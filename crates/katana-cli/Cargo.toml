@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 katana-core = { path = "../katana-core" }
 clap = { version = "4", features = ["derive"] }
+rayon = "1"

@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use katana_core::{offset, slicer, stl, svg};
+use rayon::prelude::*;
 
 #[derive(Parser)]
 #[command(name = "katana", about = "3D printing slicer")]
@@ -120,19 +121,20 @@ fn cmd_slice(file: &str, layer_height: f32, output_dir: &str, nozzle_width: f32,
         std::process::exit(1);
     });
 
-    for (i, (tp_layer, orig_layer)) in toolpath_result
+    let output_dir_owned = output_dir.to_string();
+    toolpath_result
         .layers
-        .iter()
-        .zip(result.layers.iter())
+        .par_iter()
+        .zip(result.layers.par_iter())
         .enumerate()
-    {
-        let svg_content = svg::toolpath_layer_to_svg(tp_layer, orig_layer, 2.0);
-        let path = format!("{output_dir}/layer_{i:04}.svg");
-        fs::write(&path, &svg_content).unwrap_or_else(|e| {
-            eprintln!("Failed to write {path}: {e}");
-            std::process::exit(1);
+        .for_each(|(i, (tp_layer, orig_layer))| {
+            let svg_content = svg::toolpath_layer_to_svg(tp_layer, orig_layer, 2.0);
+            let path = format!("{output_dir_owned}/layer_{i:04}.svg");
+            fs::write(&path, &svg_content).unwrap_or_else(|e| {
+                eprintln!("Failed to write {path}: {e}");
+                std::process::exit(1);
+            });
         });
-    }
     let svg_ms = t_svg.elapsed().as_secs_f64() * 1000.0;
 
     println!("  SVGs written to: {output_dir}/ ({:.1}ms)", svg_ms);

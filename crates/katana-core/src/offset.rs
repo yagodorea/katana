@@ -263,14 +263,16 @@ pub fn generate_perimeters(layer: &Layer, config: &PerimeterConfig) -> ToolpathL
     }
 }
 
-/// Generate toolpaths for all layers.
+/// Generate toolpaths for all layers (parallelized across cores).
 pub fn generate_toolpaths(
     slice_result: &SliceResult,
     config: &PerimeterConfig,
 ) -> ToolpathResult {
+    use rayon::prelude::*;
+
     let layers = slice_result
         .layers
-        .iter()
+        .par_iter()
         .map(|layer| generate_perimeters(layer, config))
         .collect();
     ToolpathResult { layers }
