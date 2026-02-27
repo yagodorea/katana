@@ -2,7 +2,7 @@ use std::fs;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use katana_core::{slicer, stl, svg};
+use katana_core::{offset, slicer, stl, svg};
 
 #[derive(Parser)]
 #[command(name = "katana", about = "3D printing slicer")]
@@ -28,6 +28,12 @@ enum Command {
         /// Output directory for SVG files
         #[arg(short, long, default_value = "output")]
         output: String,
+        /// Nozzle diameter in mm
+        #[arg(short, long, default_value_t = 0.4)]
+        nozzle_width: f32,
+        /// Number of perimeter walls
+        #[arg(short, long, default_value_t = 3)]
+        perimeters: usize,
     },
 }
 
@@ -40,7 +46,9 @@ fn main() {
             file,
             layer_height,
             output,
-        } => cmd_slice(&file, layer_height, &output),
+            nozzle_width,
+            perimeters,
+        } => cmd_slice(&file, layer_height, &output, nozzle_width, perimeters),
     }
 }
 
@@ -74,7 +82,7 @@ fn cmd_info(file: &str) {
     println!("  Volume: {:.3}", mesh.volume());
 }
 
-fn cmd_slice(file: &str, layer_height: f32, output_dir: &str) {
+fn cmd_slice(file: &str, layer_height: f32, output_dir: &str, nozzle_width: f32, perimeters: usize) {
     let t_load = Instant::now();
     let mesh = load_mesh(file);
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
@@ -83,6 +91,7 @@ fn cmd_slice(file: &str, layer_height: f32, output_dir: &str) {
     println!("Slicing: {file}");
     println!("  Triangles: {} (loaded in {:.1}ms)", mesh.triangles.len(), load_ms);
     println!("  Layer height: {layer_height} mm");
+    println!("  Nozzle: {nozzle_width} mm, {perimeters} perimeters");
     println!(
         "  Z range: {:.3} to {:.3}",
         min.z, max.z
@@ -94,14 +103,30 @@ fn cmd_slice(file: &str, layer_height: f32, output_dir: &str) {
 
     println!("  Layers: {} (sliced in {:.1}ms)", result.layers.len(), slice_ms);
 
+    let config = offset::PerimeterConfig {
+        nozzle_width,
+        perimeter_count: perimeters,
+    };
+
+    let t_offset = Instant::now();
+    let toolpath_result = offset::generate_toolpaths(&result, &config);
+    let offset_ms = t_offset.elapsed().as_secs_f64() * 1000.0;
+
+    println!("  Perimeters generated in {:.1}ms", offset_ms);
+
     let t_svg = Instant::now();
     fs::create_dir_all(output_dir).unwrap_or_else(|e| {
         eprintln!("Failed to create output directory: {e}");
         std::process::exit(1);
     });
 
-    for (i, layer) in result.layers.iter().enumerate() {
-        let svg_content = svg::layer_to_svg(layer, 2.0);
+    for (i, (tp_layer, orig_layer)) in toolpath_result
+        .layers
+        .iter()
+        .zip(result.layers.iter())
+        .enumerate()
+    {
+        let svg_content = svg::toolpath_layer_to_svg(tp_layer, orig_layer, 2.0);
         let path = format!("{output_dir}/layer_{i:04}.svg");
         fs::write(&path, &svg_content).unwrap_or_else(|e| {
             eprintln!("Failed to write {path}: {e}");

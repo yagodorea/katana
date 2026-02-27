@@ -210,9 +210,8 @@ pub fn generate_perimeters(layer: &Layer, config: &PerimeterConfig) -> ToolpathL
                 config.nozzle_width
             };
 
-            let style = OutlineStyle::new(inset)
-                .outer_offset(0.0)
-                .inner_offset(inset)
+            // Negative offset = shrink inward
+            let style = OutlineStyle::new(-inset)
                 .line_join(LineJoin::Miter(2.0));
 
             let mut level_perimeters = Vec::new();
@@ -323,6 +322,36 @@ mod tests {
         ];
         assert!(point_in_polygon(&Point2::new(0.5, 0.5), &square));
         assert!(!point_in_polygon(&Point2::new(2.0, 2.0), &square));
+    }
+
+    #[test]
+    fn debug_outline_api() {
+        // 100x100 square, try various offset approaches
+        let shape: Vec<Vec<[f32; 2]>> = vec![vec![
+            [0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0],
+        ]];
+        let shapes: Vec<Vec<Vec<[f32; 2]>>> = vec![shape];
+
+        // Approach: negative offset to shrink
+        let style = OutlineStyle::new(-10.0)
+            .line_join(LineJoin::Miter(2.0));
+
+        let result: Vec<Vec<Vec<[f32; 2]>>> = shapes.outline(&style);
+        println!("Negative offset result:");
+        for (i, shape) in result.iter().enumerate() {
+            println!("  Shape {i}: {} rings", shape.len());
+            for (j, ring) in shape.iter().enumerate() {
+                println!("    Ring {j}: {} pts: {:?}", ring.len(), ring);
+            }
+        }
+
+        assert!(!result.is_empty(), "Expected non-empty result");
+        // The inset square should be 10..90
+        let ring = &result[0][0];
+        for p in ring {
+            assert!(p[0] >= 9.0 && p[0] <= 91.0, "x={} not in expected inset range", p[0]);
+            assert!(p[1] >= 9.0 && p[1] <= 91.0, "y={} not in expected inset range", p[1]);
+        }
     }
 
     #[test]
