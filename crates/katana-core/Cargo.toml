@@ -1,0 +1,9 @@
+[package]
+name = "katana-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nalgebra = "0.33"
+byteorder = "1"
+thiserror = "2"
