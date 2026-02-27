@@ -1,4 +1,5 @@
 use std::fs;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use katana_core::{slicer, stl, svg};
@@ -74,20 +75,26 @@ fn cmd_info(file: &str) {
 }
 
 fn cmd_slice(file: &str, layer_height: f32, output_dir: &str) {
+    let t_load = Instant::now();
     let mesh = load_mesh(file);
+    let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
     let (min, max) = mesh.bounding_box();
 
     println!("Slicing: {file}");
+    println!("  Triangles: {} (loaded in {:.1}ms)", mesh.triangles.len(), load_ms);
     println!("  Layer height: {layer_height} mm");
     println!(
         "  Z range: {:.3} to {:.3}",
         min.z, max.z
     );
 
+    let t_slice = Instant::now();
     let result = slicer::slice_mesh(&mesh, layer_height);
+    let slice_ms = t_slice.elapsed().as_secs_f64() * 1000.0;
 
-    println!("  Layers: {}", result.layers.len());
+    println!("  Layers: {} (sliced in {:.1}ms)", result.layers.len(), slice_ms);
 
+    let t_svg = Instant::now();
     fs::create_dir_all(output_dir).unwrap_or_else(|e| {
         eprintln!("Failed to create output directory: {e}");
         std::process::exit(1);
@@ -101,6 +108,7 @@ fn cmd_slice(file: &str, layer_height: f32, output_dir: &str) {
             std::process::exit(1);
         });
     }
+    let svg_ms = t_svg.elapsed().as_secs_f64() * 1000.0;
 
-    println!("  SVGs written to: {output_dir}/");
+    println!("  SVGs written to: {output_dir}/ ({:.1}ms)", svg_ms);
 }
