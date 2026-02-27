@@ -5,5 +5,6 @@ edition = "2021"
 
 [dependencies]
 katana-core = { path = "../katana-core" }
-eframe = "0.31"
+eframe = { version = "0.31", features = ["glow"] }
+glow = "0.16"
 clap = { version = "4", features = ["derive"] }

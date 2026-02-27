@@ -1,8 +1,12 @@
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use clap::Parser;
 use eframe::egui;
-use katana_core::{mesh, slicer, stl};
+use eframe::glow;
+use katana_core::{slicer, stl};
+
+mod renderer;
 
 #[derive(Parser)]
 #[command(name = "katana-viewer", about = "2D layer viewer for sliced meshes")]
@@ -22,7 +26,6 @@ fn main() -> eframe::Result {
         eprintln!("Failed to read {}: {e}", args.file);
         std::process::exit(1);
     });
-
     let mesh = stl::load_stl(&data).unwrap_or_else(|e| {
         eprintln!("Failed to parse STL: {e}");
         std::process::exit(1);
@@ -30,7 +33,7 @@ fn main() -> eframe::Result {
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
 
     let (mesh_min, mesh_max) = mesh.bounding_box();
-    let triangles = mesh.triangles.len();
+    let num_triangles = mesh.triangles.len();
 
     let t_slice = Instant::now();
     let result = slicer::slice_mesh(&mesh, args.layer_height);
@@ -38,7 +41,7 @@ fn main() -> eframe::Result {
 
     println!(
         "Loaded {} ({} triangles) in {:.1}ms",
-        args.file, triangles, load_ms
+        args.file, num_triangles, load_ms
     );
     println!(
         "Sliced {} layers (z {:.2} to {:.2}) in {:.1}ms",
@@ -55,23 +58,9 @@ fn main() -> eframe::Result {
         .max(mesh_max.y - mesh_min.y)
         .max(mesh_max.z - mesh_min.z);
 
-    let app = ViewerApp {
-        mesh_triangles: mesh.triangles,
-        layers: result.layers,
-        current_layer: 0,
-        center: [center_x, center_y, center_z],
-        extent,
-        azimuth: std::f32::consts::FRAC_PI_4,
-        elevation: std::f32::consts::FRAC_PI_6,
-        zoom: 1.0,
-        pan: egui::Vec2::ZERO,
-        bg_mode: BgMode::Mesh,
-        stats: Stats {
-            triangles,
-            load_ms,
-            slice_ms,
-        },
-    };
+    let triangles = mesh.triangles;
+    let layers = result.layers;
+    let num_layers = layers.len();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 700.0]),
@@ -81,12 +70,48 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "katana viewer",
         options,
-        Box::new(|_cc| Ok(Box::new(app))),
+        Box::new(move |cc| {
+            let gl = cc.gl.as_ref().expect("eframe glow backend required");
+            let mut gpu = renderer::Renderer::new(gl.clone());
+
+            // Upload mesh wireframe to GPU
+            gpu.upload_mesh(&triangles);
+
+            // Upload all slices — single GPU draw call, no need to skip layers
+            gpu.upload_all_slices(&layers, 1);
+
+            // Upload first layer
+            if !layers.is_empty() {
+                gpu.upload_current_slice(&layers[0]);
+            }
+
+            let renderer = Arc::new(Mutex::new(gpu));
+
+            Ok(Box::new(ViewerApp {
+                renderer,
+                layers,
+                num_layers,
+                current_layer: 0,
+                prev_layer: usize::MAX,
+                center: [center_x, center_y, center_z],
+                extent,
+                azimuth: std::f32::consts::FRAC_PI_4,
+                elevation: std::f32::consts::FRAC_PI_6,
+                zoom: 1.0,
+                pan: egui::Vec2::ZERO,
+                bg_mode: BgMode::Mesh,
+                stats: Stats {
+                    triangles: num_triangles,
+                    load_ms,
+                    slice_ms,
+                },
+            }))
+        }),
     )
 }
 
-#[derive(PartialEq)]
-enum BgMode {
+#[derive(PartialEq, Clone, Copy)]
+pub enum BgMode {
     None,
     Mesh,
     Layers,
@@ -99,9 +124,11 @@ struct Stats {
 }
 
 struct ViewerApp {
-    mesh_triangles: Vec<mesh::Triangle>,
+    renderer: Arc<Mutex<renderer::Renderer>>,
     layers: Vec<slicer::Layer>,
+    num_layers: usize,
     current_layer: usize,
+    prev_layer: usize,
     center: [f32; 3],
     extent: f32,
     azimuth: f32,
@@ -112,137 +139,21 @@ struct ViewerApp {
     stats: Stats,
 }
 
-impl ViewerApp {
-    /// Project a 3D mesh-space point to 2D screen-space using an orthographic
-    /// projection with camera rotation (azimuth + elevation).
-    fn project(&self, x: f32, y: f32, z: f32, canvas: &egui::Rect) -> egui::Pos2 {
-        let dx = x - self.center[0];
-        let dy = y - self.center[1];
-        let dz = z - self.center[2];
-
-        let cos_a = self.azimuth.cos();
-        let sin_a = self.azimuth.sin();
-        let rx = dx * cos_a - dy * sin_a;
-        let ry = dx * sin_a + dy * cos_a;
-        let rz = dz;
-
-        let cos_e = self.elevation.cos();
-        let sin_e = self.elevation.sin();
-        let screen_x = rx;
-        let screen_y = -(rz * cos_e - ry * sin_e);
-
-        let margin = 60.0;
-        let available = (canvas.width() - 2.0 * margin).min(canvas.height() - 2.0 * margin);
-        let scale = available / self.extent * self.zoom;
-
-        let cx = canvas.center().x + self.pan.x;
-        let cy = canvas.center().y + self.pan.y;
-
-        egui::pos2(screen_x * scale + cx, screen_y * scale + cy)
-    }
-
-    /// Compute the camera's view direction (used for backface culling).
-    fn view_direction(&self) -> [f32; 3] {
-        let cos_a = self.azimuth.cos();
-        let sin_a = self.azimuth.sin();
-        let cos_e = self.elevation.cos();
-        let sin_e = self.elevation.sin();
-        // Camera looks along -Z in view space, which in world space is:
-        [sin_a * cos_e, -cos_a * cos_e, -sin_e]
-    }
-
-    fn draw_mesh_wireframe(&self, painter: &egui::Painter, canvas: &egui::Rect) {
-        let view_dir = self.view_direction();
-        let stroke = egui::Stroke::new(
-            0.5,
-            egui::Color32::from_rgba_premultiplied(70, 80, 110, 80),
-        );
-
-        for tri in &self.mesh_triangles {
-            // Backface culling: skip triangles facing away from camera
-            let n = &tri.normal;
-            let dot = n.x * view_dir[0] + n.y * view_dir[1] + n.z * view_dir[2];
-            if dot > 0.0 {
-                continue;
-            }
-
-            let p0 = self.project(
-                tri.vertices[0].x,
-                tri.vertices[0].y,
-                tri.vertices[0].z,
-                canvas,
-            );
-            let p1 = self.project(
-                tri.vertices[1].x,
-                tri.vertices[1].y,
-                tri.vertices[1].z,
-                canvas,
-            );
-            let p2 = self.project(
-                tri.vertices[2].x,
-                tri.vertices[2].y,
-                tri.vertices[2].z,
-                canvas,
-            );
-
-            painter.line_segment([p0, p1], stroke);
-            painter.line_segment([p1, p2], stroke);
-            painter.line_segment([p2, p0], stroke);
-        }
-    }
-
-    fn draw_bg_layers(&self, painter: &egui::Painter, canvas: &egui::Rect) {
-        let stride = (self.layers.len() / 100).max(1);
-        let bg_stroke = egui::Stroke::new(
-            0.5,
-            egui::Color32::from_rgba_premultiplied(80, 80, 120, 60),
-        );
-
-        for (i, layer) in self.layers.iter().enumerate() {
-            if i == self.current_layer || i % stride != 0 {
-                continue;
-            }
-            for contour in &layer.contours {
-                if contour.points.len() < 2 {
-                    continue;
-                }
-                let pts: Vec<egui::Pos2> = contour
-                    .points
-                    .iter()
-                    .map(|p| self.project(p.x, p.y, layer.z, canvas))
-                    .collect();
-                painter.add(egui::Shape::closed_line(pts, bg_stroke));
-            }
-        }
-    }
-
-    fn draw_current_layer(&self, painter: &egui::Painter, canvas: &egui::Rect) {
-        if self.layers.is_empty() {
-            return;
-        }
-        let layer = &self.layers[self.current_layer];
-        let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(233, 69, 96));
-
-        for contour in &layer.contours {
-            if contour.points.len() < 2 {
-                continue;
-            }
-            let pts: Vec<egui::Pos2> = contour
-                .points
-                .iter()
-                .map(|p| self.project(p.x, p.y, layer.z, canvas))
-                .collect();
-            painter.add(egui::Shape::closed_line(pts, stroke));
-        }
-    }
-}
-
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Top panel: info
+        // Re-upload current slice if it changed
+        if self.current_layer != self.prev_layer && !self.layers.is_empty() {
+            self.renderer
+                .lock()
+                .unwrap()
+                .upload_current_slice(&self.layers[self.current_layer]);
+            self.prev_layer = self.current_layer;
+        }
+
+        // Top panel
         egui::TopBottomPanel::top("info").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if self.layers.is_empty() {
+                if self.num_layers == 0 {
                     ui.label("No layers");
                     return;
                 }
@@ -250,10 +161,10 @@ impl eframe::App for ViewerApp {
                 ui.label(format!(
                     "Layer {}/{} | z = {:.3} mm | {} contour{}",
                     self.current_layer + 1,
-                    self.layers.len(),
+                    self.num_layers,
                     layer.z,
                     layer.contours.len(),
-                    if layer.contours.len() == 1 { "" } else { "s" }
+                    if layer.contours.len() == 1 { "" } else { "s" },
                 ));
                 ui.separator();
                 ui.selectable_value(&mut self.bg_mode, BgMode::Mesh, "Mesh");
@@ -271,15 +182,15 @@ impl eframe::App for ViewerApp {
             });
         });
 
-        // Bottom panel: layer slider
+        // Bottom panel: slider
         egui::TopBottomPanel::bottom("slider").show(ctx, |ui| {
-            if self.layers.is_empty() {
+            if self.num_layers == 0 {
                 return;
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Layer:");
-                let max = self.layers.len().saturating_sub(1);
+                let max = self.num_layers.saturating_sub(1);
                 ui.add(
                     egui::Slider::new(&mut self.current_layer, 0..=max).show_value(false),
                 );
@@ -287,61 +198,93 @@ impl eframe::App for ViewerApp {
             ui.add_space(4.0);
         });
 
-        // Central canvas
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let (response, painter) =
-                ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
-            let canvas = response.rect;
+        // Central panel
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(26, 26, 46)))
+            .show(ctx, |ui| {
+                let (response, painter) =
+                    ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
 
-            painter.rect_filled(canvas, 0.0, egui::Color32::from_rgb(26, 26, 46));
+                // Input handling
+                if response.dragged_by(egui::PointerButton::Primary) {
+                    let delta = response.drag_delta();
+                    self.azimuth -= delta.x * 0.005;
+                    self.elevation = (self.elevation + delta.y * 0.005).clamp(
+                        -std::f32::consts::FRAC_PI_2 + 0.01,
+                        std::f32::consts::FRAC_PI_2 - 0.01,
+                    );
+                }
+                if response.dragged_by(egui::PointerButton::Middle)
+                    || response.dragged_by(egui::PointerButton::Secondary)
+                {
+                    self.pan += response.drag_delta();
+                }
 
-            // Left-drag = rotate, right/middle-drag = pan
-            if response.dragged_by(egui::PointerButton::Primary) {
-                let delta = response.drag_delta();
-                self.azimuth -= delta.x * 0.005;
-                self.elevation = (self.elevation + delta.y * 0.005).clamp(
-                    -std::f32::consts::FRAC_PI_2 + 0.01,
-                    std::f32::consts::FRAC_PI_2 - 0.01,
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0.0 {
+                    let factor = 1.0 + scroll * 0.002;
+                    self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
+                }
+
+                ui.input(|i| {
+                    if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowRight) {
+                        if self.current_layer < self.num_layers.saturating_sub(1) {
+                            self.current_layer += 1;
+                        }
+                    }
+                    if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowLeft) {
+                        if self.current_layer > 0 {
+                            self.current_layer -= 1;
+                        }
+                    }
+                    if i.key_pressed(egui::Key::Home) {
+                        self.current_layer = 0;
+                    }
+                    if i.key_pressed(egui::Key::End) {
+                        self.current_layer = self.num_layers.saturating_sub(1);
+                    }
+                });
+
+                // Build MVP matrix
+                let rect = response.rect;
+                let aspect = rect.width() / rect.height();
+                let mvp = renderer::build_mvp(
+                    self.center,
+                    self.azimuth,
+                    self.elevation,
+                    self.zoom,
+                    self.extent,
+                    aspect,
                 );
-            }
-            if response.dragged_by(egui::PointerButton::Middle)
-                || response.dragged_by(egui::PointerButton::Secondary)
-            {
-                self.pan += response.drag_delta();
-            }
 
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                let factor = 1.0 + scroll * 0.002;
-                self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
-            }
+                let bg_mode = self.bg_mode;
+                let light_dir = renderer::headlight_dir(self.azimuth, self.elevation);
+                let renderer = self.renderer.clone();
+                let ppp = ctx.pixels_per_point();
+                let vw = (rect.width() * ppp) as i32;
+                let vh = (rect.height() * ppp) as i32;
 
-            ui.input(|i| {
-                if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowRight) {
-                    if self.current_layer < self.layers.len().saturating_sub(1) {
-                        self.current_layer += 1;
-                    }
-                }
-                if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowLeft) {
-                    if self.current_layer > 0 {
-                        self.current_layer -= 1;
-                    }
-                }
-                if i.key_pressed(egui::Key::Home) {
-                    self.current_layer = 0;
-                }
-                if i.key_pressed(egui::Key::End) {
-                    self.current_layer = self.layers.len().saturating_sub(1);
-                }
+                let callback = egui::PaintCallback {
+                    rect,
+                    callback: Arc::new(eframe::egui_glow::CallbackFn::new(
+                        move |info, _painter| {
+                            // Screen position of the viewport (bottom-left in GL coords)
+                            let vp = info.viewport_in_pixels();
+                            let sx = vp.left_px;
+                            let sy = vp.from_bottom_px;
+                            renderer.lock().unwrap().draw(
+                                &mvp, &light_dir, &bg_mode, vw, vh, sx, sy,
+                            );
+                        },
+                    )),
+                };
+                painter.add(callback);
             });
+    }
 
-            // Draw background then current layer on top
-            match self.bg_mode {
-                BgMode::Mesh => self.draw_mesh_wireframe(&painter, &canvas),
-                BgMode::Layers => self.draw_bg_layers(&painter, &canvas),
-                BgMode::None => {}
-            }
-            self.draw_current_layer(&painter, &canvas);
-        });
+    fn on_exit(&mut self, gl: Option<&glow::Context>) {
+        if gl.is_some() {
+            self.renderer.lock().unwrap().destroy();
+        }
     }
 }
