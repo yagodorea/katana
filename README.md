@@ -5,6 +5,11 @@ This workspace contains 3 programs:
 2. `katana-cli` - CLI interface for katana-core
 3. `katana-viewer` - GUI application based on `eframe` (for the interface) and `glow` (for GPU rendering with OpenGL) to visualize the slices.
 
+<p align="center">
+  <img src="./katana.gif" alt="Sublime's custom image"/>
+</p>
+
+
 ## Getting started
 
 - `cargo build`
