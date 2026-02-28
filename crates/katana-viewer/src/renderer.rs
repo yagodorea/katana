@@ -230,6 +230,13 @@ impl Renderer {
             }
         }
 
+        // Infill lines in green
+        let (r, g, b, a) = (0.27, 0.91, 0.38, 0.8);
+        for line in &tp_layer.infill_lines {
+            push_line_vert(&mut verts, line.start.x, line.start.y, z, r, g, b, a);
+            push_line_vert(&mut verts, line.end.x, line.end.y, z, r, g, b, a);
+        }
+
         let count = (verts.len() / LINE_STRIDE) as i32;
         self.current_slice = Some(upload_line_buffer(&self.gl, &verts, count));
     }

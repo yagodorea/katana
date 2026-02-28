@@ -45,13 +45,17 @@ fn main() -> eframe::Result {
     let result = slicer::slice_mesh(&mesh, args.layer_height);
     let slice_ms = t_slice.elapsed().as_secs_f64() * 1000.0;
 
-    let config = offset::PerimeterConfig {
+    let perim_config = offset::PerimeterConfig {
         nozzle_width: args.nozzle_width,
         perimeter_count: args.perimeters,
     };
+    let infill_config = offset::InfillConfig {
+        density: 0.2,
+        nozzle_width: args.nozzle_width,
+    };
 
     let t_offset = Instant::now();
-    let toolpath_result = offset::generate_toolpaths(&result, &config);
+    let toolpath_result = offset::generate_toolpaths(&result, &perim_config, &infill_config);
     let offset_ms = t_offset.elapsed().as_secs_f64() * 1000.0;
 
     println!(

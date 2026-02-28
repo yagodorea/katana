@@ -32,11 +32,29 @@ pub struct PerimeterSet {
     pub infill_boundary: Vec<Contour>,
 }
 
-/// A fully processed layer with perimeter toolpaths.
+/// A single open infill line segment.
+#[derive(Debug, Clone)]
+pub struct InfillLine {
+    pub start: Point2<f32>,
+    pub end: Point2<f32>,
+}
+
+/// Configuration for infill generation.
+#[derive(Debug, Clone)]
+pub struct InfillConfig {
+    /// Infill density from 0.0 (empty) to 1.0 (solid).
+    pub density: f32,
+    /// Nozzle width in mm — determines line spacing at 100% density.
+    pub nozzle_width: f32,
+}
+
+/// A fully processed layer with perimeter toolpaths and infill.
 #[derive(Debug, Clone)]
 pub struct ToolpathLayer {
     pub z: f32,
+    pub layer_index: usize,
     pub perimeter_sets: Vec<PerimeterSet>,
+    pub infill_lines: Vec<InfillLine>,
 }
 
 /// Result of generating toolpaths for all layers.
@@ -199,11 +217,19 @@ fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
 // Core offset logic
 // ---------------------------------------------------------------------------
 
+use i_overlay::core::fill_rule::FillRule;
+use i_overlay::float::clip::FloatClip;
 use i_overlay::mesh::outline::offset::OutlineOffset;
 use i_overlay::mesh::style::{LineJoin, OutlineStyle};
+use i_overlay::string::clip::ClipRule;
 
-/// Generate perimeter toolpaths for a single layer.
-pub fn generate_perimeters(layer: &Layer, config: &PerimeterConfig) -> ToolpathLayer {
+/// Generate perimeter toolpaths and infill for a single layer.
+pub fn generate_perimeters(
+    layer: &Layer,
+    layer_index: usize,
+    perim_config: &PerimeterConfig,
+    infill_config: &InfillConfig,
+) -> ToolpathLayer {
     let shapes = classify_contours(&layer.contours);
     let mut perimeter_sets = Vec::new();
 
@@ -212,14 +238,14 @@ pub fn generate_perimeters(layer: &Layer, config: &PerimeterConfig) -> ToolpathL
         // Wrap in an outer vec to form "Shapes" (Vec<Shape>)
         let mut current_shapes: Vec<OverlayShape> = vec![shape.clone()];
 
-        for i in 0..config.perimeter_count {
+        for i in 0..perim_config.perimeter_count {
             // First perimeter: inset by nozzle_width/2 so the outer edge of
             // the extruded line aligns with the original contour.
             // Subsequent perimeters: inset by a full nozzle_width.
             let inset = if i == 0 {
-                config.nozzle_width / 2.0
+                perim_config.nozzle_width / 2.0
             } else {
-                config.nozzle_width
+                perim_config.nozzle_width
             };
 
             // Negative offset = shrink inward
@@ -269,23 +295,121 @@ pub fn generate_perimeters(layer: &Layer, config: &PerimeterConfig) -> ToolpathL
         });
     }
 
+    // Generate infill
+    let infill_lines = generate_infill(&perimeter_sets, infill_config);
+
     ToolpathLayer {
         z: layer.z,
+        layer_index,
         perimeter_sets,
+        infill_lines,
     }
+}
+
+/// Generate rectilinear grid infill lines clipped to the infill boundaries.
+///
+/// Produces both horizontal and vertical lines on every layer, forming a grid
+/// so each line is deposited on top of the previous layer's perpendicular line.
+fn generate_infill(
+    perimeter_sets: &[PerimeterSet],
+    config: &InfillConfig,
+) -> Vec<InfillLine> {
+    if config.density <= 0.0 {
+        return Vec::new();
+    }
+
+    let spacing = config.nozzle_width / config.density.min(1.0);
+
+    let mut all_lines = Vec::new();
+
+    for pset in perimeter_sets {
+        if pset.infill_boundary.is_empty() {
+            continue;
+        }
+
+        // Build i_overlay shape from infill boundary contours.
+        // First contour with positive area is outer, rest assigned as holes.
+        let boundary_shape: Vec<Vec<[f32; 2]>> = pset
+            .infill_boundary
+            .iter()
+            .map(|c| contour_to_overlay(c))
+            .collect();
+
+        // Compute bounding box of the boundary
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for ring in &boundary_shape {
+            for p in ring {
+                min_x = min_x.min(p[0]);
+                min_y = min_y.min(p[1]);
+                max_x = max_x.max(p[0]);
+                max_y = max_y.max(p[1]);
+            }
+        }
+
+        // Generate a grid: both horizontal and vertical lines so each
+        // line is deposited on top of the previous layer's perpendicular line.
+        let mut scan_lines: Vec<Vec<[f32; 2]>> = Vec::new();
+
+        // Horizontal lines
+        let mut y = min_y + spacing;
+        while y < max_y {
+            scan_lines.push(vec![[min_x, y], [max_x, y]]);
+            y += spacing;
+        }
+
+        // Vertical lines
+        let mut x = min_x + spacing;
+        while x < max_x {
+            scan_lines.push(vec![[x, min_y], [x, max_y]]);
+            x += spacing;
+        }
+
+        if scan_lines.is_empty() {
+            continue;
+        }
+
+        // Clip each scan line individually against the infill boundary.
+        // clip_by treats a Vec<Vec<>> as a single connected polyline, so we
+        // must clip one line at a time.
+        let clip_rule = ClipRule {
+            invert: false,
+            boundary_included: true,
+        };
+        let shapes = vec![boundary_shape];
+
+        for line in &scan_lines {
+            let clipped: Vec<Vec<[f32; 2]>> =
+                vec![line.clone()].clip_by(&shapes, FillRule::EvenOdd, clip_rule);
+
+            for segment in &clipped {
+                if segment.len() >= 2 {
+                    let start = from_overlay(&segment[0]);
+                    let end = from_overlay(segment.last().unwrap());
+                    all_lines.push(InfillLine { start, end });
+                }
+            }
+        }
+    }
+
+    all_lines
 }
 
 /// Generate toolpaths for all layers (parallelized across cores).
 pub fn generate_toolpaths(
     slice_result: &SliceResult,
-    config: &PerimeterConfig,
+    perim_config: &PerimeterConfig,
+    infill_config: &InfillConfig,
 ) -> ToolpathResult {
     use rayon::prelude::*;
 
     let layers = slice_result
         .layers
         .par_iter()
-        .map(|layer| generate_perimeters(layer, config))
+        .enumerate()
+        .map(|(i, layer)| generate_perimeters(layer, i, perim_config, infill_config))
         .collect();
     ToolpathResult { layers }
 }
@@ -368,18 +492,22 @@ mod tests {
         }
     }
 
+    fn no_infill() -> InfillConfig {
+        InfillConfig { density: 0.0, nozzle_width: 0.4 }
+    }
+
     #[test]
     fn cube_single_perimeter() {
         let data = std::fs::read(stl_path("cube.stl")).unwrap();
         let mesh = stl::load_stl(&data).unwrap();
         let result = crate::slicer::slice_mesh(&mesh, 0.2);
-        let layer = &result.layers[2]; // middle layer
+        let layer = &result.layers[2];
 
         let config = PerimeterConfig {
             nozzle_width: 0.2,
             perimeter_count: 1,
         };
-        let toolpath = generate_perimeters(layer, &config);
+        let toolpath = generate_perimeters(layer, 2, &config, &no_infill());
 
         assert_eq!(toolpath.perimeter_sets.len(), 1, "Cube should produce 1 shape");
         assert_eq!(
@@ -391,5 +519,43 @@ mod tests {
             !toolpath.perimeter_sets[0].perimeters[0].is_empty(),
             "Perimeter level should have at least 1 loop"
         );
+    }
+
+    #[test]
+    fn block_infill_generates_grid() {
+        let data = std::fs::read(stl_path("block100.stl")).unwrap();
+        let mesh = stl::load_stl(&data).unwrap();
+        let result = crate::slicer::slice_mesh(&mesh, 10.0);
+
+        let perim_config = PerimeterConfig {
+            nozzle_width: 5.0,
+            perimeter_count: 1,
+        };
+        let infill_config = InfillConfig {
+            density: 0.5,
+            nozzle_width: 5.0,
+        };
+
+        let tp = generate_perimeters(&result.layers[4], 0, &perim_config, &infill_config);
+
+        assert!(
+            !tp.infill_lines.is_empty(),
+            "Expected infill lines"
+        );
+
+        // Grid should have both horizontal and vertical lines.
+        // Use a tolerance relative to the boundary size since clipping
+        // may introduce tiny floating-point deviations.
+        let tol = 0.1;
+        let horizontal = tp.infill_lines.iter()
+            .filter(|l| (l.start.y - l.end.y).abs() < tol)
+            .count();
+        let vertical = tp.infill_lines.iter()
+            .filter(|l| (l.start.x - l.end.x).abs() < tol)
+            .count();
+
+        assert!(horizontal > 0, "Expected horizontal infill lines, got 0");
+        assert!(vertical > 0, "Expected vertical infill lines, got 0");
+        println!("Infill: {horizontal} horizontal + {vertical} vertical = {} total", tp.infill_lines.len());
     }
 }

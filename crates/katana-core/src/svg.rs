@@ -200,6 +200,17 @@ pub fn toolpath_layer_to_svg(layer: &ToolpathLayer, original: &Layer, padding: f
         }
     }
 
+    // Infill lines: green, thin
+    for line in &layer.infill_lines {
+        let (x1, y1) = to_svg(&line.start);
+        let (x2, y2) = to_svg(&line.end);
+        writeln!(
+            svg,
+            r##"  <line x1="{x1:.2}" y1="{y1:.2}" x2="{x2:.2}" y2="{y2:.2}" stroke="#45e960" stroke-width="0.6"/>"##,
+        )
+        .unwrap();
+    }
+
     writeln!(svg, "</svg>").unwrap();
     svg
 }
