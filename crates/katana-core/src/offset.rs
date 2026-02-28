@@ -133,6 +133,36 @@ type OverlayShape = Vec<Vec<[f32; 2]>>;
 /// Uses containment depth to classify contours: a contour nested inside an
 /// even number of other contours is an outer boundary; odd = hole. This is
 /// robust against the slicer producing inconsistent winding orders.
+/// Axis-aligned bounding box for fast containment pre-checks.
+struct Aabb {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+}
+
+impl Aabb {
+    fn from_points(points: &[Point2<f32>]) -> Self {
+        let mut bb = Aabb {
+            min_x: f32::INFINITY,
+            min_y: f32::INFINITY,
+            max_x: f32::NEG_INFINITY,
+            max_y: f32::NEG_INFINITY,
+        };
+        for p in points {
+            bb.min_x = bb.min_x.min(p.x);
+            bb.min_y = bb.min_y.min(p.y);
+            bb.max_x = bb.max_x.max(p.x);
+            bb.max_y = bb.max_y.max(p.y);
+        }
+        bb
+    }
+
+    fn contains(&self, p: &Point2<f32>) -> bool {
+        p.x >= self.min_x && p.x <= self.max_x && p.y >= self.min_y && p.y <= self.max_y
+    }
+}
+
 fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
     if contours.is_empty() {
         return Vec::new();
@@ -140,13 +170,21 @@ fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
 
     let n = contours.len();
 
+    // Precompute AABBs and signed areas for all contours
+    let aabbs: Vec<Aabb> = contours.iter().map(|c| Aabb::from_points(&c.points)).collect();
+    let areas: Vec<f32> = contours.iter().map(|c| signed_area(&c.points)).collect();
+
     // For each contour, count how many other contours contain its first point.
     // Even depth = outer boundary; odd depth = hole.
+    // AABB pre-check skips expensive PIP tests when point is outside bounding box.
     let mut depth = vec![0usize; n];
     for i in 0..n {
         if let Some(test_pt) = contours[i].points.first() {
             for j in 0..n {
-                if i != j && point_in_polygon(test_pt, &contours[j].points) {
+                if i != j
+                    && aabbs[j].contains(test_pt)
+                    && point_in_polygon(test_pt, &contours[j].points)
+                {
                     depth[i] += 1;
                 }
             }
@@ -157,7 +195,7 @@ fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
     let mut holes: Vec<(usize, f32)> = Vec::new();  // (index, signed_area)
 
     for i in 0..n {
-        let area = signed_area(&contours[i].points);
+        let area = areas[i];
         if area.abs() < 1e-10 {
             continue; // degenerate
         }
@@ -173,10 +211,9 @@ fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
     let mut outer_indices: Vec<(usize, f32)> = Vec::new(); // (contour_idx, abs_area)
 
     for &(idx, abs_area) in &outers {
-        let area = signed_area(&contours[idx].points);
         let mut ring = contour_to_overlay(&contours[idx]);
         // Ensure CCW winding for outer (positive area)
-        if area < 0.0 {
+        if areas[idx] < 0.0 {
             ring.reverse();
         }
         shapes.push(vec![ring]);
@@ -192,6 +229,7 @@ fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
 
             for (shape_idx, &(outer_idx, outer_abs_area)) in outer_indices.iter().enumerate() {
                 if outer_abs_area < best_area
+                    && aabbs[outer_idx].contains(test_point)
                     && point_in_polygon(test_point, &contours[outer_idx].points)
                 {
                     best_outer = Some(shape_idx);
@@ -217,11 +255,8 @@ fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
 // Core offset logic
 // ---------------------------------------------------------------------------
 
-use i_overlay::core::fill_rule::FillRule;
-use i_overlay::float::clip::FloatClip;
 use i_overlay::mesh::outline::offset::OutlineOffset;
 use i_overlay::mesh::style::{LineJoin, OutlineStyle};
-use i_overlay::string::clip::ClipRule;
 
 /// Generate perimeter toolpaths and infill for a single layer.
 pub fn generate_perimeters(
@@ -253,21 +288,17 @@ pub fn generate_perimeters(
                 .line_join(LineJoin::Miter(2.0));
 
             let mut level_perimeters = Vec::new();
-            let mut next_shapes = Vec::new();
 
-            for s in &current_shapes {
-                let offset_result: Vec<OverlayShape> = vec![s.clone()].outline(&style);
+            // Pass all current shapes as a batch to .outline()
+            let offset_result: Vec<OverlayShape> = current_shapes.outline(&style);
 
-                for offset_shape in &offset_result {
-                    // Each ring in the offset shape is a perimeter path
-                    for ring in offset_shape {
-                        if ring.len() >= 3 {
-                            level_perimeters.push(Perimeter {
-                                points: overlay_to_points(ring),
-                            });
-                        }
+            for offset_shape in &offset_result {
+                for ring in offset_shape {
+                    if ring.len() >= 3 {
+                        level_perimeters.push(Perimeter {
+                            points: overlay_to_points(ring),
+                        });
                     }
-                    next_shapes.push(offset_shape.clone());
                 }
             }
 
@@ -276,7 +307,7 @@ pub fn generate_perimeters(
             }
 
             all_perimeters.push(level_perimeters);
-            current_shapes = next_shapes;
+            current_shapes = offset_result;
         }
 
         // The last valid offset result defines the infill boundary
@@ -306,10 +337,69 @@ pub fn generate_perimeters(
     }
 }
 
+/// Clip a horizontal scan line (at y = `y`) against polygon edges using
+/// even-odd ray intersection. Returns pairs of x-coordinates representing
+/// inside segments.
+fn clip_horizontal_line(y: f32, edges: &[([f32; 2], [f32; 2])], min_x: f32, max_x: f32) -> Vec<(f32, f32)> {
+    let mut intersections = Vec::new();
+
+    for &(p0, p1) in edges {
+        let (y0, y1) = (p0[1], p1[1]);
+        // Check if edge spans this y (exclusive of endpoints to avoid
+        // double-counting at vertices).
+        if (y0 < y && y1 >= y) || (y1 < y && y0 >= y) {
+            let t = (y - y0) / (y1 - y0);
+            let x = p0[0] + t * (p1[0] - p0[0]);
+            intersections.push(x);
+        }
+    }
+
+    intersections.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let mut segments = Vec::new();
+    // Even-odd: pairs of intersections define inside segments
+    for pair in intersections.chunks_exact(2) {
+        let x0 = pair[0].max(min_x);
+        let x1 = pair[1].min(max_x);
+        if x0 < x1 {
+            segments.push((x0, x1));
+        }
+    }
+    segments
+}
+
+/// Clip a vertical scan line (at x = `x`) against polygon edges using
+/// even-odd ray intersection. Returns pairs of y-coordinates.
+fn clip_vertical_line(x: f32, edges: &[([f32; 2], [f32; 2])], min_y: f32, max_y: f32) -> Vec<(f32, f32)> {
+    let mut intersections = Vec::new();
+
+    for &(p0, p1) in edges {
+        let (x0, x1) = (p0[0], p1[0]);
+        if (x0 < x && x1 >= x) || (x1 < x && x0 >= x) {
+            let t = (x - x0) / (x1 - x0);
+            let y = p0[1] + t * (p1[1] - p0[1]);
+            intersections.push(y);
+        }
+    }
+
+    intersections.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let mut segments = Vec::new();
+    for pair in intersections.chunks_exact(2) {
+        let y0 = pair[0].max(min_y);
+        let y1 = pair[1].min(max_y);
+        if y0 < y1 {
+            segments.push((y0, y1));
+        }
+    }
+    segments
+}
+
 /// Generate rectilinear grid infill lines clipped to the infill boundaries.
 ///
-/// Produces both horizontal and vertical lines on every layer, forming a grid
-/// so each line is deposited on top of the previous layer's perpendicular line.
+/// Uses direct scanline-polygon intersection (even-odd rule) instead of
+/// i_overlay's full clip_by, which is orders of magnitude faster for
+/// axis-aligned lines.
 fn generate_infill(
     perimeter_sets: &[PerimeterSet],
     config: &InfillConfig,
@@ -327,70 +417,54 @@ fn generate_infill(
             continue;
         }
 
-        // Build i_overlay shape from infill boundary contours.
-        // First contour with positive area is outer, rest assigned as holes.
-        let boundary_shape: Vec<Vec<[f32; 2]>> = pset
-            .infill_boundary
-            .iter()
-            .map(|c| contour_to_overlay(c))
-            .collect();
-
-        // Compute bounding box of the boundary
+        // Build edge list from all boundary contours (outer + holes).
+        // Even-odd fill rule handles holes naturally.
+        let mut edges: Vec<([f32; 2], [f32; 2])> = Vec::new();
         let mut min_x = f32::INFINITY;
         let mut min_y = f32::INFINITY;
         let mut max_x = f32::NEG_INFINITY;
         let mut max_y = f32::NEG_INFINITY;
-        for ring in &boundary_shape {
-            for p in ring {
-                min_x = min_x.min(p[0]);
-                min_y = min_y.min(p[1]);
-                max_x = max_x.max(p[0]);
-                max_y = max_y.max(p[1]);
+
+        for contour in &pset.infill_boundary {
+            let pts = &contour.points;
+            let n = pts.len();
+            if n < 3 {
+                continue;
+            }
+            for i in 0..n {
+                let j = (i + 1) % n;
+                let p0 = [pts[i].x, pts[i].y];
+                let p1 = [pts[j].x, pts[j].y];
+                edges.push((p0, p1));
+                min_x = min_x.min(p0[0]);
+                min_y = min_y.min(p0[1]);
+                max_x = max_x.max(p0[0]);
+                max_y = max_y.max(p0[1]);
             }
         }
 
-        // Generate a grid: both horizontal and vertical lines so each
-        // line is deposited on top of the previous layer's perpendicular line.
-        let mut scan_lines: Vec<Vec<[f32; 2]>> = Vec::new();
-
-        // Horizontal lines
+        // Horizontal scan lines
         let mut y = min_y + spacing;
         while y < max_y {
-            scan_lines.push(vec![[min_x, y], [max_x, y]]);
+            for (x0, x1) in clip_horizontal_line(y, &edges, min_x, max_x) {
+                all_lines.push(InfillLine {
+                    start: Point2::new(x0, y),
+                    end: Point2::new(x1, y),
+                });
+            }
             y += spacing;
         }
 
-        // Vertical lines
+        // Vertical scan lines
         let mut x = min_x + spacing;
         while x < max_x {
-            scan_lines.push(vec![[x, min_y], [x, max_y]]);
-            x += spacing;
-        }
-
-        if scan_lines.is_empty() {
-            continue;
-        }
-
-        // Clip each scan line individually against the infill boundary.
-        // clip_by treats a Vec<Vec<>> as a single connected polyline, so we
-        // must clip one line at a time.
-        let clip_rule = ClipRule {
-            invert: false,
-            boundary_included: true,
-        };
-        let shapes = vec![boundary_shape];
-
-        for line in &scan_lines {
-            let clipped: Vec<Vec<[f32; 2]>> =
-                vec![line.clone()].clip_by(&shapes, FillRule::EvenOdd, clip_rule);
-
-            for segment in &clipped {
-                if segment.len() >= 2 {
-                    let start = from_overlay(&segment[0]);
-                    let end = from_overlay(segment.last().unwrap());
-                    all_lines.push(InfillLine { start, end });
-                }
+            for (y0, y1) in clip_vertical_line(x, &edges, min_y, max_y) {
+                all_lines.push(InfillLine {
+                    start: Point2::new(x, y0),
+                    end: Point2::new(x, y1),
+                });
             }
+            x += spacing;
         }
     }
 
@@ -557,5 +631,119 @@ mod tests {
         assert!(horizontal > 0, "Expected horizontal infill lines, got 0");
         assert!(vertical > 0, "Expected vertical infill lines, got 0");
         println!("Infill: {horizontal} horizontal + {vertical} vertical = {} total", tp.infill_lines.len());
+    }
+
+    #[test]
+    fn infill_lines_are_axis_aligned_and_inside_boundary() {
+        // Verify that every infill line is either horizontal or vertical
+        // and that all endpoints lie within the infill boundary.
+        let data = std::fs::read(stl_path("block100.stl")).unwrap();
+        let mesh = stl::load_stl(&data).unwrap();
+        let result = crate::slicer::slice_mesh(&mesh, 10.0);
+
+        let perim_config = PerimeterConfig {
+            nozzle_width: 5.0,
+            perimeter_count: 1,
+        };
+        let infill_config = InfillConfig {
+            density: 0.5,
+            nozzle_width: 5.0,
+        };
+
+        let tp = generate_perimeters(&result.layers[4], 0, &perim_config, &infill_config);
+        assert!(!tp.infill_lines.is_empty(), "Expected infill lines");
+
+        let tol = 0.1;
+
+        // Every infill line must be either horizontal or vertical
+        for (i, line) in tp.infill_lines.iter().enumerate() {
+            let is_horizontal = (line.start.y - line.end.y).abs() < tol;
+            let is_vertical = (line.start.x - line.end.x).abs() < tol;
+            assert!(
+                is_horizontal || is_vertical,
+                "Infill line {} is neither horizontal nor vertical: ({:.3},{:.3}) -> ({:.3},{:.3})",
+                i, line.start.x, line.start.y, line.end.x, line.end.y
+            );
+        }
+
+        // Collect the infill boundary polygon(s)
+        let boundary_polys: Vec<&[Point2<f32>]> = tp
+            .perimeter_sets
+            .iter()
+            .flat_map(|ps| ps.infill_boundary.iter().map(|c| c.points.as_slice()))
+            .collect();
+
+        assert!(!boundary_polys.is_empty(), "Expected infill boundary");
+
+        // Every infill endpoint must be inside or on the boundary of at least
+        // one infill boundary polygon (with a small tolerance for clipping).
+        let margin = 0.5; // generous margin for clipping tolerance
+        for (i, line) in tp.infill_lines.iter().enumerate() {
+            for (label, pt) in [("start", &line.start), ("end", &line.end)] {
+                let inside = boundary_polys.iter().any(|poly| {
+                    // Check if point is within the bounding box + margin
+                    let (mut bmin_x, mut bmin_y) = (f32::INFINITY, f32::INFINITY);
+                    let (mut bmax_x, mut bmax_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                    for p in *poly {
+                        bmin_x = bmin_x.min(p.x);
+                        bmin_y = bmin_y.min(p.y);
+                        bmax_x = bmax_x.max(p.x);
+                        bmax_y = bmax_y.max(p.y);
+                    }
+                    pt.x >= bmin_x - margin
+                        && pt.x <= bmax_x + margin
+                        && pt.y >= bmin_y - margin
+                        && pt.y <= bmax_y + margin
+                });
+                assert!(
+                    inside,
+                    "Infill line {} {} ({:.3},{:.3}) is outside all boundaries",
+                    i, label, pt.x, pt.y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sphere_infill_generates_lines() {
+        // Sphere has curved contours — verify infill works on non-rectangular geometry.
+        let data = std::fs::read(stl_path("sphere.stl")).unwrap();
+        let mesh = stl::load_stl(&data).unwrap();
+        let result = crate::slicer::slice_mesh(&mesh, 2.0);
+
+        let perim_config = PerimeterConfig {
+            nozzle_width: 0.4,
+            perimeter_count: 2,
+        };
+        let infill_config = InfillConfig {
+            density: 0.2,
+            nozzle_width: 0.4,
+        };
+
+        // Test a mid-height layer (away from poles)
+        let mid_layer = result
+            .layers
+            .iter()
+            .find(|l| l.z > 20.0 && l.z < 30.0)
+            .expect("Expected mid-range layer");
+
+        let tp = generate_perimeters(mid_layer, 0, &perim_config, &infill_config);
+        assert!(
+            !tp.infill_lines.is_empty(),
+            "Expected infill lines on sphere mid-layer at z={}",
+            mid_layer.z
+        );
+
+        // All lines should be axis-aligned
+        let tol = 0.1;
+        for line in &tp.infill_lines {
+            let is_horizontal = (line.start.y - line.end.y).abs() < tol;
+            let is_vertical = (line.start.x - line.end.x).abs() < tol;
+            assert!(
+                is_horizontal || is_vertical,
+                "Non-axis-aligned infill on sphere: ({:.3},{:.3}) -> ({:.3},{:.3})",
+                line.start.x, line.start.y, line.end.x, line.end.y
+            );
+        }
     }
 }

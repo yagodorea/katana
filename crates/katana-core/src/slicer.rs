@@ -5,6 +5,13 @@ use crate::mesh::Mesh;
 /// Small offset to avoid slicing exactly on vertices/edges.
 const EPSILON: f32 = 1e-4;
 
+/// Pre-computed z-range for a triangle, used for sweep-line acceleration.
+struct TriZRange {
+    z_min: f32,
+    z_max: f32,
+    tri_idx: usize,
+}
+
 /// A closed polygon contour from slicing at a single Z height.
 #[derive(Debug, Clone)]
 pub struct Contour {
@@ -35,6 +42,22 @@ pub fn slice_mesh(mesh: &Mesh, layer_height: f32) -> SliceResult {
     let z_min = min.z + EPSILON;
     let z_max = max.z - EPSILON;
 
+    // Build z-range index sorted by z_min for sweep-line acceleration
+    let mut z_index: Vec<TriZRange> = mesh
+        .triangles
+        .iter()
+        .enumerate()
+        .map(|(i, tri)| {
+            let zs = [tri.vertices[0].z, tri.vertices[1].z, tri.vertices[2].z];
+            TriZRange {
+                z_min: zs[0].min(zs[1]).min(zs[2]),
+                z_max: zs[0].max(zs[1]).max(zs[2]),
+                tri_idx: i,
+            }
+        })
+        .collect();
+    z_index.sort_unstable_by(|a, b| a.z_min.partial_cmp(&b.z_min).unwrap());
+
     // Collect Z heights first, then process in parallel
     let mut z_heights = Vec::new();
     let mut z = z_min + layer_height;
@@ -46,7 +69,7 @@ pub fn slice_mesh(mesh: &Mesh, layer_height: f32) -> SliceResult {
     let layers: Vec<Layer> = z_heights
         .par_iter()
         .map(|&z| {
-            let segments = intersect_plane(mesh, z);
+            let segments = intersect_plane_indexed(mesh, z, &z_index);
             let contours = assemble_contours(segments);
             Layer { z, contours }
         })
@@ -66,44 +89,41 @@ struct Segment {
     b: Point2<f32>,
 }
 
-/// Intersect all mesh triangles with a horizontal plane at height `z`.
-// TODO: currently iterates every triangle for every layer (O(triangles × layers)).
-// Optimize with a sorted sweep: precompute min_z/max_z per triangle, sort by
-// min_z, then maintain an active window as layers advance. This reduces total
-// work to O(triangles + layers).
-fn intersect_plane(mesh: &Mesh, z: f32) -> Vec<Segment> {
+/// Intersect mesh triangles with a horizontal plane at height `z`, using a
+/// pre-sorted z-range index to skip triangles that cannot intersect.
+fn intersect_plane_indexed(mesh: &Mesh, z: f32, z_index: &[TriZRange]) -> Vec<Segment> {
     let mut segments = Vec::new();
 
-    for tri in &mesh.triangles {
+    // Binary-search to find the first triangle whose z_min > z — all triangles
+    // before this point *may* intersect (their z_min <= z). We then filter by
+    // z_max >= z within the loop.
+    let upper = z_index.partition_point(|t| t.z_min <= z);
+
+    for entry in &z_index[..upper] {
+        if entry.z_max < z {
+            continue; // z-range doesn't span this plane
+        }
+
+        let tri = &mesh.triangles[entry.tri_idx];
         let v = &tri.vertices;
-        // Classify each vertex relative to the plane
         let d = [v[0].z - z, v[1].z - z, v[2].z - z];
 
-        // Count vertices above and below
         let above = d.iter().filter(|&&d| d > 0.0).count();
         let below = d.iter().filter(|&&d| d < 0.0).count();
 
-        // No intersection if all vertices are on the same side
         if above == 0 || below == 0 {
             continue;
         }
 
-        // Find the vertex that's alone on its side of the plane.
-        // With epsilon offset we won't have d == 0, so one vertex is alone
-        // on one side and two are on the other.
         let (lone, pair0, pair1) = if (d[0] > 0.0) != (d[1] > 0.0) && (d[0] > 0.0) != (d[2] > 0.0)
         {
-            // v[0] is alone
             (0, 1, 2)
         } else if (d[1] > 0.0) != (d[0] > 0.0) && (d[1] > 0.0) != (d[2] > 0.0) {
-            // v[1] is alone
             (1, 2, 0)
         } else {
-            // v[2] is alone
             (2, 0, 1)
         };
 
-        // Interpolate along edges from the lone vertex to each of the pair
         let p0 = edge_intersect_z(&v[lone], &v[pair0], z);
         let p1 = edge_intersect_z(&v[lone], &v[pair1], z);
 
@@ -129,62 +149,91 @@ fn edge_intersect_z(
 // Contour assembly
 // ---------------------------------------------------------------------------
 
+/// Quantize a coordinate to an integer key for HashMap lookups.
+/// Matches the 1e-3 tolerance used by `points_close`.
+fn quantize(v: f32) -> i64 {
+    (v * 1000.0).round() as i64
+}
+
+fn quantize_point(p: &Point2<f32>) -> (i64, i64) {
+    (quantize(p.x), quantize(p.y))
+}
+
 /// Connect line segments into closed polygon contours.
 ///
-/// For a watertight mesh, every segment endpoint is shared with exactly one
-/// other segment. We follow the chain from segment to segment until we loop
-/// back to the start.
+/// Uses a HashMap keyed by quantized endpoint coordinates for O(1) neighbor
+/// lookup instead of O(s) linear scans. Checks a 3×3 neighborhood of cells
+/// to handle points that straddle quantization bucket boundaries.
 fn assemble_contours(segments: Vec<Segment>) -> Vec<Contour> {
+    use std::collections::HashMap;
+
     if segments.is_empty() {
         return Vec::new();
     }
 
-    // Build an adjacency structure: for each segment, store both endpoints.
-    // We'll consume segments as we chain them together.
-    let mut remaining: Vec<Option<Segment>> = segments.into_iter().map(Some).collect();
+    let n = segments.len();
+
+    // Build adjacency map: quantized point → list of (segment_index, is_endpoint_a)
+    let mut map: HashMap<(i64, i64), Vec<(usize, bool)>> = HashMap::with_capacity(n * 2);
+    for (i, seg) in segments.iter().enumerate() {
+        map.entry(quantize_point(&seg.a))
+            .or_default()
+            .push((i, true));
+        map.entry(quantize_point(&seg.b))
+            .or_default()
+            .push((i, false));
+    }
+
+    let mut used = vec![false; n];
     let mut contours = Vec::new();
 
-    loop {
-        // Find the next unconsumed segment
-        let start_idx = match remaining.iter().position(|s| s.is_some()) {
-            Some(i) => i,
-            None => break,
-        };
+    for start_idx in 0..n {
+        if used[start_idx] {
+            continue;
+        }
 
-        let start_seg = remaining[start_idx].take().unwrap();
-        let mut contour_points = vec![start_seg.a];
-        let mut current_end = start_seg.b;
-        let chain_start = start_seg.a;
+        used[start_idx] = true;
+        let mut contour_points = vec![segments[start_idx].a];
+        let mut current_end = segments[start_idx].b;
+        let chain_start = segments[start_idx].a;
 
-        // Follow the chain
         loop {
-            // Are we back to the start?
             if points_close(current_end, chain_start) {
                 break;
             }
 
-            // Find a segment that connects to current_end
+            let (qx, qy) = quantize_point(&current_end);
             let mut found = false;
-            for slot in remaining.iter_mut() {
-                if let Some(seg) = slot {
-                    if points_close(seg.a, current_end) {
-                        contour_points.push(seg.a);
-                        current_end = seg.b;
-                        *slot = None;
-                        found = true;
-                        break;
-                    } else if points_close(seg.b, current_end) {
-                        contour_points.push(seg.b);
-                        current_end = seg.a;
-                        *slot = None;
-                        found = true;
-                        break;
+
+            // Check the 3×3 neighborhood to handle bucket boundary straddling
+            'outer: for dx in -1i64..=1 {
+                for dy in -1i64..=1 {
+                    let key = (qx + dx, qy + dy);
+                    if let Some(candidates) = map.get(&key) {
+                        for &(seg_idx, is_a) in candidates {
+                            if used[seg_idx] {
+                                continue;
+                            }
+                            let seg = &segments[seg_idx];
+                            if is_a && points_close(seg.a, current_end) {
+                                contour_points.push(seg.a);
+                                current_end = seg.b;
+                                used[seg_idx] = true;
+                                found = true;
+                                break 'outer;
+                            } else if !is_a && points_close(seg.b, current_end) {
+                                contour_points.push(seg.b);
+                                current_end = seg.a;
+                                used[seg_idx] = true;
+                                found = true;
+                                break 'outer;
+                            }
+                        }
                     }
                 }
             }
 
             if !found {
-                // Open contour — mesh probably isn't watertight. Stop this chain.
                 break;
             }
         }
