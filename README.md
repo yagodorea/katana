@@ -1,5 +1,7 @@
 # Katana - Rust-based 3D slicer
 
+[_Work in progress_]
+
 This workspace contains 3 programs:
 1. `katana-core` - Application that processes STLs and slices them
 2. `katana-cli` - CLI interface for katana-core
@@ -15,3 +17,8 @@ This workspace contains 3 programs:
 - `cargo build`
 - `cargo run -p katana-viewer -- stls/liver.stl`
 
+## Features
+- [X] SLT parsing (bin and ASCII)
+- [X] Parameterizes slicing and toolpathing powered by `nalgebra` and `i_overlay`
+- [X] Rectilinear infill
+- [X] GPU-rendered visualizer built on `eframe` and `glow`

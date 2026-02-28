@@ -22,6 +22,9 @@ struct Args {
     /// Number of perimeter walls
     #[arg(short, long, default_value_t = 3)]
     perimeters: usize,
+    /// Infill density %
+    #[arg(short, long, default_value_t = 20)]
+    infill_density: usize,
 }
 
 fn main() -> eframe::Result {
@@ -50,7 +53,7 @@ fn main() -> eframe::Result {
         perimeter_count: args.perimeters,
     };
     let infill_config = offset::InfillConfig {
-        density: 0.2,
+        density: args.infill_density as f32 / 100.0,
         nozzle_width: args.nozzle_width,
     };
 
