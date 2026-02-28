@@ -112,66 +112,78 @@ type OverlayShape = Vec<Vec<[f32; 2]>>;
 
 /// Group a layer's flat contours into i_overlay shapes.
 ///
-/// Determines which contours are outer boundaries vs holes using signed area,
-/// then assigns each hole to the outer boundary that contains it.
+/// Uses containment depth to classify contours: a contour nested inside an
+/// even number of other contours is an outer boundary; odd = hole. This is
+/// robust against the slicer producing inconsistent winding orders.
 fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
     if contours.is_empty() {
         return Vec::new();
     }
 
-    // Separate outers and holes by signed area
-    let mut outers: Vec<(usize, f32)> = Vec::new(); // (index, area)
-    let mut holes: Vec<(usize, f32)> = Vec::new(); // (index, area)
+    let n = contours.len();
 
-    for (i, c) in contours.iter().enumerate() {
-        let area = signed_area(&c.points);
-        if area > 0.0 {
-            outers.push((i, area));
-        } else if area < 0.0 {
-            holes.push((i, area));
+    // For each contour, count how many other contours contain its first point.
+    // Even depth = outer boundary; odd depth = hole.
+    let mut depth = vec![0usize; n];
+    for i in 0..n {
+        if let Some(test_pt) = contours[i].points.first() {
+            for j in 0..n {
+                if i != j && point_in_polygon(test_pt, &contours[j].points) {
+                    depth[i] += 1;
+                }
+            }
         }
-        // Zero-area contours are degenerate, skip them
     }
 
-    // If no outers found, all contours might have CW winding.
-    // Treat them as outers with reversed winding.
-    if outers.is_empty() {
-        outers = holes.drain(..).collect();
+    let mut outers: Vec<(usize, f32)> = Vec::new(); // (index, abs_area)
+    let mut holes: Vec<(usize, f32)> = Vec::new();  // (index, signed_area)
+
+    for i in 0..n {
+        let area = signed_area(&contours[i].points);
+        if area.abs() < 1e-10 {
+            continue; // degenerate
+        }
+        if depth[i] % 2 == 0 {
+            outers.push((i, area.abs()));
+        } else {
+            holes.push((i, area));
+        }
     }
 
     // Build shapes: each outer gets a vec, then we assign holes
     let mut shapes: Vec<OverlayShape> = Vec::new();
-    let mut outer_indices: Vec<(usize, f32)> = Vec::new(); // parallel to shapes
+    let mut outer_indices: Vec<(usize, f32)> = Vec::new(); // (contour_idx, abs_area)
 
-    for &(idx, area) in &outers {
+    for &(idx, abs_area) in &outers {
+        let area = signed_area(&contours[idx].points);
         let mut ring = contour_to_overlay(&contours[idx]);
-        // Ensure CCW winding for outer
+        // Ensure CCW winding for outer (positive area)
         if area < 0.0 {
             ring.reverse();
         }
         shapes.push(vec![ring]);
-        outer_indices.push((idx, area));
+        outer_indices.push((idx, abs_area));
     }
 
     // Assign each hole to the smallest outer that contains it
     for &(hole_idx, hole_area) in &holes {
         let hole_contour = &contours[hole_idx];
-        // Use first point of hole for containment test
         if let Some(test_point) = hole_contour.points.first() {
             let mut best_outer: Option<usize> = None;
             let mut best_area = f32::INFINITY;
 
-            for (shape_idx, &(outer_idx, outer_area)) in outer_indices.iter().enumerate() {
-                let area = outer_area.abs();
-                if area < best_area && point_in_polygon(test_point, &contours[outer_idx].points) {
+            for (shape_idx, &(outer_idx, outer_abs_area)) in outer_indices.iter().enumerate() {
+                if outer_abs_area < best_area
+                    && point_in_polygon(test_point, &contours[outer_idx].points)
+                {
                     best_outer = Some(shape_idx);
-                    best_area = area;
+                    best_area = outer_abs_area;
                 }
             }
 
             if let Some(shape_idx) = best_outer {
                 let mut ring = contour_to_overlay(hole_contour);
-                // Ensure CW winding for hole
+                // Ensure CW winding for hole (negative area)
                 if hole_area > 0.0 {
                     ring.reverse();
                 }

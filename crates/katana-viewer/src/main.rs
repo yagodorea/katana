@@ -4,7 +4,7 @@ use std::time::Instant;
 use clap::Parser;
 use eframe::egui;
 use eframe::glow;
-use katana_core::{slicer, stl};
+use katana_core::{offset, slicer, stl};
 
 mod renderer;
 
@@ -16,6 +16,12 @@ struct Args {
     /// Layer height in mm
     #[arg(short, long, default_value_t = 0.2)]
     layer_height: f32,
+    /// Nozzle diameter in mm
+    #[arg(short, long, default_value_t = 0.4)]
+    nozzle_width: f32,
+    /// Number of perimeter walls
+    #[arg(short, long, default_value_t = 3)]
+    perimeters: usize,
 }
 
 fn main() -> eframe::Result {
@@ -39,16 +45,24 @@ fn main() -> eframe::Result {
     let result = slicer::slice_mesh(&mesh, args.layer_height);
     let slice_ms = t_slice.elapsed().as_secs_f64() * 1000.0;
 
+    let config = offset::PerimeterConfig {
+        nozzle_width: args.nozzle_width,
+        perimeter_count: args.perimeters,
+    };
+
+    let t_offset = Instant::now();
+    let toolpath_result = offset::generate_toolpaths(&result, &config);
+    let offset_ms = t_offset.elapsed().as_secs_f64() * 1000.0;
+
     println!(
         "Loaded {} ({} triangles) in {:.1}ms",
         args.file, num_triangles, load_ms
     );
     println!(
-        "Sliced {} layers (z {:.2} to {:.2}) in {:.1}ms",
+        "Sliced {} layers in {:.1}ms, perimeters in {:.1}ms",
         result.layers.len(),
-        mesh_min.z,
-        mesh_max.z,
         slice_ms,
+        offset_ms,
     );
 
     let center_x = (mesh_min.x + mesh_max.x) / 2.0;
@@ -60,6 +74,7 @@ fn main() -> eframe::Result {
 
     let triangles = mesh.triangles;
     let layers = result.layers;
+    let toolpath_layers = toolpath_result.layers;
     let num_layers = layers.len();
 
     let options = eframe::NativeOptions {
@@ -74,15 +89,12 @@ fn main() -> eframe::Result {
             let gl = cc.gl.as_ref().expect("eframe glow backend required");
             let mut gpu = renderer::Renderer::new(gl.clone());
 
-            // Upload mesh wireframe to GPU
             gpu.upload_mesh(&triangles);
-
-            // Upload all slices — single GPU draw call, no need to skip layers
             gpu.upload_all_slices(&layers, 1);
 
-            // Upload first layer
-            if !layers.is_empty() {
-                gpu.upload_current_slice(&layers[0]);
+            // Upload first layer as toolpath view by default
+            if !toolpath_layers.is_empty() {
+                gpu.upload_current_toolpath(&toolpath_layers[0], &layers[0]);
             }
 
             let renderer = Arc::new(Mutex::new(gpu));
@@ -90,9 +102,11 @@ fn main() -> eframe::Result {
             Ok(Box::new(ViewerApp {
                 renderer,
                 layers,
+                toolpath_layers,
                 num_layers,
                 current_layer: 0,
                 prev_layer: usize::MAX,
+                slice_view: SliceView::Toolpaths,
                 center: [center_x, center_y, center_z],
                 extent,
                 azimuth: std::f32::consts::FRAC_PI_4,
@@ -104,6 +118,7 @@ fn main() -> eframe::Result {
                     triangles: num_triangles,
                     load_ms,
                     slice_ms,
+                    offset_ms,
                 },
             }))
         }),
@@ -117,18 +132,27 @@ pub enum BgMode {
     Layers,
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum SliceView {
+    Contours,
+    Toolpaths,
+}
+
 struct Stats {
     triangles: usize,
     load_ms: f64,
     slice_ms: f64,
+    offset_ms: f64,
 }
 
 struct ViewerApp {
     renderer: Arc<Mutex<renderer::Renderer>>,
     layers: Vec<slicer::Layer>,
+    toolpath_layers: Vec<offset::ToolpathLayer>,
     num_layers: usize,
     current_layer: usize,
     prev_layer: usize,
+    slice_view: SliceView,
     center: [f32; 3],
     extent: f32,
     azimuth: f32,
@@ -141,12 +165,22 @@ struct ViewerApp {
 
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Re-upload current slice if it changed
+        // Re-upload current slice/toolpath if layer or view mode changed
         if self.current_layer != self.prev_layer && !self.layers.is_empty() {
-            self.renderer
-                .lock()
-                .unwrap()
-                .upload_current_slice(&self.layers[self.current_layer]);
+            match self.slice_view {
+                SliceView::Contours => {
+                    self.renderer
+                        .lock()
+                        .unwrap()
+                        .upload_current_slice(&self.layers[self.current_layer]);
+                }
+                SliceView::Toolpaths => {
+                    self.renderer.lock().unwrap().upload_current_toolpath(
+                        &self.toolpath_layers[self.current_layer],
+                        &self.layers[self.current_layer],
+                    );
+                }
+            }
             self.prev_layer = self.current_layer;
         }
 
@@ -159,43 +193,49 @@ impl eframe::App for ViewerApp {
                 }
                 let layer = &self.layers[self.current_layer];
                 ui.label(format!(
-                    "Layer {}/{} | z = {:.3} mm | {} contour{}",
+                    "Layer {}/{} | z = {:.3} mm",
                     self.current_layer + 1,
                     self.num_layers,
                     layer.z,
-                    layer.contours.len(),
-                    if layer.contours.len() == 1 { "" } else { "s" },
                 ));
                 ui.separator();
+                ui.label("BG:");
                 ui.selectable_value(&mut self.bg_mode, BgMode::Mesh, "Mesh");
                 ui.selectable_value(&mut self.bg_mode, BgMode::Layers, "Layers");
                 ui.selectable_value(&mut self.bg_mode, BgMode::None, "None");
+                ui.separator();
+                ui.label("View:");
+                let prev_view = self.slice_view;
+                ui.selectable_value(&mut self.slice_view, SliceView::Contours, "Contours");
+                ui.selectable_value(&mut self.slice_view, SliceView::Toolpaths, "Toolpaths");
+                // Force re-upload if view mode changed
+                if self.slice_view != prev_view {
+                    self.prev_layer = usize::MAX;
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!(
-                        "zoom: {:.0}% | {} tris, load: {:.1}ms, slice: {:.1}ms",
-                        self.zoom * 100.0,
+                        "{} tris | load: {:.0}ms, slice: {:.0}ms, offset: {:.0}ms",
                         self.stats.triangles,
                         self.stats.load_ms,
                         self.stats.slice_ms,
+                        self.stats.offset_ms,
                     ));
                 });
             });
         });
 
-        // Bottom panel: slider
+        // Bottom panel: full-width slider
         egui::TopBottomPanel::bottom("slider").show(ctx, |ui| {
             if self.num_layers == 0 {
                 return;
             }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Layer:");
-                let max = self.num_layers.saturating_sub(1);
-                ui.add(
-                    egui::Slider::new(&mut self.current_layer, 0..=max).show_value(false),
-                );
-            });
-            ui.add_space(4.0);
+            ui.add_space(2.0);
+            let max = self.num_layers.saturating_sub(1);
+            ui.spacing_mut().slider_width = ui.available_width() - 16.0;
+            ui.add(
+                egui::Slider::new(&mut self.current_layer, 0..=max).show_value(false),
+            );
+            ui.add_space(2.0);
         });
 
         // Central panel
@@ -205,7 +245,6 @@ impl eframe::App for ViewerApp {
                 let (response, painter) =
                     ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
 
-                // Input handling
                 if response.dragged_by(egui::PointerButton::Primary) {
                     let delta = response.drag_delta();
                     self.azimuth -= delta.x * 0.005;
@@ -245,7 +284,6 @@ impl eframe::App for ViewerApp {
                     }
                 });
 
-                // Build MVP matrix
                 let rect = response.rect;
                 let aspect = rect.width() / rect.height();
                 let mvp = renderer::build_mvp(
@@ -268,7 +306,6 @@ impl eframe::App for ViewerApp {
                     rect,
                     callback: Arc::new(eframe::egui_glow::CallbackFn::new(
                         move |info, _painter| {
-                            // Screen position of the viewport (bottom-left in GL coords)
                             let vp = info.viewport_in_pixels();
                             let sx = vp.left_px;
                             let sy = vp.from_bottom_px;
