@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use glow::HasContext;
+use katana_core::planner::{PlannedLayer, MoveKind};
 
 // ---------------------------------------------------------------------------
 // Shaders
@@ -12,18 +13,24 @@ layout (location = 1) in vec4 a_color;
 
 uniform mat4 u_mvp;
 out vec4 v_color;
+out float v_z;
 
 void main() {
     gl_Position = u_mvp * vec4(a_pos, 1.0);
     v_color = a_color;
+    v_z = a_pos.z;
 }
 "#;
 
 const LINE_FS: &str = r#"#version 330 core
 in vec4 v_color;
+in float v_z;
 out vec4 frag_color;
 
+uniform float u_clip_z;
+
 void main() {
+    if (v_z < u_clip_z) discard;
     frag_color = v_color;
 }
 "#;
@@ -37,22 +44,27 @@ uniform mat4 u_mvp;
 
 out vec3 v_normal;
 out vec4 v_color;
+out float v_z;
 
 void main() {
     gl_Position = u_mvp * vec4(a_pos, 1.0);
     v_normal = a_normal;
     v_color = a_color;
+    v_z = a_pos.z;
 }
 "#;
 
 const MESH_FS: &str = r#"#version 330 core
 in vec3 v_normal;
 in vec4 v_color;
+in float v_z;
 out vec4 frag_color;
 
 uniform vec3 u_light_dir;
+uniform float u_clip_z;
 
 void main() {
+    if (v_z < u_clip_z) discard;
     vec3 n = normalize(v_normal);
     float diffuse = abs(dot(n, u_light_dir));
     float ambient = 0.15;
@@ -81,12 +93,19 @@ pub struct Renderer {
     pub mesh: Option<GpuBuffer>,
     pub slices: Option<GpuBuffer>,
     pub current_slice: Option<GpuBuffer>,
+    pub toolpath_quads: Option<GpuBuffer>,
+    pub toolpath_lines: Option<GpuBuffer>,
     // Our own FBO with a guaranteed depth buffer
     fbo: glow::Framebuffer,
     fbo_color: glow::Texture,
     fbo_depth: glow::Renderbuffer,
     fbo_w: i32,
     fbo_h: i32,
+    // Z-clipping: only draw geometry at z >= clip_z
+    pub clip_z: f32,
+    pub draw_contours: bool,
+    pub draw_toolpaths: bool,
+    pub show_travel_moves: bool,
 }
 
 impl Renderer {
@@ -104,11 +123,17 @@ impl Renderer {
             mesh: None,
             slices: None,
             current_slice: None,
+            toolpath_quads: None,
+            toolpath_lines: None,
             fbo,
             fbo_color,
             fbo_depth,
             fbo_w: 1,
             fbo_h: 1,
+            clip_z: -1e30,
+            draw_contours: false,
+            draw_toolpaths: true,
+            show_travel_moves: true,
         }
     }
 
@@ -175,77 +200,90 @@ impl Renderer {
         self.current_slice = Some(upload_line_buffer(&self.gl, &verts, count));
     }
 
-    /// Upload toolpath layers (perimeters + infill boundary) with color-coded levels.
-    pub fn upload_current_toolpath(
+    /// Upload planned toolpath layers: extrusion moves become lit quads,
+    /// travel moves stay as thin lines. All layers are uploaded once;
+    /// visibility is controlled by `clip_z` in the shader.
+    pub fn upload_planned_toolpath(
         &mut self,
-        tp_layers: &[katana_core::offset::ToolpathLayer],
-        orig_layers: &[katana_core::slicer::Layer],
+        planned_layers: &[PlannedLayer],
+        nozzle_width: f32,
     ) {
-        let mut verts: Vec<f32> = Vec::new();
+        let mut quad_verts: Vec<f32> = Vec::new();
+        let mut line_verts: Vec<f32> = Vec::new();
 
-        // Perimeter colors: bright red → dim red
-        let colors: &[(f32, f32, f32, f32)] = &[
-            (0.91, 0.27, 0.38, 1.0),  // outermost
-            (0.79, 0.22, 0.31, 1.0),
-            (0.65, 0.18, 0.25, 1.0),
-            (0.52, 0.14, 0.20, 1.0),
-            (0.40, 0.10, 0.15, 1.0),  // innermost
-        ];
+        for layer in planned_layers {
+            let z = layer.z;
 
-        for (idx, tp_layer) in tp_layers.iter().enumerate() {
-            let z = tp_layer.z;
-
-            // Original contour in dim gray
-            if let Some(orig_layer) = orig_layers.get(idx) {
-                let (r, g, b, a) = (0.33, 0.33, 0.33, 0.5);
-                for contour in &orig_layer.contours {
-                    let pts = &contour.points;
-                    if pts.len() < 2 { continue; }
-                    for j in 0..pts.len() {
-                        let k = (j + 1) % pts.len();
-                        push_line_vert(&mut verts, pts[j].x, pts[j].y, z, r, g, b, a);
-                        push_line_vert(&mut verts, pts[k].x, pts[k].y, z, r, g, b, a);
+            for move_ in &layer.moves {
+                match move_.kind {
+                    MoveKind::Travel => {
+                        if move_.points.len() >= 2 {
+                            let (r, g, b, a) = (1.0, 0.8, 0.2, 0.4);
+                            let from = &move_.points[0];
+                            let to = &move_.points[1];
+                            push_line_vert(&mut line_verts, from.x, from.y, z, r, g, b, a);
+                            push_line_vert(&mut line_verts, to.x, to.y, z, r, g, b, a);
+                        }
                     }
-                }
-            }
-
-            for pset in &tp_layer.perimeter_sets {
-                for (level, perimeters) in pset.perimeters.iter().enumerate() {
-                    let &(r, g, b, a) = &colors[level.min(colors.len() - 1)];
-                    for perimeter in perimeters {
-                        let pts = &perimeter.points;
+                    MoveKind::Perimeter => {
+                        let (r, g, b, a) = (0.91, 0.27, 0.38, 1.0);
+                        let pts = &move_.points;
                         if pts.len() < 2 { continue; }
                         for j in 0..pts.len() {
                             let k = (j + 1) % pts.len();
-                            push_line_vert(&mut verts, pts[j].x, pts[j].y, z, r, g, b, a);
-                            push_line_vert(&mut verts, pts[k].x, pts[k].y, z, r, g, b, a);
+                            push_segment_tube(
+                                &mut quad_verts,
+                                pts[j].x, pts[j].y,
+                                pts[k].x, pts[k].y,
+                                z, nozzle_width,
+                                r, g, b, a,
+                            );
+                        }
+                    }
+                    MoveKind::Infill => {
+                        let (r, g, b, a) = (0.27, 0.91, 0.38, 0.8);
+                        if move_.points.len() >= 2 {
+                            let from = &move_.points[0];
+                            let to = &move_.points[1];
+                            push_segment_tube(
+                                &mut quad_verts,
+                                from.x, from.y,
+                                to.x, to.y,
+                                z, nozzle_width,
+                                r, g, b, a,
+                            );
+                        }
+                    }
+                    MoveKind::SurfaceInfill => {
+                        let (r, g, b, a) = (0.9, 0.2, 0.7, 0.9);
+                        if move_.points.len() >= 2 {
+                            let from = &move_.points[0];
+                            let to = &move_.points[1];
+                            push_segment_tube(
+                                &mut quad_verts,
+                                from.x, from.y,
+                                to.x, to.y,
+                                z, nozzle_width,
+                                r, g, b, a,
+                            );
                         }
                     }
                 }
-
-                // Infill boundary in blue
-                let (r, g, b, a) = (0.27, 0.38, 0.91, 0.8);
-                for boundary in &pset.infill_boundary {
-                    let pts = &boundary.points;
-                    if pts.len() < 2 { continue; }
-                    for j in 0..pts.len() {
-                        let k = (j + 1) % pts.len();
-                        push_line_vert(&mut verts, pts[j].x, pts[j].y, z, r, g, b, a);
-                        push_line_vert(&mut verts, pts[k].x, pts[k].y, z, r, g, b, a);
-                    }
-                }
-            }
-
-            // Infill lines in green
-            let (r, g, b, a) = (0.27, 0.91, 0.38, 0.8);
-            for line in &tp_layer.infill_lines {
-                push_line_vert(&mut verts, line.start.x, line.start.y, z, r, g, b, a);
-                push_line_vert(&mut verts, line.end.x, line.end.y, z, r, g, b, a);
             }
         }
 
-        let count = (verts.len() / LINE_STRIDE) as i32;
-        self.current_slice = Some(upload_line_buffer(&self.gl, &verts, count));
+        self.toolpath_quads = if quad_verts.is_empty() {
+            None
+        } else {
+            let count = (quad_verts.len() / MESH_STRIDE) as i32;
+            Some(upload_mesh_buffer(&self.gl, &quad_verts, count))
+        };
+        self.toolpath_lines = if line_verts.is_empty() {
+            None
+        } else {
+            let count = (line_verts.len() / LINE_STRIDE) as i32;
+            Some(upload_line_buffer(&self.gl, &line_verts, count))
+        };
     }
 
     /// Draw the scene into our own FBO (with depth buffer), then blit to screen.
@@ -285,7 +323,9 @@ impl Renderer {
             gl.enable(glow::BLEND);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
 
-            // Draw background
+            let no_clip: f32 = -1e30;
+
+            // Draw background (no z-clipping)
             match bg_mode {
                 super::BgMode::Mesh => {
                     if let Some(m) = &self.mesh {
@@ -294,6 +334,8 @@ impl Renderer {
                         gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
                         let loc = gl.get_uniform_location(self.mesh_program, "u_light_dir");
                         gl.uniform_3_f32_slice(loc.as_ref(), light_dir);
+                        let loc = gl.get_uniform_location(self.mesh_program, "u_clip_z");
+                        gl.uniform_1_f32(loc.as_ref(), no_clip);
                         draw_buffer(gl, m, glow::TRIANGLES);
                     }
                 }
@@ -302,21 +344,56 @@ impl Renderer {
                         gl.use_program(Some(self.line_program));
                         let loc = gl.get_uniform_location(self.line_program, "u_mvp");
                         gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
+                        let loc = gl.get_uniform_location(self.line_program, "u_clip_z");
+                        gl.uniform_1_f32(loc.as_ref(), no_clip);
                         draw_buffer(gl, s, glow::LINES);
                     }
                 }
                 super::BgMode::None => {}
             }
 
-            // Draw current slice on top of background (clear depth so the
-            // background mesh doesn't occlude it, but keep depth test enabled
-            // so that toolpath lines at different Z heights occlude correctly).
+            // Draw foreground with z-clipping (clear depth so BG doesn't
+            // occlude it, but keep depth test for inter-layer occlusion).
             gl.clear(glow::DEPTH_BUFFER_BIT);
-            if let Some(cs) = &self.current_slice {
-                gl.use_program(Some(self.line_program));
-                let loc = gl.get_uniform_location(self.line_program, "u_mvp");
-                gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
-                draw_buffer(gl, cs, glow::LINES);
+
+            let clip = self.clip_z;
+
+            // Contour view (lines)
+            if self.draw_contours {
+                if let Some(cs) = &self.current_slice {
+                    gl.use_program(Some(self.line_program));
+                    let loc = gl.get_uniform_location(self.line_program, "u_mvp");
+                    gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
+                    let loc = gl.get_uniform_location(self.line_program, "u_clip_z");
+                    gl.uniform_1_f32(loc.as_ref(), clip);
+                    draw_buffer(gl, cs, glow::LINES);
+                }
+            }
+
+            // Toolpath quads (lit triangles)
+            if self.draw_toolpaths {
+                if let Some(tq) = &self.toolpath_quads {
+                    gl.use_program(Some(self.mesh_program));
+                    let loc = gl.get_uniform_location(self.mesh_program, "u_mvp");
+                    gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
+                    let loc = gl.get_uniform_location(self.mesh_program, "u_light_dir");
+                    gl.uniform_3_f32_slice(loc.as_ref(), light_dir);
+                    let loc = gl.get_uniform_location(self.mesh_program, "u_clip_z");
+                    gl.uniform_1_f32(loc.as_ref(), clip);
+                    draw_buffer(gl, tq, glow::TRIANGLES);
+                }
+
+                // Toolpath travel lines
+                if self.show_travel_moves {
+                    if let Some(tl) = &self.toolpath_lines {
+                        gl.use_program(Some(self.line_program));
+                        let loc = gl.get_uniform_location(self.line_program, "u_mvp");
+                        gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
+                        let loc = gl.get_uniform_location(self.line_program, "u_clip_z");
+                        gl.uniform_1_f32(loc.as_ref(), clip);
+                        draw_buffer(gl, tl, glow::LINES);
+                    }
+                }
             }
 
             gl.disable(glow::BLEND);
@@ -383,7 +460,7 @@ impl Renderer {
             gl.delete_framebuffer(self.fbo);
             gl.delete_texture(self.fbo_color);
             gl.delete_renderbuffer(self.fbo_depth);
-            for buf in [&self.mesh, &self.slices, &self.current_slice]
+            for buf in [&self.mesh, &self.slices, &self.current_slice, &self.toolpath_quads, &self.toolpath_lines]
                 .into_iter()
                 .flatten()
             {
@@ -459,6 +536,81 @@ unsafe fn create_fbo(
 
 fn push_line_vert(buf: &mut Vec<f32>, x: f32, y: f32, z: f32, r: f32, g: f32, b: f32, a: f32) {
     buf.extend_from_slice(&[x, y, z, r, g, b, a]);
+}
+
+fn push_mesh_vert(
+    buf: &mut Vec<f32>,
+    x: f32, y: f32, z: f32,
+    nx: f32, ny: f32, nz: f32,
+    r: f32, g: f32, b: f32, a: f32,
+) {
+    buf.extend_from_slice(&[x, y, z, nx, ny, nz, r, g, b, a]);
+}
+
+const TUBE_SIDES: usize = 8;
+
+/// Emit a cylindrical tube (N-sided, 2N triangles) for segment A→B at height
+/// `z`, with diameter `w`. Produces outward-facing normals for proper lighting.
+fn push_segment_tube(
+    buf: &mut Vec<f32>,
+    ax: f32, ay: f32,
+    bx: f32, by: f32,
+    z: f32,
+    w: f32,
+    r: f32, g: f32, b: f32, a: f32,
+) {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-9 { return; }
+
+    let radius = w * 0.5;
+
+    // Two perpendicular basis vectors (segments are horizontal, same Z):
+    // perp1 lies in XY plane, perp2 points up in Z
+    let p1x = -dy / len;
+    let p1y =  dx / len;
+    // perp2 = (0, 0, 1)
+
+    for i in 0..TUBE_SIDES {
+        let theta0 = std::f32::consts::TAU * (i as f32) / (TUBE_SIDES as f32);
+        let theta1 = std::f32::consts::TAU * ((i + 1) as f32) / (TUBE_SIDES as f32);
+
+        let (c0, s0) = (theta0.cos(), theta0.sin());
+        let (c1, s1) = (theta1.cos(), theta1.sin());
+
+        // Ring positions at A
+        let a0x = ax + radius * (c0 * p1x);
+        let a0y = ay + radius * (c0 * p1y);
+        let a0z = z  + radius * s0;
+
+        let a1x = ax + radius * (c1 * p1x);
+        let a1y = ay + radius * (c1 * p1y);
+        let a1z = z  + radius * s1;
+
+        // Ring positions at B
+        let b0x = bx + radius * (c0 * p1x);
+        let b0y = by + radius * (c0 * p1y);
+        let b0z = z  + radius * s0;
+
+        let b1x = bx + radius * (c1 * p1x);
+        let b1y = by + radius * (c1 * p1y);
+        let b1z = z  + radius * s1;
+
+        // Outward normals
+        let (n0x, n0y, n0z) = (c0 * p1x, c0 * p1y, s0);
+        let (n1x, n1y, n1z) = (c1 * p1x, c1 * p1y, s1);
+
+        // Triangle 1: A0, B0, A1
+        push_mesh_vert(buf, a0x, a0y, a0z, n0x, n0y, n0z, r, g, b, a);
+        push_mesh_vert(buf, b0x, b0y, b0z, n0x, n0y, n0z, r, g, b, a);
+        push_mesh_vert(buf, a1x, a1y, a1z, n1x, n1y, n1z, r, g, b, a);
+
+        // Triangle 2: A1, B0, B1
+        push_mesh_vert(buf, a1x, a1y, a1z, n1x, n1y, n1z, r, g, b, a);
+        push_mesh_vert(buf, b0x, b0y, b0z, n0x, n0y, n0z, r, g, b, a);
+        push_mesh_vert(buf, b1x, b1y, b1z, n1x, n1y, n1z, r, g, b, a);
+    }
 }
 
 fn upload_line_buffer(gl: &glow::Context, data: &[f32], vertex_count: i32) -> GpuBuffer {
@@ -555,6 +707,7 @@ pub fn build_mvp(
     zoom: f32,
     extent: f32,
     aspect: f32,
+    _pan: (f32, f32),  // Currently unused; panning handled by updating center directly
 ) -> [f32; 16] {
     let s = 2.0 * zoom / extent;
     let sx = if aspect > 1.0 { s / aspect } else { s };
@@ -577,6 +730,8 @@ pub fn build_mvp(
     let r21 = sz * ce * ca;
     let r22 = sz * se;
 
+    // Translation to center on the target point
+    // (pan is now handled by updating center directly in world space)
     let t0 = -(r00 * tx + r01 * ty + r02 * tz);
     let t1 = -(r10 * tx + r11 * ty + r12 * tz);
     let t2 = -(r20 * tx + r21 * ty + r22 * tz);

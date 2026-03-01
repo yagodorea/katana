@@ -48,6 +48,15 @@ pub struct InfillConfig {
     pub nozzle_width: f32,
 }
 
+/// Configuration for top/bottom surface layers.
+#[derive(Debug, Clone)]
+pub struct SurfaceConfig {
+    /// Number of solid bottom layers (first N layers from build plate).
+    pub bottom_layers: usize,
+    /// Number of solid top layers (last N layers before top of model).
+    pub top_layers: usize,
+}
+
 /// A fully processed layer with perimeter toolpaths and infill.
 #[derive(Debug, Clone)]
 pub struct ToolpathLayer {
@@ -55,6 +64,9 @@ pub struct ToolpathLayer {
     pub layer_index: usize,
     pub perimeter_sets: Vec<PerimeterSet>,
     pub infill_lines: Vec<InfillLine>,
+    /// Solid surface infill for top/bottom layers (monotonic unidirectional).
+    /// Only present on layers configured as top or bottom surfaces.
+    pub surface_infill_lines: Vec<InfillLine>,
 }
 
 /// Result of generating toolpaths for all layers.
@@ -262,8 +274,10 @@ use i_overlay::mesh::style::{LineJoin, OutlineStyle};
 pub fn generate_perimeters(
     layer: &Layer,
     layer_index: usize,
+    total_layers: usize,
     perim_config: &PerimeterConfig,
     infill_config: &InfillConfig,
+    surface_config: &SurfaceConfig,
 ) -> ToolpathLayer {
     let shapes = classify_contours(&layer.contours);
     let mut perimeter_sets = Vec::new();
@@ -326,14 +340,38 @@ pub fn generate_perimeters(
         });
     }
 
+    // Determine if this is a top or bottom surface layer
+    let is_bottom_layer = layer_index < surface_config.bottom_layers;
+    let is_top_layer = layer_index >= total_layers.saturating_sub(surface_config.top_layers);
+    let is_surface_layer = is_bottom_layer || is_top_layer;
+
     // Generate infill
-    let infill_lines = generate_infill(&perimeter_sets, infill_config);
+    let infill_lines = if is_surface_layer {
+        // Surface layers get monotonic solid infill instead of regular infill
+        Vec::new()
+    } else {
+        generate_infill(&perimeter_sets, infill_config)
+    };
+
+    // Generate monotonic surface infill for top/bottom layers
+    let surface_infill_lines = if is_surface_layer {
+        // Alternate between 45° and 135° each layer for cross-hatched strength
+        let angle = if layer_index % 2 == 0 {
+            std::f32::consts::FRAC_PI_4
+        } else {
+            std::f32::consts::FRAC_PI_4 + std::f32::consts::FRAC_PI_2
+        };
+        generate_monotonic_surface_infill(&perimeter_sets, perim_config.nozzle_width, angle)
+    } else {
+        Vec::new()
+    };
 
     ToolpathLayer {
         z: layer.z,
         layer_index,
         perimeter_sets,
         infill_lines,
+        surface_infill_lines,
     }
 }
 
@@ -443,8 +481,8 @@ fn generate_infill(
             }
         }
 
-        // Horizontal scan lines
-        let mut y = min_y + spacing;
+        // Horizontal scan lines at absolute grid positions (aligned to origin)
+        let mut y = (min_y / spacing).ceil() * spacing;
         while y < max_y {
             for (x0, x1) in clip_horizontal_line(y, &edges, min_x, max_x) {
                 all_lines.push(InfillLine {
@@ -455,8 +493,8 @@ fn generate_infill(
             y += spacing;
         }
 
-        // Vertical scan lines
-        let mut x = min_x + spacing;
+        // Vertical scan lines at absolute grid positions (aligned to origin)
+        let mut x = (min_x / spacing).ceil() * spacing;
         while x < max_x {
             for (y0, y1) in clip_vertical_line(x, &edges, min_y, max_y) {
                 all_lines.push(InfillLine {
@@ -471,19 +509,91 @@ fn generate_infill(
     all_lines
 }
 
+/// Generate monotonic surface infill for solid top/bottom layers at an
+/// arbitrary angle. Rotates the boundary into axis-aligned space, runs
+/// horizontal scan lines, then rotates results back.
+fn generate_monotonic_surface_infill(
+    perimeter_sets: &[PerimeterSet],
+    nozzle_width: f32,
+    angle: f32,
+) -> Vec<InfillLine> {
+    let cos = angle.cos();
+    let sin = angle.sin();
+
+    // Rotate a point by -angle (into scan-line space)
+    let rotate_fwd = |x: f32, y: f32| -> [f32; 2] {
+        [x * cos + y * sin, -x * sin + y * cos]
+    };
+    // Rotate a point by +angle (back to world space)
+    let rotate_inv = |u: f32, v: f32| -> Point2<f32> {
+        Point2::new(u * cos - v * sin, u * sin + v * cos)
+    };
+
+    let spacing = nozzle_width;
+    let mut all_lines = Vec::new();
+
+    for pset in perimeter_sets {
+        if pset.infill_boundary.is_empty() {
+            continue;
+        }
+
+        // Build rotated edge list and bounding box
+        let mut edges: Vec<([f32; 2], [f32; 2])> = Vec::new();
+        let mut min_u = f32::INFINITY;
+        let mut min_v = f32::INFINITY;
+        let mut max_u = f32::NEG_INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+
+        for contour in &pset.infill_boundary {
+            let pts = &contour.points;
+            let n = pts.len();
+            if n < 3 {
+                continue;
+            }
+            for i in 0..n {
+                let j = (i + 1) % n;
+                let p0 = rotate_fwd(pts[i].x, pts[i].y);
+                let p1 = rotate_fwd(pts[j].x, pts[j].y);
+                edges.push((p0, p1));
+                min_u = min_u.min(p0[0]).min(p1[0]);
+                min_v = min_v.min(p0[1]).min(p1[1]);
+                max_u = max_u.max(p0[0]).max(p1[0]);
+                max_v = max_v.max(p0[1]).max(p1[1]);
+            }
+        }
+
+        // Horizontal scan lines in rotated space at absolute grid positions
+        let half = spacing / 2.0;
+        let mut v = ((min_v - half) / spacing).ceil() * spacing + half;
+        while v < max_v {
+            for (u0, u1) in clip_horizontal_line(v, &edges, min_u, max_u) {
+                all_lines.push(InfillLine {
+                    start: rotate_inv(u0, v),
+                    end: rotate_inv(u1, v),
+                });
+            }
+            v += spacing;
+        }
+    }
+
+    all_lines
+}
+
 /// Generate toolpaths for all layers (parallelized across cores).
 pub fn generate_toolpaths(
     slice_result: &SliceResult,
     perim_config: &PerimeterConfig,
     infill_config: &InfillConfig,
+    surface_config: &SurfaceConfig,
 ) -> ToolpathResult {
     use rayon::prelude::*;
 
+    let total_layers = slice_result.layers.len();
     let layers = slice_result
         .layers
         .par_iter()
         .enumerate()
-        .map(|(i, layer)| generate_perimeters(layer, i, perim_config, infill_config))
+        .map(|(i, layer)| generate_perimeters(layer, i, total_layers, perim_config, infill_config, surface_config))
         .collect();
     ToolpathResult { layers }
 }
@@ -581,7 +691,14 @@ mod tests {
             nozzle_width: 0.2,
             perimeter_count: 1,
         };
-        let toolpath = generate_perimeters(layer, 2, &config, &no_infill());
+        let toolpath = generate_perimeters(
+            layer,
+            2,
+            result.layers.len(),
+            &config,
+            &no_infill(),
+            &SurfaceConfig { bottom_layers: 0, top_layers: 0 },
+        );
 
         assert_eq!(toolpath.perimeter_sets.len(), 1, "Cube should produce 1 shape");
         assert_eq!(
@@ -610,7 +727,14 @@ mod tests {
             nozzle_width: 5.0,
         };
 
-        let tp = generate_perimeters(&result.layers[4], 0, &perim_config, &infill_config);
+        let tp = generate_perimeters(
+            &result.layers[4],
+            0,
+            result.layers.len(),
+            &perim_config,
+            &infill_config,
+            &SurfaceConfig { bottom_layers: 0, top_layers: 0 },
+        );
 
         assert!(
             !tp.infill_lines.is_empty(),
@@ -650,7 +774,14 @@ mod tests {
             nozzle_width: 5.0,
         };
 
-        let tp = generate_perimeters(&result.layers[4], 0, &perim_config, &infill_config);
+        let tp = generate_perimeters(
+            &result.layers[4],
+            0,
+            result.layers.len(),
+            &perim_config,
+            &infill_config,
+            &SurfaceConfig { bottom_layers: 0, top_layers: 0 },
+        );
         assert!(!tp.infill_lines.is_empty(), "Expected infill lines");
 
         let tol = 0.1;
@@ -721,13 +852,21 @@ mod tests {
         };
 
         // Test a mid-height layer (away from poles)
-        let mid_layer = result
+        let (mid_layer_idx, mid_layer) = result
             .layers
             .iter()
-            .find(|l| l.z > 20.0 && l.z < 30.0)
+            .enumerate()
+            .find(|(_, l)| l.z > 20.0 && l.z < 30.0)
             .expect("Expected mid-range layer");
 
-        let tp = generate_perimeters(mid_layer, 0, &perim_config, &infill_config);
+        let tp = generate_perimeters(
+            mid_layer,
+            mid_layer_idx,
+            result.layers.len(),
+            &perim_config,
+            &infill_config,
+            &SurfaceConfig { bottom_layers: 0, top_layers: 0 },
+        );
         assert!(
             !tp.infill_lines.is_empty(),
             "Expected infill lines on sphere mid-layer at z={}",

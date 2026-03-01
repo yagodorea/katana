@@ -38,6 +38,12 @@ enum Command {
         /// Infill density (0.0 = hollow, 1.0 = solid)
         #[arg(short = 'd', long, default_value_t = 0.2)]
         infill_density: f32,
+        /// Number of bottom solid layers
+        #[arg(long, default_value_t = 3)]
+        bottom_layers: usize,
+        /// Number of top solid layers
+        #[arg(long, default_value_t = 3)]
+        top_layers: usize,
     },
 }
 
@@ -53,7 +59,9 @@ fn main() {
             nozzle_width,
             perimeters,
             infill_density,
-        } => cmd_slice(&file, layer_height, &output, nozzle_width, perimeters, infill_density),
+            bottom_layers,
+            top_layers,
+        } => cmd_slice(&file, layer_height, &output, nozzle_width, perimeters, infill_density, bottom_layers, top_layers),
     }
 }
 
@@ -87,7 +95,7 @@ fn cmd_info(file: &str) {
     println!("  Volume: {:.3}", mesh.volume());
 }
 
-fn cmd_slice(file: &str, layer_height: f32, output_dir: &str, nozzle_width: f32, perimeters: usize, infill_density: f32) {
+fn cmd_slice(file: &str, layer_height: f32, output_dir: &str, nozzle_width: f32, perimeters: usize, infill_density: f32, bottom_layers: usize, top_layers: usize) {
     let t_load = Instant::now();
     let mesh = load_mesh(file);
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
@@ -97,6 +105,7 @@ fn cmd_slice(file: &str, layer_height: f32, output_dir: &str, nozzle_width: f32,
     println!("  Triangles: {} (loaded in {:.1}ms)", mesh.triangles.len(), load_ms);
     println!("  Layer height: {layer_height} mm");
     println!("  Nozzle: {nozzle_width} mm, {perimeters} perimeters, {:.0}% infill", infill_density * 100.0);
+    println!("  Bottom layers: {bottom_layers}, Top layers: {top_layers}");
     println!(
         "  Z range: {:.3} to {:.3}",
         min.z, max.z
@@ -116,9 +125,13 @@ fn cmd_slice(file: &str, layer_height: f32, output_dir: &str, nozzle_width: f32,
         density: infill_density,
         nozzle_width,
     };
+    let surface_config = offset::SurfaceConfig {
+        bottom_layers,
+        top_layers,
+    };
 
     let t_offset = Instant::now();
-    let toolpath_result = offset::generate_toolpaths(&result, &perim_config, &infill_config);
+    let toolpath_result = offset::generate_toolpaths(&result, &perim_config, &infill_config, &surface_config);
     let offset_ms = t_offset.elapsed().as_secs_f64() * 1000.0;
 
     println!("  Perimeters generated in {:.1}ms", offset_ms);

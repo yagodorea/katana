@@ -4,7 +4,7 @@ use std::time::Instant;
 use clap::Parser;
 use eframe::egui;
 use eframe::glow;
-use katana_core::{offset, slicer, stl};
+use katana_core::{offset, planner, slicer, stl};
 
 mod renderer;
 
@@ -25,6 +25,12 @@ struct Args {
     /// Infill density %
     #[arg(short, long, default_value_t = 20)]
     infill_density: usize,
+    /// Number of bottom solid layers
+    #[arg(long, default_value_t = 3)]
+    bottom_layers: usize,
+    /// Number of top solid layers
+    #[arg(long, default_value_t = 3)]
+    top_layers: usize,
 }
 
 fn main() -> eframe::Result {
@@ -56,20 +62,29 @@ fn main() -> eframe::Result {
         density: args.infill_density as f32 / 100.0,
         nozzle_width: args.nozzle_width,
     };
+    let surface_config = offset::SurfaceConfig {
+        bottom_layers: args.bottom_layers,
+        top_layers: args.top_layers,
+    };
 
     let t_offset = Instant::now();
-    let toolpath_result = offset::generate_toolpaths(&result, &perim_config, &infill_config);
+    let toolpath_result = offset::generate_toolpaths(&result, &perim_config, &infill_config, &surface_config);
     let offset_ms = t_offset.elapsed().as_secs_f64() * 1000.0;
+
+    let t_plan = Instant::now();
+    let planned_result = planner::plan_toolpaths(&toolpath_result);
+    let plan_ms = t_plan.elapsed().as_secs_f64() * 1000.0;
 
     println!(
         "Loaded {} ({} triangles) in {:.1}ms",
         args.file, num_triangles, load_ms
     );
     println!(
-        "Sliced {} layers in {:.1}ms, perimeters in {:.1}ms",
+        "Sliced {} layers in {:.1}ms, perimeters in {:.1}ms, planning in {:.1}ms",
         result.layers.len(),
         slice_ms,
         offset_ms,
+        plan_ms,
     );
 
     let center_x = (mesh_min.x + mesh_max.x) / 2.0;
@@ -81,7 +96,6 @@ fn main() -> eframe::Result {
 
     let triangles = mesh.triangles;
     let layers = result.layers;
-    let toolpath_layers = toolpath_result.layers;
     let num_layers = layers.len();
 
     let options = eframe::NativeOptions {
@@ -99,9 +113,14 @@ fn main() -> eframe::Result {
             gpu.upload_mesh(&triangles);
             gpu.upload_all_slices(&layers, 1);
 
-            // Upload all layers as toolpath view by default
-            if !toolpath_layers.is_empty() {
-                gpu.upload_current_toolpath(&toolpath_layers, &layers);
+            // Upload ALL contour + toolpath data once; layer visibility
+            // is controlled by the u_clip_z shader uniform.
+            gpu.upload_current_slice(&layers);
+            gpu.upload_planned_toolpath(&planned_result.layers, args.nozzle_width);
+
+            // Start showing all layers from the bottom
+            if !layers.is_empty() {
+                gpu.clip_z = layers[0].z - 0.001;
             }
 
             let renderer = Arc::new(Mutex::new(gpu));
@@ -109,10 +128,8 @@ fn main() -> eframe::Result {
             Ok(Box::new(ViewerApp {
                 renderer,
                 layers,
-                toolpath_layers,
                 num_layers,
                 current_layer: 0,
-                prev_layer: usize::MAX,
                 slice_view: SliceView::Toolpaths,
                 center: [center_x, center_y, center_z],
                 extent,
@@ -126,7 +143,9 @@ fn main() -> eframe::Result {
                     load_ms,
                     slice_ms,
                     offset_ms,
+                    plan_ms,
                 },
+                show_travel_moves: true,
             }))
         }),
     )
@@ -150,15 +169,14 @@ struct Stats {
     load_ms: f64,
     slice_ms: f64,
     offset_ms: f64,
+    plan_ms: f64,
 }
 
 struct ViewerApp {
     renderer: Arc<Mutex<renderer::Renderer>>,
     layers: Vec<slicer::Layer>,
-    toolpath_layers: Vec<offset::ToolpathLayer>,
     num_layers: usize,
     current_layer: usize,
-    prev_layer: usize,
     slice_view: SliceView,
     center: [f32; 3],
     extent: f32,
@@ -167,30 +185,12 @@ struct ViewerApp {
     zoom: f32,
     pan: egui::Vec2,
     bg_mode: BgMode,
+    show_travel_moves: bool,
     stats: Stats,
 }
 
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Re-upload current slice/toolpath if layer or view mode changed
-        if self.current_layer != self.prev_layer && !self.layers.is_empty() {
-            match self.slice_view {
-                SliceView::Contours => {
-                    self.renderer
-                        .lock()
-                        .unwrap()
-                        .upload_current_slice(&self.layers[self.current_layer..]);
-                }
-                SliceView::Toolpaths => {
-                    self.renderer.lock().unwrap().upload_current_toolpath(
-                        &self.toolpath_layers[self.current_layer..],
-                        &self.layers[self.current_layer..],
-                    );
-                }
-            }
-            self.prev_layer = self.current_layer;
-        }
-
         // Top panel
         egui::TopBottomPanel::top("info").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -205,6 +205,12 @@ impl eframe::App for ViewerApp {
                     self.num_layers,
                     layer.z,
                 ));
+                if ui.button("◀ Prev").clicked() && self.current_layer > 0 {
+                    self.current_layer -= 1;
+                }
+                if ui.button("Next ▶").clicked() && self.current_layer < self.num_layers.saturating_sub(1) {
+                    self.current_layer += 1;
+                }
                 ui.separator();
                 ui.label("BG:");
                 ui.selectable_value(&mut self.bg_mode, BgMode::Mesh, "Mesh");
@@ -212,20 +218,18 @@ impl eframe::App for ViewerApp {
                 ui.selectable_value(&mut self.bg_mode, BgMode::None, "None");
                 ui.separator();
                 ui.label("View:");
-                let prev_view = self.slice_view;
                 ui.selectable_value(&mut self.slice_view, SliceView::Contours, "Contours");
                 ui.selectable_value(&mut self.slice_view, SliceView::Toolpaths, "Toolpaths");
-                // Force re-upload if view mode changed
-                if self.slice_view != prev_view {
-                    self.prev_layer = usize::MAX;
-                }
+                ui.separator();
+                ui.checkbox(&mut self.show_travel_moves, "Show travel moves");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!(
-                        "{} tris | load: {:.0}ms, slice: {:.0}ms, offset: {:.0}ms",
+                        "{} tris | load: {:.0}ms, slice: {:.0}ms, offset: {:.0}ms, plan: {:.0}ms",
                         self.stats.triangles,
                         self.stats.load_ms,
                         self.stats.slice_ms,
                         self.stats.offset_ms,
+                        self.stats.plan_ms,
                     ));
                 });
             });
@@ -260,16 +264,57 @@ impl eframe::App for ViewerApp {
 
                 if response.dragged_by(egui::PointerButton::Primary) {
                     let delta = response.drag_delta();
-                    self.azimuth -= delta.x * 0.005;
-                    self.elevation = (self.elevation + delta.y * 0.005).clamp(
-                        -std::f32::consts::FRAC_PI_2 + 0.01,
-                        std::f32::consts::FRAC_PI_2 - 0.01,
-                    );
+                    // Check if Command (Mac) or Ctrl (Windows/Linux) is pressed for panning
+                    let command_pressed = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+                    if command_pressed {
+                        // Command+drag: pan the camera in world space
+                        // Transform screen-space delta to world space based on camera orientation
+                        let ca = self.azimuth.cos();
+                        let sa = self.azimuth.sin();
+                        let ce = self.elevation.cos();
+                        let se = self.elevation.sin();
+                        let pan_world_scale = self.extent / (2.0 * self.zoom);
+                        // Screen X -> world: rotated by azimuth (horizontal plane only)
+                        let right_x = ca;
+                        let right_y = -sa;
+                        let right_z = 0.0;
+                        // Screen Y -> world: camera's up vector, affected by both azimuth and elevation
+                        // After rotation: up in world space is (-sa*se, ca*se, ce)
+                        let up_x = -sa * se;
+                        let up_y = ca * se;
+                        let up_z = ce;
+                        // Combine deltas (note: dragging UP on screen means looking DOWN in world)
+                        self.center[0] += (delta.x * right_x - delta.y * up_x) * pan_world_scale * 0.001;
+                        self.center[1] += (delta.x * right_y - delta.y * up_y) * pan_world_scale * 0.001;
+                        self.center[2] += (delta.x * right_z - delta.y * up_z) * pan_world_scale * 0.001;
+                    } else {
+                        // Regular drag: rotate the camera
+                        self.azimuth -= delta.x * 0.005;
+                        self.elevation = (self.elevation + delta.y * 0.005).clamp(
+                            -std::f32::consts::FRAC_PI_2 + 0.01,
+                            std::f32::consts::FRAC_PI_2 - 0.01,
+                        );
+                    }
                 }
                 if response.dragged_by(egui::PointerButton::Middle)
                     || response.dragged_by(egui::PointerButton::Secondary)
                 {
-                    self.pan += response.drag_delta();
+                    let delta = response.drag_delta();
+                    // Middle/right drag: also pan in world space
+                    let ca = self.azimuth.cos();
+                    let sa = self.azimuth.sin();
+                    let ce = self.elevation.cos();
+                    let se = self.elevation.sin();
+                    let pan_world_scale = self.extent / (2.0 * self.zoom);
+                    let right_x = ca;
+                    let right_y = -sa;
+                    let right_z = 0.0;
+                    let up_x = -sa * se;
+                    let up_y = ca * se;
+                    let up_z = ce;
+                    self.center[0] += (delta.x * right_x - delta.y * up_x) * pan_world_scale * 0.001;
+                    self.center[1] += (delta.x * right_y - delta.y * up_y) * pan_world_scale * 0.001;
+                    self.center[2] += (delta.x * right_z - delta.y * up_z) * pan_world_scale * 0.001;
                 }
 
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -297,6 +342,15 @@ impl eframe::App for ViewerApp {
                     }
                 });
 
+                // Update renderer state (clip_z, draw mode) — no re-upload needed
+                if !self.layers.is_empty() {
+                    let mut r = self.renderer.lock().unwrap();
+                    r.clip_z = self.layers[self.current_layer].z - 0.001;
+                    r.draw_contours = self.slice_view == SliceView::Contours;
+                    r.draw_toolpaths = self.slice_view == SliceView::Toolpaths;
+                    r.show_travel_moves = self.show_travel_moves;
+                }
+
                 let rect = response.rect;
                 let aspect = rect.width() / rect.height();
                 let mvp = renderer::build_mvp(
@@ -306,6 +360,7 @@ impl eframe::App for ViewerApp {
                     self.zoom,
                     self.extent,
                     aspect,
+                    (self.pan.x, self.pan.y),
                 );
 
                 let bg_mode = self.bg_mode;

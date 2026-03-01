@@ -22,7 +22,8 @@ This workspace contains 3 programs:
 - [X] Parameterizes slicing and toolpathing powered by `nalgebra` and `i_overlay`
 - [X] Rectilinear infill
 - [X] GPU-rendered visualizer built on `eframe` and `glow`
-- [ ] Calculate travel moves and segment connections
+- [X] Rendering toolpaths with thickness
+    - [ ] Fix bug where filaments are clipped by next layer
+- [ ] :loading: Calculate travel moves and segment connections
 - [ ] G-code export
-- [ ] Rendering toolpaths with thickness
 - [ ] Add more infill patterns
