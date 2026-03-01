@@ -99,9 +99,9 @@ fn main() -> eframe::Result {
             gpu.upload_mesh(&triangles);
             gpu.upload_all_slices(&layers, 1);
 
-            // Upload first layer as toolpath view by default
+            // Upload all layers as toolpath view by default
             if !toolpath_layers.is_empty() {
-                gpu.upload_current_toolpath(&toolpath_layers[0], &layers[0]);
+                gpu.upload_current_toolpath(&toolpath_layers, &layers);
             }
 
             let renderer = Arc::new(Mutex::new(gpu));
@@ -179,12 +179,12 @@ impl eframe::App for ViewerApp {
                     self.renderer
                         .lock()
                         .unwrap()
-                        .upload_current_slice(&self.layers[self.current_layer]);
+                        .upload_current_slice(&self.layers[self.current_layer..]);
                 }
                 SliceView::Toolpaths => {
                     self.renderer.lock().unwrap().upload_current_toolpath(
-                        &self.toolpath_layers[self.current_layer],
-                        &self.layers[self.current_layer],
+                        &self.toolpath_layers[self.current_layer..],
+                        &self.layers[self.current_layer..],
                     );
                 }
             }
@@ -231,19 +231,25 @@ impl eframe::App for ViewerApp {
             });
         });
 
-        // Bottom panel: full-width slider
-        egui::TopBottomPanel::bottom("slider").show(ctx, |ui| {
-            if self.num_layers == 0 {
-                return;
-            }
-            ui.add_space(2.0);
-            let max = self.num_layers.saturating_sub(1);
-            ui.spacing_mut().slider_width = ui.available_width() - 16.0;
-            ui.add(
-                egui::Slider::new(&mut self.current_layer, 0..=max).show_value(false),
-            );
-            ui.add_space(2.0);
-        });
+        // Left panel: vertical layer slider
+        egui::SidePanel::left("slider")
+            .resizable(false)
+            .exact_width(32.0)
+            .show(ctx, |ui| {
+                if self.num_layers == 0 {
+                    return;
+                }
+                let max = self.num_layers.saturating_sub(1);
+                // Invert so top of slider = layer 0 (all layers visible)
+                let mut inverted = max - self.current_layer;
+                ui.spacing_mut().slider_width = ui.available_height() - 16.0;
+                ui.add(
+                    egui::Slider::new(&mut inverted, 0..=max)
+                        .vertical()
+                        .show_value(false),
+                );
+                self.current_layer = max - inverted;
+            });
 
         // Central panel
         egui::CentralPanel::default()

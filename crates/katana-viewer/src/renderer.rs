@@ -153,19 +153,21 @@ impl Renderer {
         self.slices = Some(upload_line_buffer(&self.gl, &verts, count));
     }
 
-    pub fn upload_current_slice(&mut self, layer: &katana_core::slicer::Layer) {
+    pub fn upload_current_slice(&mut self, layers: &[katana_core::slicer::Layer]) {
         let mut verts: Vec<f32> = Vec::new();
         let (r, g, b, a) = (0.91, 0.27, 0.38, 1.0);
 
-        for contour in &layer.contours {
-            let pts = &contour.points;
-            if pts.len() < 2 {
-                continue;
-            }
-            for j in 0..pts.len() {
-                let k = (j + 1) % pts.len();
-                push_line_vert(&mut verts, pts[j].x, pts[j].y, layer.z, r, g, b, a);
-                push_line_vert(&mut verts, pts[k].x, pts[k].y, layer.z, r, g, b, a);
+        for layer in layers {
+            for contour in &layer.contours {
+                let pts = &contour.points;
+                if pts.len() < 2 {
+                    continue;
+                }
+                for j in 0..pts.len() {
+                    let k = (j + 1) % pts.len();
+                    push_line_vert(&mut verts, pts[j].x, pts[j].y, layer.z, r, g, b, a);
+                    push_line_vert(&mut verts, pts[k].x, pts[k].y, layer.z, r, g, b, a);
+                }
             }
         }
 
@@ -173,28 +175,15 @@ impl Renderer {
         self.current_slice = Some(upload_line_buffer(&self.gl, &verts, count));
     }
 
-    /// Upload a toolpath layer (perimeters + infill boundary) with color-coded levels.
+    /// Upload toolpath layers (perimeters + infill boundary) with color-coded levels.
     pub fn upload_current_toolpath(
         &mut self,
-        tp_layer: &katana_core::offset::ToolpathLayer,
-        orig_layer: &katana_core::slicer::Layer,
+        tp_layers: &[katana_core::offset::ToolpathLayer],
+        orig_layers: &[katana_core::slicer::Layer],
     ) {
         let mut verts: Vec<f32> = Vec::new();
-        let z = tp_layer.z;
 
-        // Original contour in dim gray
-        let (r, g, b, a) = (0.33, 0.33, 0.33, 0.5);
-        for contour in &orig_layer.contours {
-            let pts = &contour.points;
-            if pts.len() < 2 { continue; }
-            for j in 0..pts.len() {
-                let k = (j + 1) % pts.len();
-                push_line_vert(&mut verts, pts[j].x, pts[j].y, z, r, g, b, a);
-                push_line_vert(&mut verts, pts[k].x, pts[k].y, z, r, g, b, a);
-            }
-        }
-
-        // Perimeters: bright red → dim red
+        // Perimeter colors: bright red → dim red
         let colors: &[(f32, f32, f32, f32)] = &[
             (0.91, 0.27, 0.38, 1.0),  // outermost
             (0.79, 0.22, 0.31, 1.0),
@@ -203,11 +192,14 @@ impl Renderer {
             (0.40, 0.10, 0.15, 1.0),  // innermost
         ];
 
-        for pset in &tp_layer.perimeter_sets {
-            for (level, perimeters) in pset.perimeters.iter().enumerate() {
-                let &(r, g, b, a) = &colors[level.min(colors.len() - 1)];
-                for perimeter in perimeters {
-                    let pts = &perimeter.points;
+        for (idx, tp_layer) in tp_layers.iter().enumerate() {
+            let z = tp_layer.z;
+
+            // Original contour in dim gray
+            if let Some(orig_layer) = orig_layers.get(idx) {
+                let (r, g, b, a) = (0.33, 0.33, 0.33, 0.5);
+                for contour in &orig_layer.contours {
+                    let pts = &contour.points;
                     if pts.len() < 2 { continue; }
                     for j in 0..pts.len() {
                         let k = (j + 1) % pts.len();
@@ -217,24 +209,39 @@ impl Renderer {
                 }
             }
 
-            // Infill boundary in blue
-            let (r, g, b, a) = (0.27, 0.38, 0.91, 0.8);
-            for boundary in &pset.infill_boundary {
-                let pts = &boundary.points;
-                if pts.len() < 2 { continue; }
-                for j in 0..pts.len() {
-                    let k = (j + 1) % pts.len();
-                    push_line_vert(&mut verts, pts[j].x, pts[j].y, z, r, g, b, a);
-                    push_line_vert(&mut verts, pts[k].x, pts[k].y, z, r, g, b, a);
+            for pset in &tp_layer.perimeter_sets {
+                for (level, perimeters) in pset.perimeters.iter().enumerate() {
+                    let &(r, g, b, a) = &colors[level.min(colors.len() - 1)];
+                    for perimeter in perimeters {
+                        let pts = &perimeter.points;
+                        if pts.len() < 2 { continue; }
+                        for j in 0..pts.len() {
+                            let k = (j + 1) % pts.len();
+                            push_line_vert(&mut verts, pts[j].x, pts[j].y, z, r, g, b, a);
+                            push_line_vert(&mut verts, pts[k].x, pts[k].y, z, r, g, b, a);
+                        }
+                    }
+                }
+
+                // Infill boundary in blue
+                let (r, g, b, a) = (0.27, 0.38, 0.91, 0.8);
+                for boundary in &pset.infill_boundary {
+                    let pts = &boundary.points;
+                    if pts.len() < 2 { continue; }
+                    for j in 0..pts.len() {
+                        let k = (j + 1) % pts.len();
+                        push_line_vert(&mut verts, pts[j].x, pts[j].y, z, r, g, b, a);
+                        push_line_vert(&mut verts, pts[k].x, pts[k].y, z, r, g, b, a);
+                    }
                 }
             }
-        }
 
-        // Infill lines in green
-        let (r, g, b, a) = (0.27, 0.91, 0.38, 0.8);
-        for line in &tp_layer.infill_lines {
-            push_line_vert(&mut verts, line.start.x, line.start.y, z, r, g, b, a);
-            push_line_vert(&mut verts, line.end.x, line.end.y, z, r, g, b, a);
+            // Infill lines in green
+            let (r, g, b, a) = (0.27, 0.91, 0.38, 0.8);
+            for line in &tp_layer.infill_lines {
+                push_line_vert(&mut verts, line.start.x, line.start.y, z, r, g, b, a);
+                push_line_vert(&mut verts, line.end.x, line.end.y, z, r, g, b, a);
+            }
         }
 
         let count = (verts.len() / LINE_STRIDE) as i32;
@@ -301,8 +308,10 @@ impl Renderer {
                 super::BgMode::None => {}
             }
 
-            // Draw current slice on top (no depth test so always visible)
-            gl.disable(glow::DEPTH_TEST);
+            // Draw current slice on top of background (clear depth so the
+            // background mesh doesn't occlude it, but keep depth test enabled
+            // so that toolpath lines at different Z heights occlude correctly).
+            gl.clear(glow::DEPTH_BUFFER_BIT);
             if let Some(cs) = &self.current_slice {
                 gl.use_program(Some(self.line_program));
                 let loc = gl.get_uniform_location(self.line_program, "u_mvp");
