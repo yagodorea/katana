@@ -17,8 +17,12 @@ This workspace contains 3 programs:
 - `cargo build`
 - `cargo run -p katana-viewer -- stls/liver.stl`
 
-## Features
+## TODO list
 - [X] SLT parsing (bin and ASCII)
 - [X] Parameterizes slicing and toolpathing powered by `nalgebra` and `i_overlay`
 - [X] Rectilinear infill
 - [X] GPU-rendered visualizer built on `eframe` and `glow`
+- [ ] Calculate travel moves and segment connections
+- [ ] G-code export
+- [ ] Rendering toolpaths with thickness
+- [ ] Add more infill patterns
