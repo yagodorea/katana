@@ -146,6 +146,7 @@ fn main() -> eframe::Result {
                     plan_ms,
                 },
                 show_travel_moves: true,
+                show_filaments: true,
             }))
         }),
     )
@@ -186,6 +187,7 @@ struct ViewerApp {
     pan: egui::Vec2,
     bg_mode: BgMode,
     show_travel_moves: bool,
+    show_filaments: bool,
     stats: Stats,
 }
 
@@ -221,7 +223,8 @@ impl eframe::App for ViewerApp {
                 ui.selectable_value(&mut self.slice_view, SliceView::Contours, "Contours");
                 ui.selectable_value(&mut self.slice_view, SliceView::Toolpaths, "Toolpaths");
                 ui.separator();
-                ui.checkbox(&mut self.show_travel_moves, "Show travel moves");
+                ui.checkbox(&mut self.show_filaments, "3D filaments");
+                ui.checkbox(&mut self.show_travel_moves, "Travel moves");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!(
                         "{} tris | load: {:.0}ms, slice: {:.0}ms, offset: {:.0}ms, plan: {:.0}ms",
@@ -349,6 +352,7 @@ impl eframe::App for ViewerApp {
                     r.draw_contours = self.slice_view == SliceView::Contours;
                     r.draw_toolpaths = self.slice_view == SliceView::Toolpaths;
                     r.show_travel_moves = self.show_travel_moves;
+                    r.show_filaments = self.show_filaments;
                 }
 
                 let rect = response.rect;

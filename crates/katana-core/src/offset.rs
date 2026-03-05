@@ -324,8 +324,14 @@ pub fn generate_perimeters(
             current_shapes = offset_result;
         }
 
-        // The last valid offset result defines the infill boundary
-        let infill_boundary = current_shapes
+        // The last valid offset result is the centerline of the innermost
+        // perimeter.  Shrink it by half a nozzle width so infill fills up to
+        // the inner edge of that wall instead of overlapping its centerline.
+        let infill_offset_style = OutlineStyle::new(-perim_config.nozzle_width / 2.0)
+            .line_join(LineJoin::Miter(2.0));
+        let infill_shapes: Vec<OverlayShape> = current_shapes.outline(&infill_offset_style);
+
+        let infill_boundary = infill_shapes
             .iter()
             .flat_map(|s| {
                 s.iter().filter(|ring| ring.len() >= 3).map(|ring| Contour {

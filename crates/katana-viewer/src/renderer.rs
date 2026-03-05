@@ -96,6 +96,7 @@ pub struct Renderer {
     pub current_slice: Option<GpuBuffer>,
     pub toolpath_quads: Option<GpuBuffer>,
     pub toolpath_lines: Option<GpuBuffer>,
+    pub toolpath_path_lines: Option<GpuBuffer>,
     // Our own FBO with a guaranteed depth buffer
     fbo: glow::Framebuffer,
     fbo_color: glow::Texture,
@@ -107,6 +108,7 @@ pub struct Renderer {
     pub draw_contours: bool,
     pub draw_toolpaths: bool,
     pub show_travel_moves: bool,
+    pub show_filaments: bool,
 }
 
 impl Renderer {
@@ -126,6 +128,7 @@ impl Renderer {
             current_slice: None,
             toolpath_quads: None,
             toolpath_lines: None,
+            toolpath_path_lines: None,
             fbo,
             fbo_color,
             fbo_depth,
@@ -135,6 +138,7 @@ impl Renderer {
             draw_contours: false,
             draw_toolpaths: true,
             show_travel_moves: true,
+            show_filaments: true,
         }
     }
 
@@ -211,6 +215,7 @@ impl Renderer {
     ) {
         let mut quad_verts: Vec<f32> = Vec::new();
         let mut line_verts: Vec<f32> = Vec::new();
+        let mut path_line_verts: Vec<f32> = Vec::new();
 
         for layer in planned_layers {
             let z = layer.z;
@@ -239,6 +244,8 @@ impl Renderer {
                                 z, nozzle_width,
                                 r, g, b, a,
                             );
+                            push_line_vert(&mut path_line_verts, pts[j].x, pts[j].y, z, r, g, b, a);
+                            push_line_vert(&mut path_line_verts, pts[k].x, pts[k].y, z, r, g, b, a);
                         }
                     }
                     MoveKind::Infill => {
@@ -253,6 +260,8 @@ impl Renderer {
                                 z, nozzle_width,
                                 r, g, b, a,
                             );
+                            push_line_vert(&mut path_line_verts, from.x, from.y, z, r, g, b, a);
+                            push_line_vert(&mut path_line_verts, to.x, to.y, z, r, g, b, a);
                         }
                     }
                     MoveKind::SurfaceInfill => {
@@ -267,6 +276,8 @@ impl Renderer {
                                 z, nozzle_width,
                                 r, g, b, a,
                             );
+                            push_line_vert(&mut path_line_verts, from.x, from.y, z, r, g, b, a);
+                            push_line_vert(&mut path_line_verts, to.x, to.y, z, r, g, b, a);
                         }
                     }
                 }
@@ -284,6 +295,12 @@ impl Renderer {
         } else {
             let count = (line_verts.len() / LINE_STRIDE) as i32;
             Some(upload_line_buffer(&self.gl, &line_verts, count))
+        };
+        self.toolpath_path_lines = if path_line_verts.is_empty() {
+            None
+        } else {
+            let count = (path_line_verts.len() / LINE_STRIDE) as i32;
+            Some(upload_line_buffer(&self.gl, &path_line_verts, count))
         };
     }
 
@@ -371,17 +388,30 @@ impl Renderer {
                 }
             }
 
-            // Toolpath quads (lit triangles)
+            // Toolpath rendering
             if self.draw_toolpaths {
-                if let Some(tq) = &self.toolpath_quads {
-                    gl.use_program(Some(self.mesh_program));
-                    let loc = gl.get_uniform_location(self.mesh_program, "u_mvp");
-                    gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
-                    let loc = gl.get_uniform_location(self.mesh_program, "u_light_dir");
-                    gl.uniform_3_f32_slice(loc.as_ref(), light_dir);
-                    let loc = gl.get_uniform_location(self.mesh_program, "u_clip_z");
-                    gl.uniform_1_f32(loc.as_ref(), clip);
-                    draw_buffer(gl, tq, glow::TRIANGLES);
+                if self.show_filaments {
+                    // 3D filament tubes (lit triangles)
+                    if let Some(tq) = &self.toolpath_quads {
+                        gl.use_program(Some(self.mesh_program));
+                        let loc = gl.get_uniform_location(self.mesh_program, "u_mvp");
+                        gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
+                        let loc = gl.get_uniform_location(self.mesh_program, "u_light_dir");
+                        gl.uniform_3_f32_slice(loc.as_ref(), light_dir);
+                        let loc = gl.get_uniform_location(self.mesh_program, "u_clip_z");
+                        gl.uniform_1_f32(loc.as_ref(), clip);
+                        draw_buffer(gl, tq, glow::TRIANGLES);
+                    }
+                } else {
+                    // Toolpath lines (flat lines for extrusion paths)
+                    if let Some(pl) = &self.toolpath_path_lines {
+                        gl.use_program(Some(self.line_program));
+                        let loc = gl.get_uniform_location(self.line_program, "u_mvp");
+                        gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
+                        let loc = gl.get_uniform_location(self.line_program, "u_clip_z");
+                        gl.uniform_1_f32(loc.as_ref(), clip);
+                        draw_buffer(gl, pl, glow::LINES);
+                    }
                 }
 
                 // Toolpath travel lines
@@ -461,7 +491,7 @@ impl Renderer {
             gl.delete_framebuffer(self.fbo);
             gl.delete_texture(self.fbo_color);
             gl.delete_renderbuffer(self.fbo_depth);
-            for buf in [&self.mesh, &self.slices, &self.current_slice, &self.toolpath_quads, &self.toolpath_lines]
+            for buf in [&self.mesh, &self.slices, &self.current_slice, &self.toolpath_quads, &self.toolpath_lines, &self.toolpath_path_lines]
                 .into_iter()
                 .flatten()
             {
