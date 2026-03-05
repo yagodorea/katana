@@ -235,15 +235,15 @@ impl Renderer {
                         let (r, g, b, a) = (0.91, 0.27, 0.38, 1.0);
                         let pts = &move_.points;
                         if pts.len() < 2 { continue; }
+                        let pts_xy: Vec<(f32, f32)> = pts.iter().map(|p| (p.x, p.y)).collect();
+                        push_polyline_tube(
+                            &mut quad_verts,
+                            &pts_xy, z, nozzle_width,
+                            r, g, b, a,
+                            true, // closed loop
+                        );
                         for j in 0..pts.len() {
                             let k = (j + 1) % pts.len();
-                            push_segment_tube(
-                                &mut quad_verts,
-                                pts[j].x, pts[j].y,
-                                pts[k].x, pts[k].y,
-                                z, nozzle_width,
-                                r, g, b, a,
-                            );
                             push_line_vert(&mut path_line_verts, pts[j].x, pts[j].y, z, r, g, b, a);
                             push_line_vert(&mut path_line_verts, pts[k].x, pts[k].y, z, r, g, b, a);
                         }
@@ -581,8 +581,148 @@ fn push_mesh_vert(
 
 const TUBE_SIDES: usize = 8;
 
-/// Emit a cylindrical tube (N-sided, 2N triangles) for segment A→B at height
-/// `z`, with diameter `w`. Produces outward-facing normals for proper lighting.
+/// Compute a ring of TUBE_SIDES vertices around `center` at height `z`,
+/// oriented perpendicular to the XY direction `(dx, dy)` (need not be unit).
+/// Returns [(x, y, z, nx, ny, nz); TUBE_SIDES].
+fn compute_ring(
+    cx: f32, cy: f32, z: f32,
+    dx: f32, dy: f32,
+    radius: f32,
+) -> [(f32, f32, f32, f32, f32, f32); TUBE_SIDES] {
+    let len = (dx * dx + dy * dy).sqrt();
+    let (p1x, p1y) = if len < 1e-9 { (1.0, 0.0) } else { (-dy / len, dx / len) };
+
+    let mut ring = [(0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0); TUBE_SIDES];
+    for i in 0..TUBE_SIDES {
+        let theta = std::f32::consts::TAU * (i as f32) / (TUBE_SIDES as f32);
+        let (c, s) = (theta.cos(), theta.sin());
+        ring[i] = (
+            cx + radius * (c * p1x),
+            cy + radius * (c * p1y),
+            z  + radius * s,
+            c * p1x,
+            c * p1y,
+            s,
+        );
+    }
+    ring
+}
+
+/// Connect two rings of TUBE_SIDES vertices with a triangle strip (2N tris).
+fn connect_rings(
+    buf: &mut Vec<f32>,
+    ring_a: &[(f32, f32, f32, f32, f32, f32); TUBE_SIDES],
+    ring_b: &[(f32, f32, f32, f32, f32, f32); TUBE_SIDES],
+    r: f32, g: f32, b: f32, a: f32,
+    layer_z: f32,
+) {
+    for i in 0..TUBE_SIDES {
+        let j = (i + 1) % TUBE_SIDES;
+        let (a0x, a0y, a0z, an0x, an0y, an0z) = ring_a[i];
+        let (a1x, a1y, a1z, an1x, an1y, an1z) = ring_a[j];
+        let (b0x, b0y, b0z, bn0x, bn0y, bn0z) = ring_b[i];
+        let (b1x, b1y, b1z, bn1x, bn1y, bn1z) = ring_b[j];
+
+        push_mesh_vert(buf, a0x, a0y, a0z, an0x, an0y, an0z, r, g, b, a, layer_z);
+        push_mesh_vert(buf, b0x, b0y, b0z, bn0x, bn0y, bn0z, r, g, b, a, layer_z);
+        push_mesh_vert(buf, a1x, a1y, a1z, an1x, an1y, an1z, r, g, b, a, layer_z);
+
+        push_mesh_vert(buf, a1x, a1y, a1z, an1x, an1y, an1z, r, g, b, a, layer_z);
+        push_mesh_vert(buf, b0x, b0y, b0z, bn0x, bn0y, bn0z, r, g, b, a, layer_z);
+        push_mesh_vert(buf, b1x, b1y, b1z, bn1x, bn1y, bn1z, r, g, b, a, layer_z);
+    }
+}
+
+/// Emit a disc cap (triangle fan) for a ring, facing `sign` direction along the tube.
+fn push_disc_cap(
+    buf: &mut Vec<f32>,
+    cx: f32, cy: f32, cz: f32,
+    nx: f32, ny: f32, nz: f32,
+    ring: &[(f32, f32, f32, f32, f32, f32); TUBE_SIDES],
+    r: f32, g: f32, b: f32, a: f32,
+    layer_z: f32,
+) {
+    for i in 0..TUBE_SIDES {
+        let j = (i + 1) % TUBE_SIDES;
+        push_mesh_vert(buf, cx, cy, cz, nx, ny, nz, r, g, b, a, layer_z);
+        push_mesh_vert(buf, ring[i].0, ring[i].1, ring[i].2, nx, ny, nz, r, g, b, a, layer_z);
+        push_mesh_vert(buf, ring[j].0, ring[j].1, ring[j].2, nx, ny, nz, r, g, b, a, layer_z);
+    }
+}
+
+/// Emit a UV sphere at (cx, cy, cz) for round joints between tube segments.
+fn push_sphere(
+    buf: &mut Vec<f32>,
+    cx: f32, cy: f32, cz: f32,
+    radius: f32,
+    r: f32, g: f32, b: f32, a: f32,
+    layer_z: f32,
+) {
+    let stacks = TUBE_SIDES;
+    let slices = TUBE_SIDES;
+
+    for i in 0..stacks {
+        let phi0 = std::f32::consts::PI * (i as f32) / (stacks as f32);
+        let phi1 = std::f32::consts::PI * ((i + 1) as f32) / (stacks as f32);
+        let (cp0, sp0) = (phi0.cos(), phi0.sin());
+        let (cp1, sp1) = (phi1.cos(), phi1.sin());
+
+        for j in 0..slices {
+            let t0 = std::f32::consts::TAU * (j as f32) / (slices as f32);
+            let t1 = std::f32::consts::TAU * ((j + 1) as f32) / (slices as f32);
+            let (ct0, st0) = (t0.cos(), t0.sin());
+            let (ct1, st1) = (t1.cos(), t1.sin());
+
+            let p00 = (sp0 * ct0, sp0 * st0, cp0);
+            let p01 = (sp0 * ct1, sp0 * st1, cp0);
+            let p10 = (sp1 * ct0, sp1 * st0, cp1);
+            let p11 = (sp1 * ct1, sp1 * st1, cp1);
+
+            push_mesh_vert(buf, cx + radius * p00.0, cy + radius * p00.1, cz + radius * p00.2, p00.0, p00.1, p00.2, r, g, b, a, layer_z);
+            push_mesh_vert(buf, cx + radius * p10.0, cy + radius * p10.1, cz + radius * p10.2, p10.0, p10.1, p10.2, r, g, b, a, layer_z);
+            push_mesh_vert(buf, cx + radius * p01.0, cy + radius * p01.1, cz + radius * p01.2, p01.0, p01.1, p01.2, r, g, b, a, layer_z);
+
+            push_mesh_vert(buf, cx + radius * p01.0, cy + radius * p01.1, cz + radius * p01.2, p01.0, p01.1, p01.2, r, g, b, a, layer_z);
+            push_mesh_vert(buf, cx + radius * p10.0, cy + radius * p10.1, cz + radius * p10.2, p10.0, p10.1, p10.2, r, g, b, a, layer_z);
+            push_mesh_vert(buf, cx + radius * p11.0, cy + radius * p11.1, cz + radius * p11.2, p11.0, p11.1, p11.2, r, g, b, a, layer_z);
+        }
+    }
+}
+
+/// Emit a continuous tube along a polyline using per-segment tubes with
+/// round (sphere) joints at each vertex to cover gaps between segments.
+fn push_polyline_tube(
+    buf: &mut Vec<f32>,
+    pts_xy: &[(f32, f32)],
+    z: f32,
+    w: f32,
+    r: f32, g: f32, b: f32, a: f32,
+    closed: bool,
+) {
+    let n = pts_xy.len();
+    if n < 2 { return; }
+
+    let radius = w * 0.5;
+    let num_segs = if closed { n } else { n - 1 };
+
+    // Emit tube body for each segment (both rings share the same perp — no twist)
+    for s in 0..num_segs {
+        let next = (s + 1) % n;
+        let dx = pts_xy[next].0 - pts_xy[s].0;
+        let dy = pts_xy[next].1 - pts_xy[s].1;
+
+        let ring_a = compute_ring(pts_xy[s].0, pts_xy[s].1, z, dx, dy, radius);
+        let ring_b = compute_ring(pts_xy[next].0, pts_xy[next].1, z, dx, dy, radius);
+        connect_rings(buf, &ring_a, &ring_b, r, g, b, a, z);
+    }
+
+    // Emit sphere at each vertex to cover joint gaps (Z-buffer handles overlap)
+    for i in 0..n {
+        push_sphere(buf, pts_xy[i].0, pts_xy[i].1, z, radius, r, g, b, a, z);
+    }
+}
+
+/// Emit a single capped tube segment for a standalone line (infill).
 fn push_segment_tube(
     buf: &mut Vec<f32>,
     ax: f32, ay: f32,
@@ -598,51 +738,16 @@ fn push_segment_tube(
 
     let radius = w * 0.5;
 
-    // Two perpendicular basis vectors (segments are horizontal, same Z):
-    // perp1 lies in XY plane, perp2 points up in Z
-    let p1x = -dy / len;
-    let p1y =  dx / len;
-    // perp2 = (0, 0, 1)
+    let ring_a = compute_ring(ax, ay, z, dx, dy, radius);
+    let ring_b = compute_ring(bx, by, z, dx, dy, radius);
 
-    for i in 0..TUBE_SIDES {
-        let theta0 = std::f32::consts::TAU * (i as f32) / (TUBE_SIDES as f32);
-        let theta1 = std::f32::consts::TAU * ((i + 1) as f32) / (TUBE_SIDES as f32);
+    connect_rings(buf, &ring_a, &ring_b, r, g, b, a, z);
 
-        let (c0, s0) = (theta0.cos(), theta0.sin());
-        let (c1, s1) = (theta1.cos(), theta1.sin());
-
-        // Ring positions at A
-        let a0x = ax + radius * (c0 * p1x);
-        let a0y = ay + radius * (c0 * p1y);
-        let a0z = z  + radius * s0;
-
-        let a1x = ax + radius * (c1 * p1x);
-        let a1y = ay + radius * (c1 * p1y);
-        let a1z = z  + radius * s1;
-
-        // Ring positions at B
-        let b0x = bx + radius * (c0 * p1x);
-        let b0y = by + radius * (c0 * p1y);
-        let b0z = z  + radius * s0;
-
-        let b1x = bx + radius * (c1 * p1x);
-        let b1y = by + radius * (c1 * p1y);
-        let b1z = z  + radius * s1;
-
-        // Outward normals
-        let (n0x, n0y, n0z) = (c0 * p1x, c0 * p1y, s0);
-        let (n1x, n1y, n1z) = (c1 * p1x, c1 * p1y, s1);
-
-        // Triangle 1: A0, B0, A1
-        push_mesh_vert(buf, a0x, a0y, a0z, n0x, n0y, n0z, r, g, b, a, z);
-        push_mesh_vert(buf, b0x, b0y, b0z, n0x, n0y, n0z, r, g, b, a, z);
-        push_mesh_vert(buf, a1x, a1y, a1z, n1x, n1y, n1z, r, g, b, a, z);
-
-        // Triangle 2: A1, B0, B1
-        push_mesh_vert(buf, a1x, a1y, a1z, n1x, n1y, n1z, r, g, b, a, z);
-        push_mesh_vert(buf, b0x, b0y, b0z, n0x, n0y, n0z, r, g, b, a, z);
-        push_mesh_vert(buf, b1x, b1y, b1z, n1x, n1y, n1z, r, g, b, a, z);
-    }
+    // Cap both ends
+    let ndx = dx / len;
+    let ndy = dy / len;
+    push_disc_cap(buf, ax, ay, z, -ndx, -ndy, 0.0, &ring_a, r, g, b, a, z);
+    push_disc_cap(buf, bx, by, z,  ndx,  ndy, 0.0, &ring_b, r, g, b, a, z);
 }
 
 fn upload_line_buffer(gl: &glow::Context, data: &[f32], vertex_count: i32) -> GpuBuffer {
