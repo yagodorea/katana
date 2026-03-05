@@ -48,18 +48,28 @@ pub struct PlannedResult {
 // ---------------------------------------------------------------------------
 
 /// Plan all toolpath layers, adding travel moves and optimizing print order.
-/// Layers are planned in parallel; each starts from the origin.
+/// Layers are planned sequentially so each starts from the last position of the previous layer.
 pub fn plan_toolpaths(toolpath_result: &ToolpathResult) -> PlannedResult {
-    use rayon::prelude::*;
+    let mut current_pos = Point2::new(0.0, 0.0);
+    let mut layers = Vec::with_capacity(toolpath_result.layers.len());
 
-    let origin = Point2::new(0.0, 0.0);
-    let layers: Vec<PlannedLayer> = toolpath_result
-        .layers
-        .par_iter()
-        .map(|layer| plan_layer(layer, origin))
-        .collect();
+    for layer in &toolpath_result.layers {
+        let planned = plan_layer(layer, current_pos);
+        current_pos = layer_end_position(&planned).unwrap_or(current_pos);
+        layers.push(planned);
+    }
 
     PlannedResult { layers }
+}
+
+/// Returns the nozzle position after completing all moves in a layer.
+fn layer_end_position(layer: &PlannedLayer) -> Option<Point2<f32>> {
+    let last_move = layer.moves.last()?;
+    match last_move.kind {
+        // Perimeter loops close back to their start point
+        MoveKind::Perimeter => last_move.points.first().copied(),
+        _ => last_move.points.last().copied(),
+    }
 }
 
 /// Plan a single layer: order segments and insert travel moves.

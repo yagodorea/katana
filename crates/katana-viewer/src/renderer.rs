@@ -39,6 +39,7 @@ const MESH_VS: &str = r#"#version 330 core
 layout (location = 0) in vec3 a_pos;
 layout (location = 1) in vec3 a_normal;
 layout (location = 2) in vec4 a_color;
+layout (location = 3) in float a_layer_z;
 
 uniform mat4 u_mvp;
 
@@ -50,7 +51,7 @@ void main() {
     gl_Position = u_mvp * vec4(a_pos, 1.0);
     v_normal = a_normal;
     v_color = a_color;
-    v_z = a_pos.z;
+    v_z = a_layer_z;
 }
 "#;
 
@@ -78,7 +79,7 @@ void main() {
 // ---------------------------------------------------------------------------
 
 const LINE_STRIDE: usize = 7;  // x y z r g b a
-const MESH_STRIDE: usize = 10; // x y z nx ny nz r g b a
+const MESH_STRIDE: usize = 11; // x y z nx ny nz r g b a layer_z
 
 pub struct GpuBuffer {
     vao: glow::VertexArray,
@@ -145,7 +146,7 @@ impl Renderer {
         for tri in triangles {
             let n = &tri.normal;
             for v in &tri.vertices {
-                verts.extend_from_slice(&[v.x, v.y, v.z, n.x, n.y, n.z, r, g, b, a]);
+                verts.extend_from_slice(&[v.x, v.y, v.z, n.x, n.y, n.z, r, g, b, a, -1e30]);
             }
         }
 
@@ -543,8 +544,9 @@ fn push_mesh_vert(
     x: f32, y: f32, z: f32,
     nx: f32, ny: f32, nz: f32,
     r: f32, g: f32, b: f32, a: f32,
+    layer_z: f32,
 ) {
-    buf.extend_from_slice(&[x, y, z, nx, ny, nz, r, g, b, a]);
+    buf.extend_from_slice(&[x, y, z, nx, ny, nz, r, g, b, a, layer_z]);
 }
 
 const TUBE_SIDES: usize = 8;
@@ -602,14 +604,14 @@ fn push_segment_tube(
         let (n1x, n1y, n1z) = (c1 * p1x, c1 * p1y, s1);
 
         // Triangle 1: A0, B0, A1
-        push_mesh_vert(buf, a0x, a0y, a0z, n0x, n0y, n0z, r, g, b, a);
-        push_mesh_vert(buf, b0x, b0y, b0z, n0x, n0y, n0z, r, g, b, a);
-        push_mesh_vert(buf, a1x, a1y, a1z, n1x, n1y, n1z, r, g, b, a);
+        push_mesh_vert(buf, a0x, a0y, a0z, n0x, n0y, n0z, r, g, b, a, z);
+        push_mesh_vert(buf, b0x, b0y, b0z, n0x, n0y, n0z, r, g, b, a, z);
+        push_mesh_vert(buf, a1x, a1y, a1z, n1x, n1y, n1z, r, g, b, a, z);
 
         // Triangle 2: A1, B0, B1
-        push_mesh_vert(buf, a1x, a1y, a1z, n1x, n1y, n1z, r, g, b, a);
-        push_mesh_vert(buf, b0x, b0y, b0z, n0x, n0y, n0z, r, g, b, a);
-        push_mesh_vert(buf, b1x, b1y, b1z, n1x, n1y, n1z, r, g, b, a);
+        push_mesh_vert(buf, a1x, a1y, a1z, n1x, n1y, n1z, r, g, b, a, z);
+        push_mesh_vert(buf, b0x, b0y, b0z, n0x, n0y, n0z, r, g, b, a, z);
+        push_mesh_vert(buf, b1x, b1y, b1z, n1x, n1y, n1z, r, g, b, a, z);
     }
 }
 
@@ -649,6 +651,8 @@ fn upload_mesh_buffer(gl: &glow::Context, data: &[f32], vertex_count: i32) -> Gp
         gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, stride, 3 * 4);
         gl.enable_vertex_attrib_array(2);
         gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 6 * 4);
+        gl.enable_vertex_attrib_array(3);
+        gl.vertex_attrib_pointer_f32(3, 1, glow::FLOAT, false, stride, 10 * 4);
 
         gl.bind_vertex_array(None);
         GpuBuffer { vao, vbo, vertex_count }
