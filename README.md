@@ -23,8 +23,8 @@ This workspace contains 3 programs:
 - [X] Rectilinear infill
 - [X] GPU-rendered visualizer built on `eframe` and `glow`
 - [X] Rendering toolpaths with thickness
-    - [ ] Fix bug where filaments are clipped by next layer
+    - [X] Fix bug where filaments are clipped by next layer
 - [ ] :loading: Calculate travel moves and segment connections
-    - [ ] Fix issue where all layer travels start from 0,0
+    - [X] Fix issue where all layer travels start from 0,0
 - [ ] G-code export
 - [ ] Add more infill patterns
