@@ -85,10 +85,6 @@ fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>) -> PlannedLayer {
         // Get the PerimeterSet using the stored pset_idx
         let pset = &layer.perimeter_sets[ordered_set.pset_idx];
         // Track whether we've started printing perimeters in this set.
-        // Within a set, consecutive perimeters are close (~nozzle_width apart),
-        // so we connect them with extrusion instead of travel moves.
-        let mut inside_pset = false;
-
         // Print perimeters from innermost to outermost (reverse order)
         for level_idx in ordered_set.level_indices.iter().rev() {
             let perimeters = &pset.perimeters[*level_idx];
@@ -108,22 +104,12 @@ fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>) -> PlannedLayer {
                 // Capture the rotated start point (loop closes back here)
                 let loop_start = points[0];
 
-                // Add connecting move if needed
+                // Travel to the perimeter start if needed
                 if !points_equal(&current_pos, &loop_start) {
-                    if inside_pset {
-                        // Within the same perimeter set, connect with extrusion
-                        // (distance is ~nozzle_width between consecutive levels)
-                        moves.push(Move {
-                            kind: MoveKind::Perimeter,
-                            points: vec![current_pos, loop_start],
-                        });
-                    } else {
-                        // First perimeter in this set — travel to it
-                        moves.push(Move {
-                            kind: MoveKind::Travel,
-                            points: vec![current_pos, loop_start],
-                        });
-                    }
+                    moves.push(Move {
+                        kind: MoveKind::Travel,
+                        points: vec![current_pos, loop_start],
+                    });
                 }
 
                 // Add perimeter move
@@ -134,7 +120,6 @@ fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>) -> PlannedLayer {
 
                 // Nozzle returns to loop start after closing the perimeter
                 current_pos = loop_start;
-                inside_pset = true;
             }
         }
     }
