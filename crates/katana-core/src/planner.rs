@@ -195,8 +195,10 @@ fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>) -> PlannedLayer {
             mid_a.partial_cmp(&mid_b).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Serpentine: alternate direction each scanline row
+        // Serpentine: alternate direction each scanline row, connecting
+        // consecutive lines with extrusion to form a continuous zigzag.
         let mut forward = true;
+        let mut inside_surface = false;
         for &idx in &indices {
             let line = &lines[idx];
 
@@ -210,12 +212,21 @@ fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>) -> PlannedLayer {
                 (line.end, line.start)
             };
 
-            // Add travel move if needed
+            // Connect to next scanline
             if !points_equal(&current_pos, &start) {
-                moves.push(Move {
-                    kind: MoveKind::Travel,
-                    points: vec![current_pos, start],
-                });
+                if inside_surface {
+                    // Adjacent scanlines: connect with extrusion (distance ~nozzle_width)
+                    moves.push(Move {
+                        kind: MoveKind::SurfaceInfill,
+                        points: vec![current_pos, start],
+                    });
+                } else {
+                    // First line: travel to it
+                    moves.push(Move {
+                        kind: MoveKind::Travel,
+                        points: vec![current_pos, start],
+                    });
+                }
             }
 
             // Add surface infill move
@@ -226,6 +237,7 @@ fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>) -> PlannedLayer {
 
             current_pos = end;
             forward = !forward;
+            inside_surface = true;
         }
     }
 

@@ -235,17 +235,36 @@ impl Renderer {
                         let (r, g, b, a) = (0.91, 0.27, 0.38, 1.0);
                         let pts = &move_.points;
                         if pts.len() < 2 { continue; }
-                        let pts_xy: Vec<(f32, f32)> = pts.iter().map(|p| (p.x, p.y)).collect();
-                        push_polyline_tube(
-                            &mut quad_verts,
-                            &pts_xy, z, nozzle_width,
-                            r, g, b, a,
-                            true, // closed loop
-                        );
-                        for j in 0..pts.len() {
-                            let k = (j + 1) % pts.len();
-                            push_line_vert(&mut path_line_verts, pts[j].x, pts[j].y, z, r, g, b, a);
-                            push_line_vert(&mut path_line_verts, pts[k].x, pts[k].y, z, r, g, b, a);
+                        if pts.len() == 2 {
+                            // Connection segment between perimeter loops:
+                            // render as open tube with sphere joints
+                            let from = &pts[0];
+                            let to = &pts[1];
+                            push_segment_tube(
+                                &mut quad_verts,
+                                from.x, from.y, to.x, to.y,
+                                z, nozzle_width,
+                                r, g, b, a,
+                            );
+                            let radius = nozzle_width * 0.5;
+                            push_sphere(&mut quad_verts, from.x, from.y, z, radius, r, g, b, a, z);
+                            push_sphere(&mut quad_verts, to.x, to.y, z, radius, r, g, b, a, z);
+                            push_line_vert(&mut path_line_verts, from.x, from.y, z, r, g, b, a);
+                            push_line_vert(&mut path_line_verts, to.x, to.y, z, r, g, b, a);
+                        } else {
+                            // Closed perimeter loop
+                            let pts_xy: Vec<(f32, f32)> = pts.iter().map(|p| (p.x, p.y)).collect();
+                            push_polyline_tube(
+                                &mut quad_verts,
+                                &pts_xy, z, nozzle_width,
+                                r, g, b, a,
+                                true, // closed loop
+                            );
+                            for j in 0..pts.len() {
+                                let k = (j + 1) % pts.len();
+                                push_line_vert(&mut path_line_verts, pts[j].x, pts[j].y, z, r, g, b, a);
+                                push_line_vert(&mut path_line_verts, pts[k].x, pts[k].y, z, r, g, b, a);
+                            }
                         }
                     }
                     MoveKind::Infill => {
@@ -276,6 +295,10 @@ impl Renderer {
                                 z, nozzle_width,
                                 r, g, b, a,
                             );
+                            // Sphere joints at endpoints for smooth connections
+                            let radius = nozzle_width * 0.5;
+                            push_sphere(&mut quad_verts, from.x, from.y, z, radius, r, g, b, a, z);
+                            push_sphere(&mut quad_verts, to.x, to.y, z, radius, r, g, b, a, z);
                             push_line_vert(&mut path_line_verts, from.x, from.y, z, r, g, b, a);
                             push_line_vert(&mut path_line_verts, to.x, to.y, z, r, g, b, a);
                         }
