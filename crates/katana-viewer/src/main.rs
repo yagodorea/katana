@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
@@ -148,6 +148,10 @@ fn main() -> eframe::Result {
                 },
                 show_travel_moves: true,
                 show_filaments: true,
+                fps: 0.0,
+                frame_time: 0.0,
+                last_update: Instant::now(),
+                frame_count: 0,
             }))
         }),
     )
@@ -190,10 +194,25 @@ struct ViewerApp {
     show_travel_moves: bool,
     show_filaments: bool,
     stats: Stats,
+    fps: f32,
+    frame_time: f32,
+    last_update: Instant,
+    frame_count: u32,
 }
 
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Update FPS counter (manually tracked)
+        self.frame_count += 1;
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update);
+        if elapsed >= Duration::from_secs(1) {
+            self.fps = self.frame_count as f32 / elapsed.as_secs_f32();
+            self.frame_time = if self.fps > 0.0 { 1000.0 / self.fps } else { 0.0 };
+            self.last_update = now;
+            self.frame_count = 0;
+        }
+
         // Top panel
         egui::TopBottomPanel::top("info").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -389,7 +408,15 @@ impl eframe::App for ViewerApp {
                     )),
                 };
                 painter.add(callback);
+        });
+
+        // FPS counter (bottom-right corner)
+        egui::Area::new(egui::Id::new("fps_counter"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, [10.0, 10.0])
+            .show(ctx, |ui| {
+                ui.colored_label(egui::Color32::YELLOW, format!("{:.1} FPS ({:.1} ms)", self.fps, self.frame_time));
             });
+
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
