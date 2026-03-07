@@ -23,6 +23,10 @@ pub struct Contour {
 pub struct Layer {
     pub z: f32,
     pub contours: Vec<Contour>,
+    /// Minimum surface angle from horizontal (radians) among triangles
+    /// intersecting this layer. 0 = horizontal overhang, π/2 = vertical wall.
+    /// Used to determine extra perimeters on shallow slopes.
+    pub min_surface_angle: f32,
 }
 
 /// Result of slicing a mesh into layers.
@@ -69,9 +73,9 @@ pub fn slice_mesh(mesh: &Mesh, layer_height: f32) -> SliceResult {
     let layers: Vec<Layer> = z_heights
         .par_iter()
         .map(|&z| {
-            let segments = intersect_plane_indexed(mesh, z, &z_index);
+            let (segments, min_surface_angle) = intersect_plane_indexed(mesh, z, &z_index);
             let contours = assemble_contours(segments);
-            Layer { z, contours }
+            Layer { z, contours, min_surface_angle }
         })
         .collect();
 
@@ -91,8 +95,12 @@ struct Segment {
 
 /// Intersect mesh triangles with a horizontal plane at height `z`, using a
 /// pre-sorted z-range index to skip triangles that cannot intersect.
-fn intersect_plane_indexed(mesh: &Mesh, z: f32, z_index: &[TriZRange]) -> Vec<Segment> {
+///
+/// Returns the intersection segments and the minimum surface angle from
+/// horizontal (radians) among all intersecting triangles.
+fn intersect_plane_indexed(mesh: &Mesh, z: f32, z_index: &[TriZRange]) -> (Vec<Segment>, f32) {
     let mut segments = Vec::new();
+    let mut min_angle = std::f32::consts::FRAC_PI_2; // start at vertical (best case)
 
     // Binary-search to find the first triangle whose z_min > z — all triangles
     // before this point *may* intersect (their z_min <= z). We then filter by
@@ -115,6 +123,17 @@ fn intersect_plane_indexed(mesh: &Mesh, z: f32, z_index: &[TriZRange]) -> Vec<Se
             continue;
         }
 
+        // Surface angle from horizontal: the normal is perpendicular to the
+        // surface, so if the surface makes angle θ with horizontal, the normal
+        // makes angle θ with vertical. Thus θ = acos(|normal.z|).
+        //   vertical wall: |normal.z| ≈ 0 → θ = π/2 (no extra perimeters)
+        //   horizontal:    |normal.z| ≈ 1 → θ = 0   (max extra perimeters)
+        let nz_abs = tri.normal.z.abs();
+        let angle = nz_abs.clamp(0.0, 1.0).acos();
+        if angle < min_angle {
+            min_angle = angle;
+        }
+
         let (lone, pair0, pair1) = if (d[0] > 0.0) != (d[1] > 0.0) && (d[0] > 0.0) != (d[2] > 0.0)
         {
             (0, 1, 2)
@@ -130,7 +149,7 @@ fn intersect_plane_indexed(mesh: &Mesh, z: f32, z_index: &[TriZRange]) -> Vec<Se
         segments.push(Segment { a: p0, b: p1 });
     }
 
-    segments
+    (segments, min_angle)
 }
 
 /// Linearly interpolate along an edge to find where it crosses height `z`.

@@ -120,6 +120,7 @@ fn cmd_slice(file: &str, layer_height: f32, output_dir: &str, nozzle_width: f32,
     let perim_config = offset::PerimeterConfig {
         nozzle_width,
         perimeter_count: perimeters,
+        layer_height,
     };
     let infill_config = offset::InfillConfig {
         density: infill_density,

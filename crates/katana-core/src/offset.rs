@@ -13,6 +13,8 @@ pub struct PerimeterConfig {
     pub nozzle_width: f32,
     /// Number of perimeter walls to generate (e.g. 3).
     pub perimeter_count: usize,
+    /// Layer height in mm — needed for angle-based extra perimeter calculation.
+    pub layer_height: f32,
 }
 
 /// A single closed toolpath loop the nozzle follows.
@@ -264,6 +266,41 @@ fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
 }
 
 // ---------------------------------------------------------------------------
+// Angle-based extra perimeters
+// ---------------------------------------------------------------------------
+
+/// Compute the number of extra perimeter walls needed to prevent infill from
+/// being visible through gaps between layers on a sloped surface.
+///
+/// `surface_angle` is the angle of the surface from horizontal in radians
+/// (0 = horizontal overhang, π/2 = vertical wall).
+///
+/// At steep surface angles (near vertical) the layers stack tightly and no
+/// extra perimeters are needed. At shallow angles the horizontal gap between
+/// successive layer contours grows, requiring additional walls to cover it.
+pub fn extra_perimeters_for_angle(surface_angle: f32, layer_height: f32, nozzle_width: f32) -> usize {
+    // Vertical or near-vertical surfaces need no extra perimeters.
+    // Also guard against division by zero (tan(90°) = ∞ is fine, tan(0°) = 0).
+    const MIN_ANGLE: f32 = 0.01; // ~0.6°
+    // Arbitrary const to regulate how much the gap influences the additional layers
+    const ALPHA: f32 = 2.0;
+    if surface_angle >= std::f32::consts::FRAC_PI_2 - MIN_ANGLE {
+        return 0;
+    }
+    if surface_angle < MIN_ANGLE {
+        // Nearly horizontal — add an arbitrary big number of perimeters, we'll stop.
+        // produce toolpaths once the perimeter reduces to nothing
+        return 100000;
+    }
+
+    let horizontal_gap = layer_height / surface_angle.tan();
+    let total_walls_needed = (ALPHA * horizontal_gap / nozzle_width).ceil() as usize;
+    // At least 1 wall is already covered by the base perimeter count, so
+    // subtract 1 (but never go below 0).
+    total_walls_needed.saturating_sub(1)
+}
+
+// ---------------------------------------------------------------------------
 // Core offset logic
 // ---------------------------------------------------------------------------
 
@@ -282,12 +319,20 @@ pub fn generate_perimeters(
     let shapes = classify_contours(&layer.contours);
     let mut perimeter_sets = Vec::new();
 
+    // Compute extra perimeters based on the surface angle at this layer.
+    let extra = extra_perimeters_for_angle(
+        layer.min_surface_angle,
+        perim_config.layer_height,
+        perim_config.nozzle_width,
+    );
+    let effective_perimeter_count = perim_config.perimeter_count + extra;
+
     for shape in &shapes {
         let mut all_perimeters: Vec<Vec<Perimeter>> = Vec::new();
         // Wrap in an outer vec to form "Shapes" (Vec<Shape>)
         let mut current_shapes: Vec<OverlayShape> = vec![shape.clone()];
 
-        for i in 0..perim_config.perimeter_count {
+        for i in 0..effective_perimeter_count {
             // First perimeter: inset by nozzle_width/2 so the outer edge of
             // the extruded line aligns with the original contour.
             // Subsequent perimeters: inset by a full nozzle_width.
@@ -696,6 +741,7 @@ mod tests {
         let config = PerimeterConfig {
             nozzle_width: 0.2,
             perimeter_count: 1,
+            layer_height: 0.2,
         };
         let toolpath = generate_perimeters(
             layer,
@@ -727,6 +773,7 @@ mod tests {
         let perim_config = PerimeterConfig {
             nozzle_width: 5.0,
             perimeter_count: 1,
+            layer_height: 10.0,
         };
         let infill_config = InfillConfig {
             density: 0.5,
@@ -774,6 +821,7 @@ mod tests {
         let perim_config = PerimeterConfig {
             nozzle_width: 5.0,
             perimeter_count: 1,
+            layer_height: 10.0,
         };
         let infill_config = InfillConfig {
             density: 0.5,
@@ -851,6 +899,7 @@ mod tests {
         let perim_config = PerimeterConfig {
             nozzle_width: 0.4,
             perimeter_count: 2,
+            layer_height: 2.0,
         };
         let infill_config = InfillConfig {
             density: 0.2,

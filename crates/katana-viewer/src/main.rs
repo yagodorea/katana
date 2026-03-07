@@ -57,6 +57,7 @@ fn main() -> eframe::Result {
     let perim_config = offset::PerimeterConfig {
         nozzle_width: args.nozzle_width,
         perimeter_count: args.perimeters,
+        layer_height: args.layer_height,
     };
     let infill_config = offset::InfillConfig {
         density: args.infill_density as f32 / 100.0,
