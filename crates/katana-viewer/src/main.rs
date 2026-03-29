@@ -117,7 +117,7 @@ fn main() -> eframe::Result {
             // Upload ALL contour + toolpath data once; layer visibility
             // is controlled by the u_clip_z shader uniform.
             gpu.upload_current_slice(&layers);
-            gpu.upload_planned_toolpath(&planned_result.layers, args.nozzle_width);
+            gpu.upload_planned_toolpath(&planned_result.layers, args.nozzle_width, args.layer_height);
 
             // Start showing all layers from the bottom
             if !layers.is_empty() {

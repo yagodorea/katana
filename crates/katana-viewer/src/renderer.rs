@@ -74,136 +74,107 @@ void main() {
 }
 "#;
 
-// Impostor tube vertex shader: billboard quad per segment, cylinder shading in FS.
-// No prototype mesh — quad corners computed from gl_VertexID (TRIANGLE_STRIP, 4 verts).
-const IMPOSTOR_TUBE_VS: &str = r#"#version 330 core
-// Per-instance data only — no prototype mesh
-layout (location = 0) in vec3 a_inst_start;
-layout (location = 1) in vec2 a_inst_dir;
-layout (location = 2) in vec2 a_inst_scale;     // (length, radius)
-layout (location = 3) in vec4 a_inst_color;
+// Extruded rhombus vertex shader: generates a 12-triangle prism per instance from gl_VertexID.
+// Cross-section is a rhombus: width = nozzle_width (horizontal), height = layer_height (vertical).
+// 4 side faces (2 triangles each) + 2 end caps (2 triangles each) = 12 triangles = 36 vertices.
+const RHOMBUS_VS: &str = r#"#version 330 core
+layout (location = 0) in vec3  a_inst_start;
+layout (location = 1) in vec2  a_inst_dir;
+layout (location = 2) in vec2  a_inst_scale;     // (length, half_width)
+layout (location = 3) in vec4  a_inst_color;
 layout (location = 4) in float a_inst_layer_z;
 
-uniform mat4 u_mvp;
+uniform mat4  u_mvp;
 uniform float u_clip_z;
+uniform float u_half_height;                      // layer_height / 2 (constant for whole print)
 
-flat out vec3 v_perp;
-flat out vec3 v_perp2;
-out float v_v;          // cross-tube coordinate, interpolates -1..+1
-out vec4 v_color;
+flat out vec3 v_normal;
+out vec4  v_color;
 out float v_z;
 
 void main() {
     float seg_len = a_inst_scale.x;
-    float radius  = a_inst_scale.y;
+    float half_w  = a_inst_scale.y;
+    float half_h  = u_half_height;
 
-    vec3 axis    = vec3(a_inst_dir, 0.0);
-    vec3 seg_end = a_inst_start + axis * seg_len;
+    vec3 seg_dir = vec3(a_inst_dir, 0.0);
+    vec3 perp    = vec3(-a_inst_dir.y, a_inst_dir.x, 0.0);
+    vec3 up      = vec3(0.0, 0.0, 1.0);
 
-    // Camera forward extracted from orthographic MVP matrix
-    vec3 cam_fwd = normalize(vec3(u_mvp[0][2], u_mvp[1][2], u_mvp[2][2]));
+    // 4 cross-section offsets
+    vec3 r_off = perp * half_w;    // right
+    vec3 t_off = up   * half_h;    // top
+    vec3 l_off = -perp * half_w;   // left
+    vec3 b_off = -up   * half_h;   // bottom
 
-    // Billboard perpendicular: maximises visible tube width from camera
-    vec3 perp = cross(axis, cam_fwd);
-    float perp_len = length(perp);
-    if (perp_len < 0.001) {
-        // Degenerate: looking along tube axis — use lateral direction
-        perp = vec3(-a_inst_dir.y, a_inst_dir.x, 0.0);
-    } else {
-        perp /= perp_len;
-    }
-    vec3 p2 = cross(axis, perp);   // always faces away from camera
+    // 4 side face normals (normalized bisectors of adjacent edges)
+    vec3 n_rt = normalize(perp + up);     // right-top face
+    vec3 n_tl = normalize(-perp + up);    // top-left face
+    vec3 n_lb = normalize(-perp - up);    // left-bottom face
+    vec3 n_br = normalize(perp - up);     // bottom-right face
 
-    // Quad corners (TRIANGLE_STRIP: 0-1-2-3)
-    vec3  base = (gl_VertexID < 2) ? a_inst_start : seg_end;
-    float side = ((gl_VertexID & 1) == 0) ? -1.0 : 1.0;
+    vec3 cross_off;
+    vec3 along_off;
+    vec3 norm;
 
-    vec3 world_pos = base + perp * (radius * side);
+    int vid = gl_VertexID;
 
-    gl_Position      = u_mvp * vec4(world_pos, 1.0);
+    // Side face 0: right-top (triangles 0, 1)
+    if      (vid == 0)  { cross_off = r_off; along_off = vec3(0);              norm = n_rt; }
+    else if (vid == 1)  { cross_off = t_off; along_off = vec3(0);              norm = n_rt; }
+    else if (vid == 2)  { cross_off = r_off; along_off = seg_dir * seg_len;    norm = n_rt; }
+    else if (vid == 3)  { cross_off = t_off; along_off = vec3(0);              norm = n_rt; }
+    else if (vid == 4)  { cross_off = t_off; along_off = seg_dir * seg_len;    norm = n_rt; }
+    else if (vid == 5)  { cross_off = r_off; along_off = seg_dir * seg_len;    norm = n_rt; }
+    // Side face 1: top-left (triangles 2, 3)
+    else if (vid == 6)  { cross_off = t_off; along_off = vec3(0);              norm = n_tl; }
+    else if (vid == 7)  { cross_off = l_off; along_off = vec3(0);              norm = n_tl; }
+    else if (vid == 8)  { cross_off = t_off; along_off = seg_dir * seg_len;    norm = n_tl; }
+    else if (vid == 9)  { cross_off = l_off; along_off = vec3(0);              norm = n_tl; }
+    else if (vid == 10) { cross_off = l_off; along_off = seg_dir * seg_len;    norm = n_tl; }
+    else if (vid == 11) { cross_off = t_off; along_off = seg_dir * seg_len;    norm = n_tl; }
+    // Side face 2: left-bottom (triangles 4, 5)
+    else if (vid == 12) { cross_off = l_off; along_off = vec3(0);              norm = n_lb; }
+    else if (vid == 13) { cross_off = b_off; along_off = vec3(0);              norm = n_lb; }
+    else if (vid == 14) { cross_off = l_off; along_off = seg_dir * seg_len;    norm = n_lb; }
+    else if (vid == 15) { cross_off = b_off; along_off = vec3(0);              norm = n_lb; }
+    else if (vid == 16) { cross_off = b_off; along_off = seg_dir * seg_len;    norm = n_lb; }
+    else if (vid == 17) { cross_off = l_off; along_off = seg_dir * seg_len;    norm = n_lb; }
+    // Side face 3: bottom-right (triangles 6, 7)
+    else if (vid == 18) { cross_off = b_off; along_off = vec3(0);              norm = n_br; }
+    else if (vid == 19) { cross_off = r_off; along_off = vec3(0);              norm = n_br; }
+    else if (vid == 20) { cross_off = b_off; along_off = seg_dir * seg_len;    norm = n_br; }
+    else if (vid == 21) { cross_off = r_off; along_off = vec3(0);              norm = n_br; }
+    else if (vid == 22) { cross_off = r_off; along_off = seg_dir * seg_len;    norm = n_br; }
+    else if (vid == 23) { cross_off = b_off; along_off = seg_dir * seg_len;    norm = n_br; }
+    // Start cap (triangles 8, 9), normal = -seg_dir
+    else if (vid == 24) { cross_off = r_off; along_off = vec3(0);              norm = -seg_dir; }
+    else if (vid == 25) { cross_off = t_off; along_off = vec3(0);              norm = -seg_dir; }
+    else if (vid == 26) { cross_off = l_off; along_off = vec3(0);              norm = -seg_dir; }
+    else if (vid == 27) { cross_off = r_off; along_off = vec3(0);              norm = -seg_dir; }
+    else if (vid == 28) { cross_off = l_off; along_off = vec3(0);              norm = -seg_dir; }
+    else if (vid == 29) { cross_off = b_off; along_off = vec3(0);              norm = -seg_dir; }
+    // End cap (triangles 10, 11), normal = +seg_dir
+    else if (vid == 30) { cross_off = r_off; along_off = seg_dir * seg_len;    norm = seg_dir; }
+    else if (vid == 31) { cross_off = l_off; along_off = seg_dir * seg_len;    norm = seg_dir; }
+    else if (vid == 32) { cross_off = t_off; along_off = seg_dir * seg_len;    norm = seg_dir; }
+    else if (vid == 33) { cross_off = r_off; along_off = seg_dir * seg_len;    norm = seg_dir; }
+    else if (vid == 34) { cross_off = b_off; along_off = seg_dir * seg_len;    norm = seg_dir; }
+    else                { cross_off = l_off; along_off = seg_dir * seg_len;    norm = seg_dir; }
+
+    vec3 world_pos = a_inst_start + along_off + cross_off;
+
+    gl_Position = u_mvp * vec4(world_pos, 1.0);
     gl_ClipDistance[0] = a_inst_layer_z - u_clip_z;
 
-    v_perp  = perp;
-    v_perp2 = p2;
-    v_v     = side;
-    v_color = a_inst_color;
-    v_z     = a_inst_layer_z;
+    v_normal = norm;
+    v_color  = a_inst_color;
+    v_z      = a_inst_layer_z;
 }
 "#;
 
-const IMPOSTOR_TUBE_FS: &str = r#"#version 330 core
-flat in vec3 v_perp;
-flat in vec3 v_perp2;
-in float v_v;
-in vec4 v_color;
-in float v_z;
-
-uniform vec3  u_light_dir;
-uniform float u_clip_z;
-
-out vec4 frag_color;
-
-void main() {
-    if (v_z < u_clip_z) discard;
-
-    float cos_t = v_v;
-    float sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
-    vec3 n = normalize(cos_t * v_perp + sin_t * v_perp2);
-
-    float diffuse = abs(dot(n, u_light_dir));
-    float ambient = 0.15;
-    float light   = ambient + (1.0 - ambient) * diffuse;
-    frag_color    = vec4(v_color.rgb * light, v_color.a);
-}
-"#;
-
-// Impostor sphere vertex shader: camera-facing billboard quad, sphere shading in FS.
-const IMPOSTOR_SPHERE_VS: &str = r#"#version 330 core
-layout (location = 0) in vec3  a_inst_center;
-layout (location = 1) in float a_inst_radius;
-layout (location = 2) in vec4  a_inst_color;
-layout (location = 3) in float a_inst_layer_z;
-
-uniform mat4  u_mvp;
-uniform float u_clip_z;
-
-out vec2 v_uv;                 // billboard coords [-1,1]
-flat out vec3 v_cam_right;
-flat out vec3 v_cam_up;
-flat out vec3 v_cam_fwd;
-out vec4 v_color;
-out float v_z;
-
-void main() {
-    // Camera basis from orthographic MVP matrix
-    vec3 cam_right = normalize(vec3(u_mvp[0][0], u_mvp[1][0], u_mvp[2][0]));
-    vec3 cam_up    = normalize(vec3(u_mvp[0][1], u_mvp[1][1], u_mvp[2][1]));
-
-    // Quad corners via gl_VertexID (TRIANGLE_STRIP)
-    float u = ((gl_VertexID & 1) == 0) ? -1.0 : 1.0;
-    float v = ((gl_VertexID & 2) == 0) ? -1.0 : 1.0;
-
-    vec3 world_pos = a_inst_center
-        + cam_right * (u * a_inst_radius)
-        + cam_up    * (v * a_inst_radius);
-
-    gl_Position      = u_mvp * vec4(world_pos, 1.0);
-    gl_ClipDistance[0] = a_inst_layer_z - u_clip_z;
-
-    v_uv        = vec2(u, v);
-    v_cam_right = cam_right;
-    v_cam_up    = cam_up;
-    v_cam_fwd   = normalize(vec3(u_mvp[0][2], u_mvp[1][2], u_mvp[2][2]));
-    v_color     = a_inst_color;
-    v_z         = a_inst_layer_z;
-}
-"#;
-
-const IMPOSTOR_SPHERE_FS: &str = r#"#version 330 core
-in vec2 v_uv;
-flat in vec3 v_cam_right;
-flat in vec3 v_cam_up;
-flat in vec3 v_cam_fwd;
+const RHOMBUS_FS: &str = r#"#version 330 core
+flat in vec3  v_normal;
 in vec4  v_color;
 in float v_z;
 
@@ -215,13 +186,7 @@ out vec4 frag_color;
 void main() {
     if (v_z < u_clip_z) discard;
 
-    float r2 = dot(v_uv, v_uv);
-    if (r2 > 1.0) discard;          // outside sphere silhouette
-
-    float nz = sqrt(1.0 - r2);
-    vec3 n = normalize(v_uv.x * v_cam_right + v_uv.y * v_cam_up - nz * v_cam_fwd);
-
-    float diffuse = abs(dot(n, u_light_dir));
+    float diffuse = abs(dot(v_normal, u_light_dir));
     float ambient = 0.15;
     float light   = ambient + (1.0 - ambient) * diffuse;
     frag_color    = vec4(v_color.rgb * light, v_color.a);
@@ -234,8 +199,7 @@ void main() {
 
 const LINE_STRIDE: usize = 7;  // x y z r g b a
 const MESH_STRIDE: usize = 11; // x y z nx ny nz r g b a layer_z
-const TUBE_INSTANCE_STRIDE: usize = 12;   // start(3) + dir(2) + scale(2) + color(4) + layer_z(1)
-const SPHERE_INSTANCE_STRIDE: usize = 9;  // center(3) + radius(1) + color(4) + layer_z(1)
+const RHOMBUS_INSTANCE_STRIDE: usize = 12;  // start(3) + dir(2) + scale(2) + color(4) + layer_z(1)
 
 pub struct GpuBuffer {
     vao: glow::VertexArray,
@@ -243,7 +207,10 @@ pub struct GpuBuffer {
     vertex_count: i32,
 }
 
-enum BatchKind { Tube, Sphere }
+#[allow(dead_code)]
+enum BatchKind { Rhombus }
+
+#[allow(dead_code)]
 
 struct InstancedBatch {
     vao: glow::VertexArray,
@@ -262,11 +229,10 @@ pub struct Renderer {
     pub mesh: Option<GpuBuffer>,
     pub slices: Option<GpuBuffer>,
     pub current_slice: Option<GpuBuffer>,
-    // Impostor toolpath rendering
-    impostor_tube_program: glow::Program,
-    impostor_sphere_program: glow::Program,
-    toolpath_tubes: Option<InstancedBatch>,
-    toolpath_spheres: Option<InstancedBatch>,
+    // Extruded rhombus toolpath rendering
+    rhombus_program: glow::Program,
+    toolpath_rhombuses: Option<InstancedBatch>,
+    half_height: f32,
     pub toolpath_lines: Option<GpuBuffer>,
     pub toolpath_path_lines: Option<GpuBuffer>,
     // Our own FBO with a guaranteed depth buffer
@@ -287,8 +253,7 @@ impl Renderer {
     pub fn new(gl: Arc<glow::Context>) -> Self {
         let line_program = unsafe { create_program(&gl, LINE_VS, LINE_FS) };
         let mesh_program = unsafe { create_program(&gl, MESH_VS, MESH_FS) };
-        let impostor_tube_program = unsafe { create_program(&gl, IMPOSTOR_TUBE_VS, IMPOSTOR_TUBE_FS) };
-        let impostor_sphere_program = unsafe { create_program(&gl, IMPOSTOR_SPHERE_VS, IMPOSTOR_SPHERE_FS) };
+        let rhombus_program = unsafe { create_program(&gl, RHOMBUS_VS, RHOMBUS_FS) };
 
         // Create FBO with depth buffer (start at 1x1, resized on first draw)
         let (fbo, fbo_color, fbo_depth) = unsafe { create_fbo(&gl, 1, 1) };
@@ -300,10 +265,9 @@ impl Renderer {
             mesh: None,
             slices: None,
             current_slice: None,
-            impostor_tube_program,
-            impostor_sphere_program,
-            toolpath_tubes: None,
-            toolpath_spheres: None,
+            rhombus_program,
+            toolpath_rhombuses: None,
+            half_height: 0.1,
             toolpath_lines: None,
             toolpath_path_lines: None,
             fbo,
@@ -382,15 +346,16 @@ impl Renderer {
         self.current_slice = Some(upload_line_buffer(&self.gl, &verts, count));
     }
 
-    /// Upload planned toolpath layers using impostor rendering.
-    /// Tube segments and sphere joints are rendered as billboard quads with analytical shading.
+    /// Upload planned toolpath layers as extruded rhombus segments.
+    /// Each segment is a prism with rhombus cross-section (width = nozzle_width, height = layer_height).
     pub fn upload_planned_toolpath(
         &mut self,
         planned_layers: &[PlannedLayer],
         nozzle_width: f32,
+        layer_height: f32,
     ) {
-        let mut tube_instances: Vec<f32> = Vec::new();
-        let mut sphere_instances: Vec<f32> = Vec::new();
+        self.half_height = layer_height * 0.5;
+        let mut rhombus_instances: Vec<f32> = Vec::new();
         let mut line_verts: Vec<f32> = Vec::new();
         let mut path_line_verts: Vec<f32> = Vec::new();
 
@@ -413,35 +378,26 @@ impl Renderer {
                         let pts = &move_.points;
                         if pts.len() < 2 { continue; }
                         if pts.len() == 2 {
-                            // Connection segment between perimeter loops
                             let from = &pts[0];
                             let to = &pts[1];
-                            push_tube_instance(&mut tube_instances,
+                            push_rhombus_instance(&mut rhombus_instances,
                                 from.x, from.y, to.x, to.y,
                                 z, nozzle_width,
                                 r, g, b, a,
                                 z,
                             );
-                            let radius = nozzle_width * 0.5;
-                            push_sphere_instance(&mut sphere_instances, from.x, from.y, z, radius, r, g, b, a, z);
-                            push_sphere_instance(&mut sphere_instances, to.x, to.y, z, radius, r, g, b, a, z);
                             push_line_vert(&mut path_line_verts, from.x, from.y, z, r, g, b, a);
                             push_line_vert(&mut path_line_verts, to.x, to.y, z, r, g, b, a);
                         } else {
-                            // Closed perimeter loop
                             let n = pts.len();
                             for s in 0..n {
                                 let next = (s + 1) % n;
-                                push_tube_instance(&mut tube_instances,
+                                push_rhombus_instance(&mut rhombus_instances,
                                     pts[s].x, pts[s].y, pts[next].x, pts[next].y,
                                     z, nozzle_width,
                                     r, g, b, a,
                                     z,
                                 );
-                            }
-                            let radius = nozzle_width * 0.5;
-                            for p in pts {
-                                push_sphere_instance(&mut sphere_instances, p.x, p.y, z, radius, r, g, b, a, z);
                             }
                             for j in 0..pts.len() {
                                 let k = (j + 1) % pts.len();
@@ -455,15 +411,12 @@ impl Renderer {
                         if move_.points.len() >= 2 {
                             let from = &move_.points[0];
                             let to = &move_.points[1];
-                            push_tube_instance(&mut tube_instances,
+                            push_rhombus_instance(&mut rhombus_instances,
                                 from.x, from.y, to.x, to.y,
                                 z, nozzle_width,
                                 r, g, b, a,
                                 z,
                             );
-                            let radius = nozzle_width * 0.5;
-                            push_sphere_instance(&mut sphere_instances, from.x, from.y, z, radius, r, g, b, a, z);
-                            push_sphere_instance(&mut sphere_instances, to.x, to.y, z, radius, r, g, b, a, z);
                             push_line_vert(&mut path_line_verts, from.x, from.y, z, r, g, b, a);
                             push_line_vert(&mut path_line_verts, to.x, to.y, z, r, g, b, a);
                         }
@@ -473,15 +426,12 @@ impl Renderer {
                         if move_.points.len() >= 2 {
                             let from = &move_.points[0];
                             let to = &move_.points[1];
-                            push_tube_instance(&mut tube_instances,
+                            push_rhombus_instance(&mut rhombus_instances,
                                 from.x, from.y, to.x, to.y,
                                 z, nozzle_width,
                                 r, g, b, a,
                                 z,
                             );
-                            let radius = nozzle_width * 0.5;
-                            push_sphere_instance(&mut sphere_instances, from.x, from.y, z, radius, r, g, b, a, z);
-                            push_sphere_instance(&mut sphere_instances, to.x, to.y, z, radius, r, g, b, a, z);
                             push_line_vert(&mut path_line_verts, from.x, from.y, z, r, g, b, a);
                             push_line_vert(&mut path_line_verts, to.x, to.y, z, r, g, b, a);
                         }
@@ -490,19 +440,12 @@ impl Renderer {
             }
         }
 
-        // Upload impostor batches (instance data only, no prototype meshes)
-        self.toolpath_tubes = if tube_instances.is_empty() {
+        // Upload rhombus batch
+        self.toolpath_rhombuses = if rhombus_instances.is_empty() {
             None
         } else {
-            let tube_count = (tube_instances.len() / TUBE_INSTANCE_STRIDE) as i32;
-            Some(unsafe { upload_impostor_batch(&self.gl, &tube_instances, tube_count, BatchKind::Tube) })
-        };
-
-        self.toolpath_spheres = if sphere_instances.is_empty() {
-            None
-        } else {
-            let sphere_count = (sphere_instances.len() / SPHERE_INSTANCE_STRIDE) as i32;
-            Some(unsafe { upload_impostor_batch(&self.gl, &sphere_instances, sphere_count, BatchKind::Sphere) })
+            let count = (rhombus_instances.len() / RHOMBUS_INSTANCE_STRIDE) as i32;
+            Some(unsafe { upload_impostor_batch(&self.gl, &rhombus_instances, count, BatchKind::Rhombus) })
         };
 
         self.toolpath_lines = if line_verts.is_empty() {
@@ -607,36 +550,23 @@ impl Renderer {
             // Toolpath rendering
             if self.draw_toolpaths {
                 if self.show_filaments {
-                    // Enable hardware clipping for layer culling (more efficient than fragment discard)
+                    // Enable hardware clipping for layer culling
                     gl.enable(glow::CLIP_DISTANCE0);
-                    
-                    // 3D filament impostor rendering (billboard quads)
 
-                    // Draw tube impostors
-                    if let Some(tubes) = &self.toolpath_tubes {
-                        gl.use_program(Some(self.impostor_tube_program));
-                        let loc = gl.get_uniform_location(self.impostor_tube_program, "u_mvp");
+                    // Extruded rhombus filament rendering
+                    if let Some(rhombuses) = &self.toolpath_rhombuses {
+                        gl.use_program(Some(self.rhombus_program));
+                        let loc = gl.get_uniform_location(self.rhombus_program, "u_mvp");
                         gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
-                        let loc = gl.get_uniform_location(self.impostor_tube_program, "u_light_dir");
+                        let loc = gl.get_uniform_location(self.rhombus_program, "u_light_dir");
                         gl.uniform_3_f32_slice(loc.as_ref(), light_dir);
-                        let loc = gl.get_uniform_location(self.impostor_tube_program, "u_clip_z");
+                        let loc = gl.get_uniform_location(self.rhombus_program, "u_clip_z");
                         gl.uniform_1_f32(loc.as_ref(), clip);
-                        draw_impostor_batch(gl, tubes, clip);
+                        let loc = gl.get_uniform_location(self.rhombus_program, "u_half_height");
+                        gl.uniform_1_f32(loc.as_ref(), self.half_height);
+                        draw_rhombus_batch(gl, rhombuses);
                     }
 
-                    // Draw sphere impostors
-                    if let Some(spheres) = &self.toolpath_spheres {
-                        gl.use_program(Some(self.impostor_sphere_program));
-                        let loc = gl.get_uniform_location(self.impostor_sphere_program, "u_mvp");
-                        gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
-                        let loc = gl.get_uniform_location(self.impostor_sphere_program, "u_light_dir");
-                        gl.uniform_3_f32_slice(loc.as_ref(), light_dir);
-                        let loc = gl.get_uniform_location(self.impostor_sphere_program, "u_clip_z");
-                        gl.uniform_1_f32(loc.as_ref(), clip);
-                        draw_impostor_batch(gl, spheres, clip);
-                    }
-                    
-                    // Disable clipping after instanced drawing
                     gl.disable(glow::CLIP_DISTANCE0);
                 } else {
                     // Toolpath lines (flat lines for extrusion paths)
@@ -724,8 +654,7 @@ impl Renderer {
             let gl = &self.gl;
             gl.delete_program(self.line_program);
             gl.delete_program(self.mesh_program);
-            gl.delete_program(self.impostor_tube_program);
-            gl.delete_program(self.impostor_sphere_program);
+            gl.delete_program(self.rhombus_program);
             gl.delete_framebuffer(self.fbo);
             gl.delete_texture(self.fbo_color);
             gl.delete_renderbuffer(self.fbo_depth);
@@ -740,7 +669,7 @@ impl Renderer {
             }
 
             // Delete instanced batches
-            for batch in [&self.toolpath_tubes, &self.toolpath_spheres].into_iter().flatten() {
+            if let Some(batch) = &self.toolpath_rhombuses {
                 gl.delete_vertex_array(batch.vao);
                 gl.delete_buffer(batch.instance_vbo);
             }
@@ -815,8 +744,8 @@ fn push_line_vert(buf: &mut Vec<f32>, x: f32, y: f32, z: f32, r: f32, g: f32, b:
     buf.extend_from_slice(&[x, y, z, r, g, b, a]);
 }
 
-/// Push a tube instance: segment from (ax, ay, z) to (bx, by, z) with given nozzle width and color.
-fn push_tube_instance(
+/// Push a rhombus instance: segment from (ax, ay, z) to (bx, by, z) with given nozzle width and color.
+fn push_rhombus_instance(
     buf: &mut Vec<f32>,
     ax: f32, ay: f32, bx: f32, by: f32,
     z: f32, nozzle_width: f32,
@@ -829,28 +758,17 @@ fn push_tube_instance(
     if length < 1e-9 { return; }
     let dir_x = dx / length;
     let dir_y = dy / length;
-    let radius = nozzle_width * 0.5;
-    buf.extend_from_slice(&[ax, ay, z, dir_x, dir_y, length, radius, r, g, b, a, layer_z]);
+    let half_width = nozzle_width * 0.5;
+    buf.extend_from_slice(&[ax, ay, z, dir_x, dir_y, length, half_width, r, g, b, a, layer_z]);
 }
 
-/// Push a sphere instance at (cx, cy, cz) with given radius and color.
-fn push_sphere_instance(
-    buf: &mut Vec<f32>,
-    cx: f32, cy: f32, cz: f32,
-    radius: f32,
-    r: f32, g: f32, b: f32, a: f32,
-    layer_z: f32,
-) {
-    buf.extend_from_slice(&[cx, cy, cz, radius, r, g, b, a, layer_z]);
-}
-
-/// Upload an impostor batch: instance data only, no prototype mesh.
-/// Quad corners are computed from gl_VertexID in the vertex shader.
+/// Upload an instanced batch: instance data only, no prototype mesh.
+/// Rhombus geometry is generated from gl_VertexID in the vertex shader.
 unsafe fn upload_impostor_batch(
     gl: &glow::Context,
     instance_data: &[f32],
     instance_count: i32,
-    kind: BatchKind,
+    _kind: BatchKind,
 ) -> InstancedBatch {
     let vao = gl.create_vertex_array().unwrap();
     gl.bind_vertex_array(Some(vao));
@@ -860,67 +778,37 @@ unsafe fn upload_impostor_batch(
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(inst_vbo));
     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, cast_f32_u8(instance_data), glow::STATIC_DRAW);
 
-    match kind {
-        BatchKind::Tube => {
-            let stride = (TUBE_INSTANCE_STRIDE * 4) as i32; // 48 bytes
-            // slot 0: vec3 start (offset 0)
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
-            gl.vertex_attrib_divisor(0, 1);
-            // slot 1: vec2 dir (offset 12)
-            gl.enable_vertex_attrib_array(1);
-            gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 3 * 4);
-            gl.vertex_attrib_divisor(1, 1);
-            // slot 2: vec2 scale (length, radius) (offset 20)
-            gl.enable_vertex_attrib_array(2);
-            gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 5 * 4);
-            gl.vertex_attrib_divisor(2, 1);
-            // slot 3: vec4 color (offset 28)
-            gl.enable_vertex_attrib_array(3);
-            gl.vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, stride, 7 * 4);
-            gl.vertex_attrib_divisor(3, 1);
-            // slot 4: float layer_z (offset 44)
-            gl.enable_vertex_attrib_array(4);
-            gl.vertex_attrib_pointer_f32(4, 1, glow::FLOAT, false, stride, 11 * 4);
-            gl.vertex_attrib_divisor(4, 1);
-        }
-        BatchKind::Sphere => {
-            let stride = (SPHERE_INSTANCE_STRIDE * 4) as i32; // 36 bytes
-            // slot 0: vec3 center (offset 0)
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
-            gl.vertex_attrib_divisor(0, 1);
-            // slot 1: float radius (offset 12)
-            gl.enable_vertex_attrib_array(1);
-            gl.vertex_attrib_pointer_f32(1, 1, glow::FLOAT, false, stride, 3 * 4);
-            gl.vertex_attrib_divisor(1, 1);
-            // slot 2: vec4 color (offset 16)
-            gl.enable_vertex_attrib_array(2);
-            gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 4 * 4);
-            gl.vertex_attrib_divisor(2, 1);
-            // slot 3: float layer_z (offset 32)
-            gl.enable_vertex_attrib_array(3);
-            gl.vertex_attrib_pointer_f32(3, 1, glow::FLOAT, false, stride, 8 * 4);
-            gl.vertex_attrib_divisor(3, 1);
-        }
-    }
+    let stride = (RHOMBUS_INSTANCE_STRIDE * 4) as i32; // 48 bytes
+    // slot 0: vec3 start (offset 0)
+    gl.enable_vertex_attrib_array(0);
+    gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
+    gl.vertex_attrib_divisor(0, 1);
+    // slot 1: vec2 dir (offset 12)
+    gl.enable_vertex_attrib_array(1);
+    gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 3 * 4);
+    gl.vertex_attrib_divisor(1, 1);
+    // slot 2: vec2 scale (length, half_width) (offset 20)
+    gl.enable_vertex_attrib_array(2);
+    gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 5 * 4);
+    gl.vertex_attrib_divisor(2, 1);
+    // slot 3: vec4 color (offset 28)
+    gl.enable_vertex_attrib_array(3);
+    gl.vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, stride, 7 * 4);
+    gl.vertex_attrib_divisor(3, 1);
+    // slot 4: float layer_z (offset 44)
+    gl.enable_vertex_attrib_array(4);
+    gl.vertex_attrib_pointer_f32(4, 1, glow::FLOAT, false, stride, 11 * 4);
+    gl.vertex_attrib_divisor(4, 1);
 
     gl.bind_vertex_array(None);
 
     // Build layer index: for each unique layer_z, record (layer_z, first_instance_index)
     let mut layer_starts: Vec<(f32, i32)> = Vec::new();
     let mut last_layer_z: Option<f32> = None;
-    let layer_z_offset = match kind {
-        BatchKind::Tube => 11,    // layer_z is at index 11 in tube instance data
-        BatchKind::Sphere => 8,   // layer_z is at index 8 in sphere instance data
-    };
 
     for i in 0..instance_count as isize {
-        let idx = i as usize * match kind {
-            BatchKind::Tube => TUBE_INSTANCE_STRIDE,
-            BatchKind::Sphere => SPHERE_INSTANCE_STRIDE,
-        };
-        let layer_z = instance_data[idx + layer_z_offset];
+        let idx = i as usize * RHOMBUS_INSTANCE_STRIDE;
+        let layer_z = instance_data[idx + 11]; // layer_z is at index 11
         if last_layer_z != Some(layer_z) {
             layer_starts.push((layer_z, i as i32));
             last_layer_z = Some(layer_z);
@@ -931,19 +819,18 @@ unsafe fn upload_impostor_batch(
         vao,
         instance_vbo: inst_vbo,
         instance_count,
-        prototype_vertex_count: 4,  // impostor quad = 4 vertices (TRIANGLE_STRIP)
+        prototype_vertex_count: 36, // 12 triangles for extruded rhombus
         layer_starts,
     }
 }
 
-/// Draw an impostor batch. Uses TRIANGLE_STRIP with 4 vertices per instance.
-/// Hardware clip distance culls invisible layers efficiently.
-unsafe fn draw_impostor_batch(gl: &glow::Context, batch: &InstancedBatch, _clip_z: f32) {
+/// Draw a rhombus batch. Uses TRIANGLES with 36 vertices per instance (12 triangles).
+unsafe fn draw_rhombus_batch(gl: &glow::Context, batch: &InstancedBatch) {
     gl.bind_vertex_array(Some(batch.vao));
     gl.draw_arrays_instanced(
-        glow::TRIANGLE_STRIP,
+        glow::TRIANGLES,
         0,
-        batch.prototype_vertex_count,  // 4
+        batch.prototype_vertex_count, // 36
         batch.instance_count,
     );
     gl.bind_vertex_array(None);
