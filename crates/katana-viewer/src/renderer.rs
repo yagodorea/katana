@@ -74,22 +74,22 @@ void main() {
 }
 "#;
 
-// Instanced tube vertex shader: prototype tube is along +X from x=-0.5 to x=+0.5, radius 0.5
-const INSTANCED_TUBE_VS: &str = r#"#version 330 core
-// Prototype mesh (unit tube along X)
-layout (location = 0) in vec3 a_pos;
-layout (location = 1) in vec3 a_normal;
-// Per-instance data
-layout (location = 2) in vec3 a_inst_start;    // (start_x, start_y, z)
-layout (location = 3) in vec2 a_inst_dir;       // unit direction in XY
-layout (location = 4) in vec2 a_inst_scale;     // (length, radius)
-layout (location = 5) in vec4 a_inst_color;
-layout (location = 6) in float a_inst_layer_z;
+// Impostor tube vertex shader: billboard quad per segment, cylinder shading in FS.
+// No prototype mesh — quad corners computed from gl_VertexID (TRIANGLE_STRIP, 4 verts).
+const IMPOSTOR_TUBE_VS: &str = r#"#version 330 core
+// Per-instance data only — no prototype mesh
+layout (location = 0) in vec3 a_inst_start;
+layout (location = 1) in vec2 a_inst_dir;
+layout (location = 2) in vec2 a_inst_scale;     // (length, radius)
+layout (location = 3) in vec4 a_inst_color;
+layout (location = 4) in float a_inst_layer_z;
 
 uniform mat4 u_mvp;
 uniform float u_clip_z;
 
-out vec3 v_normal;
+flat out vec3 v_perp;
+flat out vec3 v_perp2;
+out float v_v;          // cross-tube coordinate, interpolates -1..+1
 out vec4 v_color;
 out float v_z;
 
@@ -97,64 +97,134 @@ void main() {
     float seg_len = a_inst_scale.x;
     float radius  = a_inst_scale.y;
 
-    // Unit tube is along +X. Rotate to segment direction.
-    vec3 tangent   = vec3(a_inst_dir, 0.0);
-    vec3 bitangent = vec3(-a_inst_dir.y, a_inst_dir.x, 0.0);
-    vec3 up        = vec3(0.0, 0.0, 1.0);
+    vec3 axis    = vec3(a_inst_dir, 0.0);
+    vec3 seg_end = a_inst_start + axis * seg_len;
 
-    // Scale prototype: X by length, YZ by radius*2 (prototype radius = 0.5)
-    vec3 scaled = vec3(a_pos.x * seg_len, a_pos.y * radius * 2.0, a_pos.z * radius * 2.0);
-    // Shift so start is at segment start (prototype center is at origin)
-    scaled.x += seg_len * 0.5;
+    // Camera forward extracted from orthographic MVP matrix
+    vec3 cam_fwd = normalize(vec3(u_mvp[0][2], u_mvp[1][2], u_mvp[2][2]));
 
-    vec3 world_pos = a_inst_start
-        + scaled.x * tangent
-        + scaled.y * bitangent
-        + scaled.z * up;
+    // Billboard perpendicular: maximises visible tube width from camera
+    vec3 perp = cross(axis, cam_fwd);
+    float perp_len = length(perp);
+    if (perp_len < 0.001) {
+        // Degenerate: looking along tube axis — use lateral direction
+        perp = vec3(-a_inst_dir.y, a_inst_dir.x, 0.0);
+    } else {
+        perp /= perp_len;
+    }
+    vec3 p2 = cross(axis, perp);   // always faces away from camera
 
-    vec3 world_normal = a_normal.x * tangent
-                      + a_normal.y * bitangent
-                      + a_normal.z * up;
+    // Quad corners (TRIANGLE_STRIP: 0-1-2-3)
+    vec3  base = (gl_VertexID < 2) ? a_inst_start : seg_end;
+    float side = ((gl_VertexID & 1) == 0) ? -1.0 : 1.0;
 
-    gl_Position = u_mvp * vec4(world_pos, 1.0);
-    
-    // Hardware clipping: discard if layer is below clip plane
-    // This culls entire primitives before rasterization
+    vec3 world_pos = base + perp * (radius * side);
+
+    gl_Position      = u_mvp * vec4(world_pos, 1.0);
     gl_ClipDistance[0] = a_inst_layer_z - u_clip_z;
-    
-    v_normal = world_normal;
+
+    v_perp  = perp;
+    v_perp2 = p2;
+    v_v     = side;
     v_color = a_inst_color;
-    v_z = a_inst_layer_z;
+    v_z     = a_inst_layer_z;
 }
 "#;
 
-// Instanced sphere vertex shader: prototype sphere is radius 0.5 centered at origin
-const INSTANCED_SPHERE_VS: &str = r#"#version 330 core
-layout (location = 0) in vec3 a_pos;
-layout (location = 1) in vec3 a_normal;
-layout (location = 2) in vec3 a_inst_center;
-layout (location = 3) in float a_inst_radius;
-layout (location = 4) in vec4 a_inst_color;
-layout (location = 5) in float a_inst_layer_z;
+const IMPOSTOR_TUBE_FS: &str = r#"#version 330 core
+flat in vec3 v_perp;
+flat in vec3 v_perp2;
+in float v_v;
+in vec4 v_color;
+in float v_z;
 
-uniform mat4 u_mvp;
+uniform vec3  u_light_dir;
 uniform float u_clip_z;
 
-out vec3 v_normal;
+out vec4 frag_color;
+
+void main() {
+    if (v_z < u_clip_z) discard;
+
+    float cos_t = v_v;
+    float sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
+    vec3 n = normalize(cos_t * v_perp + sin_t * v_perp2);
+
+    float diffuse = abs(dot(n, u_light_dir));
+    float ambient = 0.15;
+    float light   = ambient + (1.0 - ambient) * diffuse;
+    frag_color    = vec4(v_color.rgb * light, v_color.a);
+}
+"#;
+
+// Impostor sphere vertex shader: camera-facing billboard quad, sphere shading in FS.
+const IMPOSTOR_SPHERE_VS: &str = r#"#version 330 core
+layout (location = 0) in vec3  a_inst_center;
+layout (location = 1) in float a_inst_radius;
+layout (location = 2) in vec4  a_inst_color;
+layout (location = 3) in float a_inst_layer_z;
+
+uniform mat4  u_mvp;
+uniform float u_clip_z;
+
+out vec2 v_uv;                 // billboard coords [-1,1]
+flat out vec3 v_cam_right;
+flat out vec3 v_cam_up;
+flat out vec3 v_cam_fwd;
 out vec4 v_color;
 out float v_z;
 
 void main() {
-    vec3 world_pos = a_inst_center + a_pos * (a_inst_radius);
-    gl_Position = u_mvp * vec4(world_pos, 1.0);
-    
-    // Hardware clipping: discard if layer is below clip plane
-    // This culls entire primitives before rasterization
+    // Camera basis from orthographic MVP matrix
+    vec3 cam_right = normalize(vec3(u_mvp[0][0], u_mvp[1][0], u_mvp[2][0]));
+    vec3 cam_up    = normalize(vec3(u_mvp[0][1], u_mvp[1][1], u_mvp[2][1]));
+
+    // Quad corners via gl_VertexID (TRIANGLE_STRIP)
+    float u = ((gl_VertexID & 1) == 0) ? -1.0 : 1.0;
+    float v = ((gl_VertexID & 2) == 0) ? -1.0 : 1.0;
+
+    vec3 world_pos = a_inst_center
+        + cam_right * (u * a_inst_radius)
+        + cam_up    * (v * a_inst_radius);
+
+    gl_Position      = u_mvp * vec4(world_pos, 1.0);
     gl_ClipDistance[0] = a_inst_layer_z - u_clip_z;
-    
-    v_normal = a_normal;  // rotation-invariant for uniform scale
-    v_color = a_inst_color;
-    v_z = a_inst_layer_z;
+
+    v_uv        = vec2(u, v);
+    v_cam_right = cam_right;
+    v_cam_up    = cam_up;
+    v_cam_fwd   = normalize(vec3(u_mvp[0][2], u_mvp[1][2], u_mvp[2][2]));
+    v_color     = a_inst_color;
+    v_z         = a_inst_layer_z;
+}
+"#;
+
+const IMPOSTOR_SPHERE_FS: &str = r#"#version 330 core
+in vec2 v_uv;
+flat in vec3 v_cam_right;
+flat in vec3 v_cam_up;
+flat in vec3 v_cam_fwd;
+in vec4  v_color;
+in float v_z;
+
+uniform vec3  u_light_dir;
+uniform float u_clip_z;
+
+out vec4 frag_color;
+
+void main() {
+    if (v_z < u_clip_z) discard;
+
+    float r2 = dot(v_uv, v_uv);
+    if (r2 > 1.0) discard;          // outside sphere silhouette
+
+    float nz = sqrt(1.0 - r2);
+    vec3 n = normalize(v_uv.x * v_cam_right + v_uv.y * v_cam_up - nz * v_cam_fwd);
+
+    float diffuse = abs(dot(n, u_light_dir));
+    float ambient = 0.15;
+    float light   = ambient + (1.0 - ambient) * diffuse;
+    frag_color    = vec4(v_color.rgb * light, v_color.a);
 }
 "#;
 
@@ -166,15 +236,9 @@ const LINE_STRIDE: usize = 7;  // x y z r g b a
 const MESH_STRIDE: usize = 11; // x y z nx ny nz r g b a layer_z
 const TUBE_INSTANCE_STRIDE: usize = 12;   // start(3) + dir(2) + scale(2) + color(4) + layer_z(1)
 const SPHERE_INSTANCE_STRIDE: usize = 9;  // center(3) + radius(1) + color(4) + layer_z(1)
-const PROTO_STRIDE: usize = 6;            // pos(3) + normal(3)
 
 pub struct GpuBuffer {
     vao: glow::VertexArray,
-    vbo: glow::Buffer,
-    vertex_count: i32,
-}
-
-struct PrototypeMesh {
     vbo: glow::Buffer,
     vertex_count: i32,
 }
@@ -198,11 +262,9 @@ pub struct Renderer {
     pub mesh: Option<GpuBuffer>,
     pub slices: Option<GpuBuffer>,
     pub current_slice: Option<GpuBuffer>,
-    // Instanced toolpath rendering
-    instanced_tube_program: glow::Program,
-    instanced_sphere_program: glow::Program,
-    tube_prototype: Option<PrototypeMesh>,
-    sphere_prototype: Option<PrototypeMesh>,
+    // Impostor toolpath rendering
+    impostor_tube_program: glow::Program,
+    impostor_sphere_program: glow::Program,
     toolpath_tubes: Option<InstancedBatch>,
     toolpath_spheres: Option<InstancedBatch>,
     pub toolpath_lines: Option<GpuBuffer>,
@@ -225,8 +287,8 @@ impl Renderer {
     pub fn new(gl: Arc<glow::Context>) -> Self {
         let line_program = unsafe { create_program(&gl, LINE_VS, LINE_FS) };
         let mesh_program = unsafe { create_program(&gl, MESH_VS, MESH_FS) };
-        let instanced_tube_program = unsafe { create_program(&gl, INSTANCED_TUBE_VS, MESH_FS) };
-        let instanced_sphere_program = unsafe { create_program(&gl, INSTANCED_SPHERE_VS, MESH_FS) };
+        let impostor_tube_program = unsafe { create_program(&gl, IMPOSTOR_TUBE_VS, IMPOSTOR_TUBE_FS) };
+        let impostor_sphere_program = unsafe { create_program(&gl, IMPOSTOR_SPHERE_VS, IMPOSTOR_SPHERE_FS) };
 
         // Create FBO with depth buffer (start at 1x1, resized on first draw)
         let (fbo, fbo_color, fbo_depth) = unsafe { create_fbo(&gl, 1, 1) };
@@ -238,10 +300,8 @@ impl Renderer {
             mesh: None,
             slices: None,
             current_slice: None,
-            instanced_tube_program,
-            instanced_sphere_program,
-            tube_prototype: None,
-            sphere_prototype: None,
+            impostor_tube_program,
+            impostor_sphere_program,
             toolpath_tubes: None,
             toolpath_spheres: None,
             toolpath_lines: None,
@@ -322,8 +382,8 @@ impl Renderer {
         self.current_slice = Some(upload_line_buffer(&self.gl, &verts, count));
     }
 
-    /// Upload planned toolpath layers using instanced rendering.
-    /// Tube segments and sphere joints are rendered as instances of prototype meshes.
+    /// Upload planned toolpath layers using impostor rendering.
+    /// Tube segments and sphere joints are rendered as billboard quads with analytical shading.
     pub fn upload_planned_toolpath(
         &mut self,
         planned_layers: &[PlannedLayer],
@@ -430,27 +490,19 @@ impl Renderer {
             }
         }
 
-        // Ensure prototypes exist (create once, reuse across uploads)
-        if self.tube_prototype.is_none() {
-            self.tube_prototype = Some(unsafe { create_unit_tube_prototype(&self.gl) });
-            self.sphere_prototype = Some(unsafe { create_unit_sphere_prototype(&self.gl) });
-        }
-
-        // Upload instanced batches
+        // Upload impostor batches (instance data only, no prototype meshes)
         self.toolpath_tubes = if tube_instances.is_empty() {
             None
         } else {
             let tube_count = (tube_instances.len() / TUBE_INSTANCE_STRIDE) as i32;
-            let proto = self.tube_prototype.as_ref().unwrap();
-            Some(unsafe { upload_instanced_batch(&self.gl, proto.vbo, proto.vertex_count, &tube_instances, tube_count, BatchKind::Tube) })
+            Some(unsafe { upload_impostor_batch(&self.gl, &tube_instances, tube_count, BatchKind::Tube) })
         };
 
         self.toolpath_spheres = if sphere_instances.is_empty() {
             None
         } else {
             let sphere_count = (sphere_instances.len() / SPHERE_INSTANCE_STRIDE) as i32;
-            let proto = self.sphere_prototype.as_ref().unwrap();
-            Some(unsafe { upload_instanced_batch(&self.gl, proto.vbo, proto.vertex_count, &sphere_instances, sphere_count, BatchKind::Sphere) })
+            Some(unsafe { upload_impostor_batch(&self.gl, &sphere_instances, sphere_count, BatchKind::Sphere) })
         };
 
         self.toolpath_lines = if line_verts.is_empty() {
@@ -558,30 +610,30 @@ impl Renderer {
                     // Enable hardware clipping for layer culling (more efficient than fragment discard)
                     gl.enable(glow::CLIP_DISTANCE0);
                     
-                    // 3D filament tubes (instanced rendering)
+                    // 3D filament impostor rendering (billboard quads)
 
-                    // Draw tubes
+                    // Draw tube impostors
                     if let Some(tubes) = &self.toolpath_tubes {
-                        gl.use_program(Some(self.instanced_tube_program));
-                        let loc = gl.get_uniform_location(self.instanced_tube_program, "u_mvp");
+                        gl.use_program(Some(self.impostor_tube_program));
+                        let loc = gl.get_uniform_location(self.impostor_tube_program, "u_mvp");
                         gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
-                        let loc = gl.get_uniform_location(self.instanced_tube_program, "u_light_dir");
+                        let loc = gl.get_uniform_location(self.impostor_tube_program, "u_light_dir");
                         gl.uniform_3_f32_slice(loc.as_ref(), light_dir);
-                        let loc = gl.get_uniform_location(self.instanced_tube_program, "u_clip_z");
+                        let loc = gl.get_uniform_location(self.impostor_tube_program, "u_clip_z");
                         gl.uniform_1_f32(loc.as_ref(), clip);
-                        draw_instanced_batch(gl, tubes, clip);
+                        draw_impostor_batch(gl, tubes, clip);
                     }
 
-                    // Draw spheres
+                    // Draw sphere impostors
                     if let Some(spheres) = &self.toolpath_spheres {
-                        gl.use_program(Some(self.instanced_sphere_program));
-                        let loc = gl.get_uniform_location(self.instanced_sphere_program, "u_mvp");
+                        gl.use_program(Some(self.impostor_sphere_program));
+                        let loc = gl.get_uniform_location(self.impostor_sphere_program, "u_mvp");
                         gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
-                        let loc = gl.get_uniform_location(self.instanced_sphere_program, "u_light_dir");
+                        let loc = gl.get_uniform_location(self.impostor_sphere_program, "u_light_dir");
                         gl.uniform_3_f32_slice(loc.as_ref(), light_dir);
-                        let loc = gl.get_uniform_location(self.instanced_sphere_program, "u_clip_z");
+                        let loc = gl.get_uniform_location(self.impostor_sphere_program, "u_clip_z");
                         gl.uniform_1_f32(loc.as_ref(), clip);
-                        draw_instanced_batch(gl, spheres, clip);
+                        draw_impostor_batch(gl, spheres, clip);
                     }
                     
                     // Disable clipping after instanced drawing
@@ -672,19 +724,11 @@ impl Renderer {
             let gl = &self.gl;
             gl.delete_program(self.line_program);
             gl.delete_program(self.mesh_program);
-            gl.delete_program(self.instanced_tube_program);
-            gl.delete_program(self.instanced_sphere_program);
+            gl.delete_program(self.impostor_tube_program);
+            gl.delete_program(self.impostor_sphere_program);
             gl.delete_framebuffer(self.fbo);
             gl.delete_texture(self.fbo_color);
             gl.delete_renderbuffer(self.fbo_depth);
-
-            // Delete prototype VBOs
-            if let Some(proto) = &self.tube_prototype {
-                gl.delete_buffer(proto.vbo);
-            }
-            if let Some(proto) = &self.sphere_prototype {
-                gl.delete_buffer(proto.vbo);
-            }
 
             // Delete regular GpuBuffers
             for buf in [&self.mesh, &self.slices, &self.current_slice, &self.toolpath_lines, &self.toolpath_path_lines]
@@ -800,96 +844,10 @@ fn push_sphere_instance(
     buf.extend_from_slice(&[cx, cy, cz, radius, r, g, b, a, layer_z]);
 }
 
-const TUBE_SIDES: usize = 6;  // Reduced from 8 for 25% fewer vertices per tube
-
-/// Create a unit tube prototype: cylinder along +X from x=-0.5 to x=+0.5, radius 0.5, 6-sided.
-/// Only stores position + normal (6 floats per vertex). 36 vertices total.
-unsafe fn create_unit_tube_prototype(gl: &glow::Context) -> PrototypeMesh {
-    let mut verts: Vec<f32> = Vec::with_capacity(TUBE_SIDES * 6 * PROTO_STRIDE);
-    let radius = 0.5_f32;
-
-    for i in 0..TUBE_SIDES {
-        let j = (i + 1) % TUBE_SIDES;
-        let theta_i = std::f32::consts::TAU * (i as f32) / (TUBE_SIDES as f32);
-        let theta_j = std::f32::consts::TAU * (j as f32) / (TUBE_SIDES as f32);
-
-        let (ci, si) = (theta_i.cos(), theta_i.sin());
-        let (cj, sj) = (theta_j.cos(), theta_j.sin());
-
-        // Ring A at x = -0.5, Ring B at x = +0.5
-        // Normals point radially: (0, cos, sin)
-        let a0 = (-0.5, radius * ci, radius * si, 0.0, ci, si);
-        let a1 = (-0.5, radius * cj, radius * sj, 0.0, cj, sj);
-        let b0 = ( 0.5, radius * ci, radius * si, 0.0, ci, si);
-        let b1 = ( 0.5, radius * cj, radius * sj, 0.0, cj, sj);
-
-        // Triangle 1: a0, b0, a1
-        verts.extend_from_slice(&[a0.0, a0.1, a0.2, a0.3, a0.4, a0.5]);
-        verts.extend_from_slice(&[b0.0, b0.1, b0.2, b0.3, b0.4, b0.5]);
-        verts.extend_from_slice(&[a1.0, a1.1, a1.2, a1.3, a1.4, a1.5]);
-        // Triangle 2: a1, b0, b1
-        verts.extend_from_slice(&[a1.0, a1.1, a1.2, a1.3, a1.4, a1.5]);
-        verts.extend_from_slice(&[b0.0, b0.1, b0.2, b0.3, b0.4, b0.5]);
-        verts.extend_from_slice(&[b1.0, b1.1, b1.2, b1.3, b1.4, b1.5]);
-    }
-
-    let vbo = gl.create_buffer().unwrap();
-    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, cast_f32_u8(&verts), glow::STATIC_DRAW);
-    gl.bind_buffer(glow::ARRAY_BUFFER, None);
-
-    PrototypeMesh { vbo, vertex_count: (TUBE_SIDES * 6) as i32 }
-}
-
-/// Create a unit sphere prototype: 8×8 UV sphere, radius 1, centered at origin.
-/// Only stores position + normal (6 floats per vertex). 384 vertices total.
-unsafe fn create_unit_sphere_prototype(gl: &glow::Context) -> PrototypeMesh {
-    let mut verts: Vec<f32> = Vec::new();
-    let stacks = 8;
-    let slices = 8;
-
-    for i in 0..stacks {
-        let phi0 = std::f32::consts::PI * (i as f32) / (stacks as f32);
-        let phi1 = std::f32::consts::PI * ((i + 1) as f32) / (stacks as f32);
-        let (cp0, sp0) = (phi0.cos(), phi0.sin());
-        let (cp1, sp1) = (phi1.cos(), phi1.sin());
-
-        for j in 0..slices {
-            let t0 = std::f32::consts::TAU * (j as f32) / (slices as f32);
-            let t1 = std::f32::consts::TAU * ((j + 1) as f32) / (slices as f32);
-            let (ct0, st0) = (t0.cos(), t0.sin());
-            let (ct1, st1) = (t1.cos(), t1.sin());
-
-            let p00 = (sp0 * ct0, sp0 * st0, cp0);
-            let p01 = (sp0 * ct1, sp0 * st1, cp0);
-            let p10 = (sp1 * ct0, sp1 * st0, cp1);
-            let p11 = (sp1 * ct1, sp1 * st1, cp1);
-
-            // Triangle 1
-            verts.extend_from_slice(&[p00.0, p00.1, p00.2, p00.0, p00.1, p00.2]);
-            verts.extend_from_slice(&[p10.0, p10.1, p10.2, p10.0, p10.1, p10.2]);
-            verts.extend_from_slice(&[p01.0, p01.1, p01.2, p01.0, p01.1, p01.2]);
-
-            // Triangle 2
-            verts.extend_from_slice(&[p01.0, p01.1, p01.2, p01.0, p01.1, p01.2]);
-            verts.extend_from_slice(&[p10.0, p10.1, p10.2, p10.0, p10.1, p10.2]);
-            verts.extend_from_slice(&[p11.0, p11.1, p11.2, p11.0, p11.1, p11.2]);
-        }
-    }
-
-    let vbo = gl.create_buffer().unwrap();
-    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, cast_f32_u8(&verts), glow::STATIC_DRAW);
-    gl.bind_buffer(glow::ARRAY_BUFFER, None);
-
-    PrototypeMesh { vbo, vertex_count: (stacks * slices * 6) as i32 }
-}
-
-/// Upload an instanced batch: prototype mesh + instance data.
-unsafe fn upload_instanced_batch(
+/// Upload an impostor batch: instance data only, no prototype mesh.
+/// Quad corners are computed from gl_VertexID in the vertex shader.
+unsafe fn upload_impostor_batch(
     gl: &glow::Context,
-    proto_vbo: glow::Buffer,
-    proto_vertex_count: i32,
     instance_data: &[f32],
     instance_count: i32,
     kind: BatchKind,
@@ -897,15 +855,7 @@ unsafe fn upload_instanced_batch(
     let vao = gl.create_vertex_array().unwrap();
     gl.bind_vertex_array(Some(vao));
 
-    // Bind prototype VBO for slots 0-1 (position + normal)
-    gl.bind_buffer(glow::ARRAY_BUFFER, Some(proto_vbo));
-    let proto_stride = (PROTO_STRIDE * 4) as i32;
-    gl.enable_vertex_attrib_array(0);
-    gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, proto_stride, 0);
-    gl.enable_vertex_attrib_array(1);
-    gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, proto_stride, 3 * 4);
-
-    // Create and bind instance VBO
+    // Create and bind instance VBO (attributes start at location 0)
     let inst_vbo = gl.create_buffer().unwrap();
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(inst_vbo));
     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, cast_f32_u8(instance_data), glow::STATIC_DRAW);
@@ -913,45 +863,45 @@ unsafe fn upload_instanced_batch(
     match kind {
         BatchKind::Tube => {
             let stride = (TUBE_INSTANCE_STRIDE * 4) as i32; // 48 bytes
-            // slot 2: vec3 start (offset 0)
+            // slot 0: vec3 start (offset 0)
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
+            gl.vertex_attrib_divisor(0, 1);
+            // slot 1: vec2 dir (offset 12)
+            gl.enable_vertex_attrib_array(1);
+            gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 3 * 4);
+            gl.vertex_attrib_divisor(1, 1);
+            // slot 2: vec2 scale (length, radius) (offset 20)
             gl.enable_vertex_attrib_array(2);
-            gl.vertex_attrib_pointer_f32(2, 3, glow::FLOAT, false, stride, 0);
+            gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 5 * 4);
             gl.vertex_attrib_divisor(2, 1);
-            // slot 3: vec2 dir (offset 12)
+            // slot 3: vec4 color (offset 28)
             gl.enable_vertex_attrib_array(3);
-            gl.vertex_attrib_pointer_f32(3, 2, glow::FLOAT, false, stride, 3 * 4);
+            gl.vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, stride, 7 * 4);
             gl.vertex_attrib_divisor(3, 1);
-            // slot 4: vec2 scale (length, radius) (offset 20)
+            // slot 4: float layer_z (offset 44)
             gl.enable_vertex_attrib_array(4);
-            gl.vertex_attrib_pointer_f32(4, 2, glow::FLOAT, false, stride, 5 * 4);
+            gl.vertex_attrib_pointer_f32(4, 1, glow::FLOAT, false, stride, 11 * 4);
             gl.vertex_attrib_divisor(4, 1);
-            // slot 5: vec4 color (offset 28)
-            gl.enable_vertex_attrib_array(5);
-            gl.vertex_attrib_pointer_f32(5, 4, glow::FLOAT, false, stride, 7 * 4);
-            gl.vertex_attrib_divisor(5, 1);
-            // slot 6: float layer_z (offset 44)
-            gl.enable_vertex_attrib_array(6);
-            gl.vertex_attrib_pointer_f32(6, 1, glow::FLOAT, false, stride, 11 * 4);
-            gl.vertex_attrib_divisor(6, 1);
         }
         BatchKind::Sphere => {
             let stride = (SPHERE_INSTANCE_STRIDE * 4) as i32; // 36 bytes
-            // slot 2: vec3 center (offset 0)
+            // slot 0: vec3 center (offset 0)
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
+            gl.vertex_attrib_divisor(0, 1);
+            // slot 1: float radius (offset 12)
+            gl.enable_vertex_attrib_array(1);
+            gl.vertex_attrib_pointer_f32(1, 1, glow::FLOAT, false, stride, 3 * 4);
+            gl.vertex_attrib_divisor(1, 1);
+            // slot 2: vec4 color (offset 16)
             gl.enable_vertex_attrib_array(2);
-            gl.vertex_attrib_pointer_f32(2, 3, glow::FLOAT, false, stride, 0);
+            gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 4 * 4);
             gl.vertex_attrib_divisor(2, 1);
-            // slot 3: float radius (offset 12)
+            // slot 3: float layer_z (offset 32)
             gl.enable_vertex_attrib_array(3);
-            gl.vertex_attrib_pointer_f32(3, 1, glow::FLOAT, false, stride, 3 * 4);
+            gl.vertex_attrib_pointer_f32(3, 1, glow::FLOAT, false, stride, 8 * 4);
             gl.vertex_attrib_divisor(3, 1);
-            // slot 4: vec4 color (offset 16)
-            gl.enable_vertex_attrib_array(4);
-            gl.vertex_attrib_pointer_f32(4, 4, glow::FLOAT, false, stride, 4 * 4);
-            gl.vertex_attrib_divisor(4, 1);
-            // slot 5: float layer_z (offset 32)
-            gl.enable_vertex_attrib_array(5);
-            gl.vertex_attrib_pointer_f32(5, 1, glow::FLOAT, false, stride, 8 * 4);
-            gl.vertex_attrib_divisor(5, 1);
         }
     }
 
@@ -962,7 +912,7 @@ unsafe fn upload_instanced_batch(
     let mut last_layer_z: Option<f32> = None;
     let layer_z_offset = match kind {
         BatchKind::Tube => 11,    // layer_z is at index 11 in tube instance data
-        BatchKind::Sphere => 8,    // layer_z is at index 8 in sphere instance data
+        BatchKind::Sphere => 8,   // layer_z is at index 8 in sphere instance data
     };
 
     for i in 0..instance_count as isize {
@@ -981,60 +931,21 @@ unsafe fn upload_instanced_batch(
         vao,
         instance_vbo: inst_vbo,
         instance_count,
-        prototype_vertex_count: proto_vertex_count,
+        prototype_vertex_count: 4,  // impostor quad = 4 vertices (TRIANGLE_STRIP)
         layer_starts,
     }
 }
 
-/// Draw an instanced batch with per-layer culling.
-/// Issues one draw call per visible layer to completely skip invisible instances.
-unsafe fn draw_instanced_batch(gl: &glow::Context, batch: &InstancedBatch, clip_z: f32) {
-    if batch.layer_starts.is_empty() {
-        // Fallback: draw all instances
-        gl.bind_vertex_array(Some(batch.vao));
-        gl.draw_arrays_instanced(
-            glow::TRIANGLES,
-            0,
-            batch.prototype_vertex_count,
-            batch.instance_count,
-        );
-        gl.bind_vertex_array(None);
-        return;
-    }
-
+/// Draw an impostor batch. Uses TRIANGLE_STRIP with 4 vertices per instance.
+/// Hardware clip distance culls invisible layers efficiently.
+unsafe fn draw_impostor_batch(gl: &glow::Context, batch: &InstancedBatch, _clip_z: f32) {
     gl.bind_vertex_array(Some(batch.vao));
-
-    // Draw each visible layer separately
-    for i in 0..batch.layer_starts.len() {
-        let (layer_z, first_instance) = batch.layer_starts[i];
-        
-        if layer_z < clip_z {
-            continue;  // Skip invisible layers
-        }
-
-        // Calculate instance count for this layer
-        let next_start = if i + 1 < batch.layer_starts.len() {
-            batch.layer_starts[i + 1].1
-        } else {
-            batch.instance_count
-        };
-        let layer_count = next_start - first_instance;
-
-        if layer_count > 0 {
-            // Draw this layer's instances
-            // Note: GL 3.3 doesn't have base_instance, so we draw all instances
-            // and rely on vertex shader culling for invisible ones within the batch.
-            // TODO: Add ARB_base_instance support for true per-layer offsets.
-            gl.draw_arrays_instanced(
-                glow::TRIANGLES,
-                0,
-                batch.prototype_vertex_count,
-                batch.instance_count,
-            );
-            break;  // For now, draw all at once after first visible layer
-        }
-    }
-
+    gl.draw_arrays_instanced(
+        glow::TRIANGLE_STRIP,
+        0,
+        batch.prototype_vertex_count,  // 4
+        batch.instance_count,
+    );
     gl.bind_vertex_array(None);
 }
 

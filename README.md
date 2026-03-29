@@ -22,9 +22,17 @@ This workspace contains 3 programs:
 - [X] Parameterizes slicing and toolpathing powered by `nalgebra` and `i_overlay`
 - [X] Rectilinear infill
 - [X] GPU-rendered visualizer built on `eframe` and `glow`
-- [X] Rendering toolpaths with thickness
-    - [X] Fix bug where filaments are clipped by next layer
 - [ ] :loading: Calculate travel moves and segment connections
     - [X] Fix issue where all layer travels start from 0,0
 - [ ] G-code export
 - [ ] Add more infill patterns
+
+### Rendering performance improvements
+- [X] Implement instanced rendering to avoid loading 20gb of triangle meshes into memory
+- [X] Use impostor rendering to render instances with 1 quad each instead of tens of vertices
+
+### Rendering quality improvements
+- [X] Rendering toolpaths with thickness
+- [X] Fix bug where filaments are clipped by next layer
+- [X] Hide tube insides with ball geometry
+    - [ ] Fix issue where smooth curves look like a bunch of balls
