@@ -119,9 +119,10 @@ fn main() -> eframe::Result {
             gpu.upload_current_slice(&layers);
             gpu.upload_planned_toolpath(&planned_result.layers, args.nozzle_width, args.layer_height);
 
-            // Start showing all layers from the bottom
+            // Start showing all layers
+            let last_layer = num_layers.saturating_sub(1);
             if !layers.is_empty() {
-                gpu.clip_z = layers[0].z - 0.001;
+                gpu.clip_z = layers[last_layer].z + 0.001;
             }
 
             let renderer = Arc::new(Mutex::new(gpu));
@@ -130,7 +131,7 @@ fn main() -> eframe::Result {
                 renderer,
                 layers,
                 num_layers,
-                current_layer: 0,
+                current_layer: last_layer,
                 slice_view: SliceView::Toolpaths,
                 center: [center_x, center_y, center_z],
                 extent,
@@ -267,7 +268,7 @@ impl eframe::App for ViewerApp {
                     return;
                 }
                 let max = self.num_layers.saturating_sub(1);
-                // Invert so top of slider = layer 0 (all layers visible)
+                // Invert: slider top = layer 0 (start of print), bottom = all layers visible
                 let mut inverted = max - self.current_layer;
                 ui.spacing_mut().slider_width = ui.available_height() - 16.0;
                 ui.add(
@@ -368,7 +369,7 @@ impl eframe::App for ViewerApp {
                 // Update renderer state (clip_z, draw mode) — no re-upload needed
                 if !self.layers.is_empty() {
                     let mut r = self.renderer.lock().unwrap();
-                    r.clip_z = self.layers[self.current_layer].z - 0.001;
+                    r.clip_z = self.layers[self.current_layer].z + 0.001;
                     r.draw_contours = self.slice_view == SliceView::Contours;
                     r.draw_toolpaths = self.slice_view == SliceView::Toolpaths;
                     r.show_travel_moves = self.show_travel_moves;

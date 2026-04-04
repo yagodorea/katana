@@ -30,7 +30,7 @@ out vec4 frag_color;
 uniform float u_clip_z;
 
 void main() {
-    if (v_z < u_clip_z) discard;
+    if (v_z > u_clip_z) discard;
     frag_color = v_color;
 }
 "#;
@@ -65,7 +65,7 @@ uniform vec3 u_light_dir;
 uniform float u_clip_z;
 
 void main() {
-    if (v_z < u_clip_z) discard;
+    if (v_z > u_clip_z) discard;
     vec3 n = normalize(v_normal);
     float diffuse = abs(dot(n, u_light_dir));
     float ambient = 0.15;
@@ -165,7 +165,7 @@ void main() {
     vec3 world_pos = a_inst_start + along_off + cross_off;
 
     gl_Position = u_mvp * vec4(world_pos, 1.0);
-    gl_ClipDistance[0] = a_inst_layer_z - u_clip_z;
+    gl_ClipDistance[0] = u_clip_z - a_inst_layer_z;
 
     v_normal = norm;
     v_color  = a_inst_color;
@@ -184,8 +184,6 @@ uniform float u_clip_z;
 out vec4 frag_color;
 
 void main() {
-    if (v_z < u_clip_z) discard;
-
     float diffuse = abs(dot(v_normal, u_light_dir));
     float ambient = 0.15;
     float light   = ambient + (1.0 - ambient) * diffuse;
@@ -210,6 +208,24 @@ pub struct GpuBuffer {
 #[allow(dead_code)]
 enum BatchKind { Rhombus }
 
+struct LineUniforms {
+    mvp:    Option<glow::UniformLocation>,
+    clip_z: Option<glow::UniformLocation>,
+}
+
+struct MeshUniforms {
+    mvp:       Option<glow::UniformLocation>,
+    light_dir: Option<glow::UniformLocation>,
+    clip_z:    Option<glow::UniformLocation>,
+}
+
+struct RhombusUniforms {
+    mvp:         Option<glow::UniformLocation>,
+    light_dir:   Option<glow::UniformLocation>,
+    clip_z:      Option<glow::UniformLocation>,
+    half_height: Option<glow::UniformLocation>,
+}
+
 #[allow(dead_code)]
 
 struct InstancedBatch {
@@ -226,6 +242,9 @@ pub struct Renderer {
     gl: Arc<glow::Context>,
     line_program: glow::Program,
     mesh_program: glow::Program,
+    line_uniforms: LineUniforms,
+    mesh_uniforms: MeshUniforms,
+    rhombus_uniforms: RhombusUniforms,
     pub mesh: Option<GpuBuffer>,
     pub slices: Option<GpuBuffer>,
     pub current_slice: Option<GpuBuffer>,
@@ -241,7 +260,7 @@ pub struct Renderer {
     fbo_depth: glow::Renderbuffer,
     fbo_w: i32,
     fbo_h: i32,
-    // Z-clipping: only draw geometry at z >= clip_z
+    // Z-clipping: only draw geometry at z <= clip_z
     pub clip_z: f32,
     pub draw_contours: bool,
     pub draw_toolpaths: bool,
@@ -255,6 +274,22 @@ impl Renderer {
         let mesh_program = unsafe { create_program(&gl, MESH_VS, MESH_FS) };
         let rhombus_program = unsafe { create_program(&gl, RHOMBUS_VS, RHOMBUS_FS) };
 
+        let line_uniforms = unsafe { LineUniforms {
+            mvp:    gl.get_uniform_location(line_program, "u_mvp"),
+            clip_z: gl.get_uniform_location(line_program, "u_clip_z"),
+        }};
+        let mesh_uniforms = unsafe { MeshUniforms {
+            mvp:       gl.get_uniform_location(mesh_program, "u_mvp"),
+            light_dir: gl.get_uniform_location(mesh_program, "u_light_dir"),
+            clip_z:    gl.get_uniform_location(mesh_program, "u_clip_z"),
+        }};
+        let rhombus_uniforms = unsafe { RhombusUniforms {
+            mvp:         gl.get_uniform_location(rhombus_program, "u_mvp"),
+            light_dir:   gl.get_uniform_location(rhombus_program, "u_light_dir"),
+            clip_z:      gl.get_uniform_location(rhombus_program, "u_clip_z"),
+            half_height: gl.get_uniform_location(rhombus_program, "u_half_height"),
+        }};
+
         // Create FBO with depth buffer (start at 1x1, resized on first draw)
         let (fbo, fbo_color, fbo_depth) = unsafe { create_fbo(&gl, 1, 1) };
 
@@ -262,6 +297,9 @@ impl Renderer {
             gl,
             line_program,
             mesh_program,
+            line_uniforms,
+            mesh_uniforms,
+            rhombus_uniforms,
             mesh: None,
             slices: None,
             current_slice: None,
@@ -275,7 +313,7 @@ impl Renderer {
             fbo_depth,
             fbo_w: 1,
             fbo_h: 1,
-            clip_z: -1e30,
+            clip_z: 1e30,
             draw_contours: false,
             draw_toolpaths: true,
             show_travel_moves: true,
@@ -500,29 +538,24 @@ impl Renderer {
             gl.enable(glow::BLEND);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
 
-            let no_clip: f32 = -1e30;
+            let no_clip: f32 = 1e30;
 
             // Draw background (no z-clipping)
             match bg_mode {
                 super::BgMode::Mesh => {
                     if let Some(m) = &self.mesh {
                         gl.use_program(Some(self.mesh_program));
-                        let loc = gl.get_uniform_location(self.mesh_program, "u_mvp");
-                        gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
-                        let loc = gl.get_uniform_location(self.mesh_program, "u_light_dir");
-                        gl.uniform_3_f32_slice(loc.as_ref(), light_dir);
-                        let loc = gl.get_uniform_location(self.mesh_program, "u_clip_z");
-                        gl.uniform_1_f32(loc.as_ref(), no_clip);
+                        gl.uniform_matrix_4_f32_slice(self.mesh_uniforms.mvp.as_ref(), false, mvp);
+                        gl.uniform_3_f32_slice(self.mesh_uniforms.light_dir.as_ref(), light_dir);
+                        gl.uniform_1_f32(self.mesh_uniforms.clip_z.as_ref(), no_clip);
                         draw_buffer(gl, m, glow::TRIANGLES);
                     }
                 }
                 super::BgMode::Layers => {
                     if let Some(s) = &self.slices {
                         gl.use_program(Some(self.line_program));
-                        let loc = gl.get_uniform_location(self.line_program, "u_mvp");
-                        gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
-                        let loc = gl.get_uniform_location(self.line_program, "u_clip_z");
-                        gl.uniform_1_f32(loc.as_ref(), no_clip);
+                        gl.uniform_matrix_4_f32_slice(self.line_uniforms.mvp.as_ref(), false, mvp);
+                        gl.uniform_1_f32(self.line_uniforms.clip_z.as_ref(), no_clip);
                         draw_buffer(gl, s, glow::LINES);
                     }
                 }
@@ -539,10 +572,8 @@ impl Renderer {
             if self.draw_contours {
                 if let Some(cs) = &self.current_slice {
                     gl.use_program(Some(self.line_program));
-                    let loc = gl.get_uniform_location(self.line_program, "u_mvp");
-                    gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
-                    let loc = gl.get_uniform_location(self.line_program, "u_clip_z");
-                    gl.uniform_1_f32(loc.as_ref(), clip);
+                    gl.uniform_matrix_4_f32_slice(self.line_uniforms.mvp.as_ref(), false, mvp);
+                    gl.uniform_1_f32(self.line_uniforms.clip_z.as_ref(), clip);
                     draw_buffer(gl, cs, glow::LINES);
                 }
             }
@@ -556,15 +587,11 @@ impl Renderer {
                     // Extruded rhombus filament rendering
                     if let Some(rhombuses) = &self.toolpath_rhombuses {
                         gl.use_program(Some(self.rhombus_program));
-                        let loc = gl.get_uniform_location(self.rhombus_program, "u_mvp");
-                        gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
-                        let loc = gl.get_uniform_location(self.rhombus_program, "u_light_dir");
-                        gl.uniform_3_f32_slice(loc.as_ref(), light_dir);
-                        let loc = gl.get_uniform_location(self.rhombus_program, "u_clip_z");
-                        gl.uniform_1_f32(loc.as_ref(), clip);
-                        let loc = gl.get_uniform_location(self.rhombus_program, "u_half_height");
-                        gl.uniform_1_f32(loc.as_ref(), self.half_height);
-                        draw_rhombus_batch(gl, rhombuses);
+                        gl.uniform_matrix_4_f32_slice(self.rhombus_uniforms.mvp.as_ref(), false, mvp);
+                        gl.uniform_3_f32_slice(self.rhombus_uniforms.light_dir.as_ref(), light_dir);
+                        gl.uniform_1_f32(self.rhombus_uniforms.clip_z.as_ref(), clip);
+                        gl.uniform_1_f32(self.rhombus_uniforms.half_height.as_ref(), self.half_height);
+                        draw_rhombus_batch(gl, rhombuses, clip);
                     }
 
                     gl.disable(glow::CLIP_DISTANCE0);
@@ -572,10 +599,8 @@ impl Renderer {
                     // Toolpath lines (flat lines for extrusion paths)
                     if let Some(pl) = &self.toolpath_path_lines {
                         gl.use_program(Some(self.line_program));
-                        let loc = gl.get_uniform_location(self.line_program, "u_mvp");
-                        gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
-                        let loc = gl.get_uniform_location(self.line_program, "u_clip_z");
-                        gl.uniform_1_f32(loc.as_ref(), clip);
+                        gl.uniform_matrix_4_f32_slice(self.line_uniforms.mvp.as_ref(), false, mvp);
+                        gl.uniform_1_f32(self.line_uniforms.clip_z.as_ref(), clip);
                         draw_buffer(gl, pl, glow::LINES);
                     }
                 }
@@ -584,10 +609,8 @@ impl Renderer {
                 if self.show_travel_moves {
                     if let Some(tl) = &self.toolpath_lines {
                         gl.use_program(Some(self.line_program));
-                        let loc = gl.get_uniform_location(self.line_program, "u_mvp");
-                        gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, mvp);
-                        let loc = gl.get_uniform_location(self.line_program, "u_clip_z");
-                        gl.uniform_1_f32(loc.as_ref(), clip);
+                        gl.uniform_matrix_4_f32_slice(self.line_uniforms.mvp.as_ref(), false, mvp);
+                        gl.uniform_1_f32(self.line_uniforms.clip_z.as_ref(), clip);
                         draw_buffer(gl, tl, glow::LINES);
                     }
                 }
@@ -824,15 +847,16 @@ unsafe fn upload_impostor_batch(
     }
 }
 
-/// Draw a rhombus batch. Uses TRIANGLES with 36 vertices per instance (12 triangles).
-unsafe fn draw_rhombus_batch(gl: &glow::Context, batch: &InstancedBatch) {
+/// Draw a rhombus batch, skipping layers whose layer_z > clip_z on the CPU side.
+/// layer_starts is sorted ascending; visible instances are the prefix where layer_z <= clip_z.
+unsafe fn draw_rhombus_batch(gl: &glow::Context, batch: &InstancedBatch, clip_z: f32) {
+    let visible_count = match batch.layer_starts.partition_point(|&(z, _)| z <= clip_z) {
+        0 => return,
+        n if n >= batch.layer_starts.len() => batch.instance_count,
+        n => batch.layer_starts[n].1,
+    };
     gl.bind_vertex_array(Some(batch.vao));
-    gl.draw_arrays_instanced(
-        glow::TRIANGLES,
-        0,
-        batch.prototype_vertex_count, // 36
-        batch.instance_count,
-    );
+    gl.draw_arrays_instanced(glow::TRIANGLES, 0, batch.prototype_vertex_count, visible_count);
     gl.bind_vertex_array(None);
 }
 
