@@ -208,6 +208,16 @@ pub struct GpuBuffer {
 #[allow(dead_code)]
 enum BatchKind { Rhombus }
 
+/// Per-layer index entry: Z position, instance count, and XY AABB for frustum culling.
+struct LayerEntry {
+    layer_z: f32,
+    instance_count: i32,
+    aabb_min_x: f32,
+    aabb_min_y: f32,
+    aabb_max_x: f32,
+    aabb_max_y: f32,
+}
+
 struct LineUniforms {
     mvp:    Option<glow::UniformLocation>,
     clip_z: Option<glow::UniformLocation>,
@@ -226,15 +236,16 @@ struct RhombusUniforms {
     half_height: Option<glow::UniformLocation>,
 }
 
-#[allow(dead_code)]
-
 struct InstancedBatch {
-    vao: glow::VertexArray,
+    /// One VAO per layer; attrib pointers pre-offset to that layer's region of the shared VBO.
+    /// Emulates glDrawArraysInstancedBaseInstance (GL 4.2) on GL 3.3 / macOS GL 4.1.
+    layer_vaos: Vec<glow::VertexArray>,
     instance_vbo: glow::Buffer,
+    #[allow(dead_code)]
     instance_count: i32,
     prototype_vertex_count: i32,
-    // Layer index: sorted list of (layer_z, first_instance_index) for skipping invisible layers
-    layer_starts: Vec<(f32, i32)>,  // (layer_z, first_instance_index)
+    /// Sorted by layer_z; used for both clip_z culling and frustum culling.
+    layer_entries: Vec<LayerEntry>,
 }
 
 
@@ -591,7 +602,7 @@ impl Renderer {
                         gl.uniform_3_f32_slice(self.rhombus_uniforms.light_dir.as_ref(), light_dir);
                         gl.uniform_1_f32(self.rhombus_uniforms.clip_z.as_ref(), clip);
                         gl.uniform_1_f32(self.rhombus_uniforms.half_height.as_ref(), self.half_height);
-                        draw_rhombus_batch(gl, rhombuses, clip);
+                        draw_rhombus_batch(gl, rhombuses, clip, mvp, self.half_height);
                     }
 
                     gl.disable(glow::CLIP_DISTANCE0);
@@ -693,7 +704,9 @@ impl Renderer {
 
             // Delete instanced batches
             if let Some(batch) = &self.toolpath_rhombuses {
-                gl.delete_vertex_array(batch.vao);
+                for &vao in &batch.layer_vaos {
+                    gl.delete_vertex_array(vao);
+                }
                 gl.delete_buffer(batch.instance_vbo);
             }
         }
@@ -785,6 +798,30 @@ fn push_rhombus_instance(
     buf.extend_from_slice(&[ax, ay, z, dir_x, dir_y, length, half_width, r, g, b, a, layer_z]);
 }
 
+/// Compute a conservative XY AABB for `count` rhombus instances starting at `first`.
+/// Each segment's footprint is its endpoint pair expanded by nozzle half-width.
+/// Returns (min_x, min_y, max_x, max_y).
+fn layer_aabb_xy(instance_data: &[f32], first: usize, count: usize) -> (f32, f32, f32, f32) {
+    let (mut mn_x, mut mn_y) = (f32::MAX, f32::MAX);
+    let (mut mx_x, mut mx_y) = (f32::MIN, f32::MIN);
+    for i in first..first + count {
+        let idx = i * RHOMBUS_INSTANCE_STRIDE;
+        let ax = instance_data[idx];
+        let ay = instance_data[idx + 1];
+        let dir_x  = instance_data[idx + 3];
+        let dir_y  = instance_data[idx + 4];
+        let len    = instance_data[idx + 5];
+        let half_w = instance_data[idx + 6];
+        let bx = ax + dir_x * len;
+        let by = ay + dir_y * len;
+        mn_x = mn_x.min(ax.min(bx) - half_w);
+        mn_y = mn_y.min(ay.min(by) - half_w);
+        mx_x = mx_x.max(ax.max(bx) + half_w);
+        mx_y = mx_y.max(ay.max(by) + half_w);
+    }
+    (mn_x, mn_y, mx_x, mx_y)
+}
+
 /// Upload an instanced batch: instance data only, no prototype mesh.
 /// Rhombus geometry is generated from gl_VertexID in the vertex shader.
 unsafe fn upload_impostor_batch(
@@ -793,70 +830,172 @@ unsafe fn upload_impostor_batch(
     instance_count: i32,
     _kind: BatchKind,
 ) -> InstancedBatch {
-    let vao = gl.create_vertex_array().unwrap();
-    gl.bind_vertex_array(Some(vao));
+    let stride = (RHOMBUS_INSTANCE_STRIDE * 4) as i32; // 48 bytes
 
-    // Create and bind instance VBO (attributes start at location 0)
+    // Upload all instance data into a single VBO (no VAO yet)
     let inst_vbo = gl.create_buffer().unwrap();
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(inst_vbo));
     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, cast_f32_u8(instance_data), glow::STATIC_DRAW);
 
-    let stride = (RHOMBUS_INSTANCE_STRIDE * 4) as i32; // 48 bytes
-    // slot 0: vec3 start (offset 0)
-    gl.enable_vertex_attrib_array(0);
-    gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
-    gl.vertex_attrib_divisor(0, 1);
-    // slot 1: vec2 dir (offset 12)
-    gl.enable_vertex_attrib_array(1);
-    gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 3 * 4);
-    gl.vertex_attrib_divisor(1, 1);
-    // slot 2: vec2 scale (length, half_width) (offset 20)
-    gl.enable_vertex_attrib_array(2);
-    gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 5 * 4);
-    gl.vertex_attrib_divisor(2, 1);
-    // slot 3: vec4 color (offset 28)
-    gl.enable_vertex_attrib_array(3);
-    gl.vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, stride, 7 * 4);
-    gl.vertex_attrib_divisor(3, 1);
-    // slot 4: float layer_z (offset 44)
-    gl.enable_vertex_attrib_array(4);
-    gl.vertex_attrib_pointer_f32(4, 1, glow::FLOAT, false, stride, 11 * 4);
-    gl.vertex_attrib_divisor(4, 1);
-
-    gl.bind_vertex_array(None);
-
-    // Build layer index: for each unique layer_z, record (layer_z, first_instance_index)
-    let mut layer_starts: Vec<(f32, i32)> = Vec::new();
+    // Pass 1: find layer boundaries
+    let mut layer_starts: Vec<(f32, usize)> = Vec::new();
     let mut last_layer_z: Option<f32> = None;
-
-    for i in 0..instance_count as isize {
-        let idx = i as usize * RHOMBUS_INSTANCE_STRIDE;
-        let layer_z = instance_data[idx + 11]; // layer_z is at index 11
+    for i in 0..instance_count as usize {
+        let layer_z = instance_data[i * RHOMBUS_INSTANCE_STRIDE + 11];
         if last_layer_z != Some(layer_z) {
-            layer_starts.push((layer_z, i as i32));
+            layer_starts.push((layer_z, i));
             last_layer_z = Some(layer_z);
         }
     }
 
+    // Pass 2: compute AABB per layer and build per-layer VAOs.
+    // Each VAO has its attrib pointers pre-offset to that layer's byte range in inst_vbo,
+    // emulating glDrawArraysInstancedBaseInstance without requiring GL 4.2.
+    let n = layer_starts.len();
+    let mut layer_entries: Vec<LayerEntry> = Vec::with_capacity(n);
+    let mut layer_vaos: Vec<glow::VertexArray> = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let (layer_z, first) = layer_starts[i];
+        let count = if i + 1 < n { layer_starts[i + 1].1 - first } else { instance_count as usize - first };
+        let base = (first as i32) * stride;  // byte offset into inst_vbo for this layer
+
+        // Create a VAO whose attrib pointers start at this layer's byte offset
+        let vao = gl.create_vertex_array().unwrap();
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(inst_vbo));
+        gl.enable_vertex_attrib_array(0);
+        gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, base + 0);
+        gl.vertex_attrib_divisor(0, 1);
+        gl.enable_vertex_attrib_array(1);
+        gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, base + 3 * 4);
+        gl.vertex_attrib_divisor(1, 1);
+        gl.enable_vertex_attrib_array(2);
+        gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, base + 5 * 4);
+        gl.vertex_attrib_divisor(2, 1);
+        gl.enable_vertex_attrib_array(3);
+        gl.vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, stride, base + 7 * 4);
+        gl.vertex_attrib_divisor(3, 1);
+        gl.enable_vertex_attrib_array(4);
+        gl.vertex_attrib_pointer_f32(4, 1, glow::FLOAT, false, stride, base + 11 * 4);
+        gl.vertex_attrib_divisor(4, 1);
+        gl.bind_vertex_array(None);
+        layer_vaos.push(vao);
+
+        let (mn_x, mn_y, mx_x, mx_y) = layer_aabb_xy(instance_data, first, count);
+        layer_entries.push(LayerEntry {
+            layer_z,
+            instance_count: count as i32,
+            aabb_min_x: mn_x, aabb_min_y: mn_y,
+            aabb_max_x: mx_x, aabb_max_y: mx_y,
+        });
+    }
+
+    gl.bind_buffer(glow::ARRAY_BUFFER, None);
+
     InstancedBatch {
-        vao,
+        layer_vaos,
         instance_vbo: inst_vbo,
         instance_count,
-        prototype_vertex_count: 36, // 12 triangles for extruded rhombus
-        layer_starts,
+        prototype_vertex_count: 36,
+        layer_entries,
     }
 }
 
-/// Draw a rhombus batch, skipping layers whose layer_z > clip_z on the CPU side.
-/// layer_starts is sorted ascending; visible instances are the prefix where layer_z <= clip_z.
-unsafe fn draw_rhombus_batch(gl: &glow::Context, batch: &InstancedBatch, clip_z: f32) {
-    let visible_count = match batch.layer_starts.partition_point(|&(z, _)| z <= clip_z) {
-        0 => return,
-        n if n >= batch.layer_starts.len() => batch.instance_count,
-        n => batch.layer_starts[n].1,
+/// Extract 6 frustum planes from MVP matrix using Gribb-Hartmann derivation
+fn extract_frustum_planes(m: &[f32; 16]) -> [[f32; 4]; 6] {
+    // m is column-major
+    let get_row = |i: usize| -> [f32; 4] {
+        [m[i], m[4 + i], m[8 + i], m[12 + i]]
     };
-    gl.bind_vertex_array(Some(batch.vao));
-    gl.draw_arrays_instanced(glow::TRIANGLES, 0, batch.prototype_vertex_count, visible_count);
+    let rows = [
+        get_row(0),
+        get_row(1),
+        get_row(2),
+        get_row(3),
+    ];
+
+    let add = |a: [f32; 4], b: [f32; 4]| -> [f32; 4] {
+        [a[0]+b[0], a[1]+b[1], a[2]+b[2], a[3]+b[3]]
+    };
+    let sub = |a: [f32; 4], b: [f32; 4]| -> [f32; 4] {
+        [a[0]-b[0], a[1]-b[1], a[2]-b[2], a[3]-b[3]]
+    };
+    
+    [
+        add(rows[3], rows[0]), // left
+        sub(rows[3], rows[0]), // right
+        add(rows[3], rows[1]), // bottom
+        sub(rows[3], rows[1]), // top
+        add(rows[3], rows[2]), // near
+        sub(rows[3], rows[2]), // far
+    ]
+
+}
+
+/// Returns true if the AABB is entirely outside at least one frustum plane (safe to cull).
+fn aabb_outside_frustum(
+    planes: &[[f32; 4]; 6],
+    min_x: f32, min_y: f32, min_z: f32,
+    max_x: f32, max_y: f32, max_z: f32,
+) -> bool {
+    for p in planes {
+        // P-vertex: AABB corner most aligned with the plane normal
+        let px = if p[0] >= 0.0 { max_x } else { min_x };
+        let py = if p[1] >= 0.0 { max_y } else { min_y };
+        let pz = if p[2] >= 0.0 { max_z } else { min_z };
+        if p[0] * px + p[1] * py + p[2] * pz + p[3] < 0.0 {
+            return true; // most positive corner is behind this plane → fully outside
+        }
+    }
+    false
+}
+
+/// Draw a rhombus batch with CPU-side frustum culling per layer.
+/// Layers are skipped if layer_z > clip_z or their AABB is outside the view frustum.
+/// Adjacent visible layers are merged into contiguous BaseInstance draw calls to minimise draw-call count.
+unsafe fn draw_rhombus_batch(
+    gl: &glow::Context,
+    batch: &InstancedBatch,
+    clip_z: f32,
+    mvp: &[f32; 16],
+    half_height: f32,
+) {
+    let visible = batch.layer_entries.partition_point(|e| e.layer_z <= clip_z);
+    if visible == 0 { return; }
+
+    let planes = extract_frustum_planes(mvp);
+
+    // Walk visible layers and merge contiguous non-culled ranges into single draw calls.
+    // Each layer has its own VAO whose attrib pointers start at that layer's VBO offset,
+    // so drawing `run_total` instances from layer_vaos[run_first_idx] reads layers
+    // run_first_idx, run_first_idx+1, ... contiguously from the shared VBO.
+    let mut run_vao_idx: Option<usize> = None;
+    let mut run_total: i32 = 0;
+
+    for (i, entry) in batch.layer_entries[..visible].iter().enumerate() {
+        let outside = aabb_outside_frustum(
+            &planes,
+            entry.aabb_min_x, entry.aabb_min_y, entry.layer_z - half_height,
+            entry.aabb_max_x, entry.aabb_max_y, entry.layer_z + half_height,
+        );
+        if outside {
+            if let Some(vao_idx) = run_vao_idx.take() {
+                gl.bind_vertex_array(Some(batch.layer_vaos[vao_idx]));
+                gl.draw_arrays_instanced(glow::TRIANGLES, 0, batch.prototype_vertex_count, run_total);
+                run_total = 0;
+            }
+        } else {
+            if run_vao_idx.is_none() { run_vao_idx = Some(i); }
+            run_total += entry.instance_count;
+        }
+    }
+    // Flush any remaining run
+    if let Some(vao_idx) = run_vao_idx {
+        gl.bind_vertex_array(Some(batch.layer_vaos[vao_idx]));
+        gl.draw_arrays_instanced(glow::TRIANGLES, 0, batch.prototype_vertex_count, run_total);
+    }
+
     gl.bind_vertex_array(None);
 }
 
