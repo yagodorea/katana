@@ -122,7 +122,8 @@ fn main() -> eframe::Result {
             // Start showing all layers
             let last_layer = num_layers.saturating_sub(1);
             if !layers.is_empty() {
-                gpu.clip_z = layers[last_layer].z + 0.001;
+                gpu.clip_z_max = layers[last_layer].z + 0.001;
+                gpu.clip_z_min = layers[0].z - 0.001;
             }
 
             let renderer = Arc::new(Mutex::new(gpu));
@@ -131,7 +132,8 @@ fn main() -> eframe::Result {
                 renderer,
                 layers,
                 num_layers,
-                current_layer: last_layer,
+                max_layer: last_layer,
+                min_layer: 0,
                 slice_view: SliceView::Toolpaths,
                 center: [center_x, center_y, center_z],
                 extent,
@@ -183,7 +185,8 @@ struct ViewerApp {
     renderer: Arc<Mutex<renderer::Renderer>>,
     layers: Vec<slicer::Layer>,
     num_layers: usize,
-    current_layer: usize,
+    max_layer: usize,
+    min_layer: usize,
     slice_view: SliceView,
     center: [f32; 3],
     extent: f32,
@@ -221,18 +224,29 @@ impl eframe::App for ViewerApp {
                     ui.label("No layers");
                     return;
                 }
-                let layer = &self.layers[self.current_layer];
+                let height = self.layers[self.num_layers.saturating_sub(1)].z;
                 ui.label(format!(
-                    "Layer {}/{} | z = {:.3} mm",
-                    self.current_layer + 1,
+                    "{} layers. Height {:.3} mm",
                     self.num_layers,
-                    layer.z,
+                    height,
                 ));
-                if ui.button("◀ Prev").clicked() && self.current_layer > 0 {
-                    self.current_layer -= 1;
+                let top_z = &self.layers[self.max_layer].z;
+                ui.label(format!(
+                    "Top layer {} | z = {:.3} mm",
+                    self.max_layer,
+                    top_z,
+                ));
+                let bottom_z = &self.layers[self.min_layer].z;
+                ui.label(format!(
+                    "Bottom layer {} | z = {:.3} mm",
+                    self.min_layer,
+                    bottom_z,
+                ));
+                if ui.button("◀ Prev").clicked() && self.max_layer > 0 {
+                    self.max_layer -= 1;
                 }
-                if ui.button("Next ▶").clicked() && self.current_layer < self.num_layers.saturating_sub(1) {
-                    self.current_layer += 1;
+                if ui.button("Next ▶").clicked() && self.max_layer < self.num_layers.saturating_sub(1) {
+                    self.max_layer += 1;
                 }
                 ui.separator();
                 ui.label("BG:");
@@ -259,8 +273,9 @@ impl eframe::App for ViewerApp {
             });
         });
 
-        // Left panel: vertical layer slider
-        egui::SidePanel::left("slider")
+        // Left panel: top layer slider (TODO: merge into a single slider with two knobs)
+        // Top layer
+        egui::SidePanel::left("slider_top")
             .resizable(false)
             .exact_width(32.0)
             .show(ctx, |ui| {
@@ -268,15 +283,28 @@ impl eframe::App for ViewerApp {
                     return;
                 }
                 let max = self.num_layers.saturating_sub(1);
-                // Invert: slider top = layer 0 (start of print), bottom = all layers visible
-                let mut inverted = max - self.current_layer;
                 ui.spacing_mut().slider_width = ui.available_height() - 16.0;
                 ui.add(
-                    egui::Slider::new(&mut inverted, 0..=max)
+                    egui::Slider::new(&mut self.max_layer, 0..=max)
                         .vertical()
                         .show_value(false),
                 );
-                self.current_layer = max - inverted;
+            });
+        // Bottom layer
+        egui::SidePanel::left("slider_bottom")
+            .resizable(false)
+            .exact_width(32.0)
+            .show(ctx, |ui| {
+                if self.num_layers == 0 {
+                    return;
+                }
+                let max = self.num_layers.saturating_sub(1);
+                ui.spacing_mut().slider_width = ui.available_height() - 16.0;
+                ui.add(
+                    egui::Slider::new(&mut self.min_layer, 0..=max)
+                        .vertical()
+                        .show_value(false),
+                );
             });
 
         // Central panel
@@ -349,27 +377,28 @@ impl eframe::App for ViewerApp {
 
                 ui.input(|i| {
                     if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowRight) {
-                        if self.current_layer < self.num_layers.saturating_sub(1) {
-                            self.current_layer += 1;
+                        if self.max_layer < self.num_layers.saturating_sub(1) {
+                            self.max_layer += 1;
                         }
                     }
                     if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowLeft) {
-                        if self.current_layer > 0 {
-                            self.current_layer -= 1;
+                        if self.max_layer > 0 {
+                            self.max_layer -= 1;
                         }
                     }
                     if i.key_pressed(egui::Key::Home) {
-                        self.current_layer = 0;
+                        self.max_layer = 0;
                     }
                     if i.key_pressed(egui::Key::End) {
-                        self.current_layer = self.num_layers.saturating_sub(1);
+                        self.max_layer = self.num_layers.saturating_sub(1);
                     }
                 });
 
                 // Update renderer state (clip_z, draw mode) — no re-upload needed
                 if !self.layers.is_empty() {
                     let mut r = self.renderer.lock().unwrap();
-                    r.clip_z = self.layers[self.current_layer].z + 0.001;
+                    r.clip_z_max = self.layers[self.max_layer].z + 0.001;
+                    r.clip_z_min = self.layers[self.min_layer].z - 0.001;
                     r.draw_contours = self.slice_view == SliceView::Contours;
                     r.draw_toolpaths = self.slice_view == SliceView::Toolpaths;
                     r.show_travel_moves = self.show_travel_moves;
