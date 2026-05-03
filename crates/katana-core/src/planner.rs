@@ -1,5 +1,5 @@
 use nalgebra::Point2;
-use crate::offset::{ToolpathLayer, ToolpathResult, Perimeter, InfillLine};
+use crate::offset::{ ToolpathLayer, ToolpathResult, Perimeter, InfillLine };
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -28,6 +28,8 @@ pub struct Move {
     /// - Infill: [start, end] (2 points)
     pub points: Vec<Point2<f32>>,
 }
+
+pub type PointXY<T> = Point2<T>;
 
 /// A layer with a fully ordered sequence of moves.
 #[derive(Debug, Clone)]
@@ -284,7 +286,7 @@ struct OrderedPerimeterSet {
 /// Order perimeter sets by nearest-neighbor from current position.
 fn order_perimeter_sets_nearest(
     perimeter_sets: &[crate::offset::PerimeterSet],
-    from: &Point2<f32>,
+    from: &Point2<f32>
 ) -> Vec<OrderedPerimeterSet> {
     let sets: Vec<OrderedPerimeterSet> = perimeter_sets
         .iter()
@@ -303,7 +305,10 @@ fn order_perimeter_sets_nearest(
             // Innermost is the last level
             let innermost = pset.perimeters.last()?;
             // Get the first perimeter loop at this level, and its first point
-            innermost.first()?.points.first().map(|pt| (s.pset_idx, *pt))
+            innermost
+                .first()?
+                .points.first()
+                .map(|pt| (s.pset_idx, *pt))
         })
         .collect();
 
@@ -317,8 +322,8 @@ fn order_perimeter_sets_nearest(
             .iter()
             .enumerate()
             .min_by(|a, b| {
-                let dist_a = distance_squared(&current, &a.1 .1);
-                let dist_b = distance_squared(&current, &b.1 .1);
+                let dist_a = distance_squared(&current, &a.1.1);
+                let dist_b = distance_squared(&current, &b.1.1);
                 dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(i, _)| i)
@@ -327,7 +332,11 @@ fn order_perimeter_sets_nearest(
         let (pset_idx, start_pt) = set_starts.remove(nearest_idx);
 
         // Find the corresponding OrderedPerimeterSet
-        let set_info = sets.iter().find(|s| s.pset_idx == pset_idx).cloned().unwrap();
+        let set_info = sets
+            .iter()
+            .find(|s| s.pset_idx == pset_idx)
+            .cloned()
+            .unwrap();
         ordered.push(set_info);
 
         current = start_pt;
@@ -340,7 +349,7 @@ fn order_perimeter_sets_nearest(
 fn order_perimeter_loops_nearest(
     loop_indices: &mut Vec<usize>,
     perimeters: &[Perimeter],
-    from: &Point2<f32>,
+    from: &Point2<f32>
 ) {
     if loop_indices.len() <= 1 {
         return;
@@ -360,8 +369,8 @@ fn order_perimeter_loops_nearest(
             .iter()
             .enumerate()
             .min_by(|a, b| {
-                let dist_a = distance_squared(&current, &a.1 .1);
-                let dist_b = distance_squared(&current, &b.1 .1);
+                let dist_a = distance_squared(&current, &a.1.1);
+                let dist_b = distance_squared(&current, &b.1.1);
                 dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(i, _)| i)
@@ -377,10 +386,7 @@ fn order_perimeter_loops_nearest(
 
 /// Order infill lines by nearest-neighbor, also considering direction.
 /// Returns Vec of (line_index, flipped) tuples.
-fn order_infill_nearest(
-    infill_lines: &[InfillLine],
-    from: &Point2<f32>,
-) -> Vec<(usize, bool)> {
+fn order_infill_nearest(infill_lines: &[InfillLine], from: &Point2<f32>) -> Vec<(usize, bool)> {
     if infill_lines.is_empty() {
         return Vec::new();
     }
@@ -437,7 +443,7 @@ mod tests {
             Point2::new(0.0, 0.0),
             Point2::new(10.0, 0.0),
             Point2::new(10.0, 10.0),
-            Point2::new(0.0, 10.0),
+            Point2::new(0.0, 10.0)
         ];
 
         rotate_to_nearest(&mut points, &from);
@@ -461,7 +467,7 @@ mod tests {
         let from = Point2::new(5.0, 0.0);
         let lines = vec![
             InfillLine { start: Point2::new(0.0, 0.0), end: Point2::new(10.0, 0.0) },
-            InfillLine { start: Point2::new(0.0, 10.0), end: Point2::new(10.0, 10.0) },
+            InfillLine { start: Point2::new(0.0, 10.0), end: Point2::new(10.0, 10.0) }
         ];
 
         let ordered = order_infill_nearest(&lines, &from);

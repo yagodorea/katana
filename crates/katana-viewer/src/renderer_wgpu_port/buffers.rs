@@ -49,22 +49,22 @@ pub struct RhombusInstance {
 const _: () = assert!(std::mem::size_of::<RhombusInstance>() == 48);
 
 pub struct GpuBuffer {
-    buffer: wgpu::Buffer,
-    vertex_count: u32,
+    pub buffer: wgpu::Buffer,
+    pub vertex_count: u32,
 }
 
 pub struct LayerEntry {
-    layer_z: f32,
-    instance_count: i32,
-    aabb_min_x: f32,
-    aabb_min_y: f32,
-    aabb_max_x: f32,
-    aabb_max_y: f32,
+    pub layer_z: f32,
+    pub instance_count: i32,
+    pub aabb_min_x: f32,
+    pub aabb_min_y: f32,
+    pub aabb_max_x: f32,
+    pub aabb_max_y: f32,
 }
 
 pub struct InstancedBatch {
-    buffer: wgpu::Buffer,
-    layer_entries: Vec<LayerEntry>,
+    pub buffer: wgpu::Buffer,
+    pub layer_entries: Vec<LayerEntry>,
 }
 
 pub fn upload_lines(device: &Device, verts: &[LineVertex]) -> GpuBuffer {
