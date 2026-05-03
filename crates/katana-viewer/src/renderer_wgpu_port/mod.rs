@@ -103,18 +103,20 @@ fn create_depth_texture(device: &Device, w: u32, h: u32) -> Texture {
 // ---------------------------------------------------------------------------
 
 use std::mem::size_of;
-use std::sync::Arc;
 
 use buffers::{ FrameUniforms, GpuBuffer, InstancedBatch };
 
 use crate::renderer_wgpu_port::buffers::{ LineVertex, MeshVertex, RhombusInstance };
 
+// Re-export camera math from the legacy renderer module so main.rs can drop
+// `mod renderer;` once the port is stable. Source of truth lives there for now.
+pub use crate::renderer::{build_mvp, headlight_dir};
+
 pub struct Renderer {
-    // GPU handles. We hold Arcs because the egui_wgpu integration owns the
-    // canonical Device/Queue and we need to call .create_buffer / .write_buffer
-    // from upload methods that run outside the prepare/paint callbacks.
-    device: Arc<Device>,
-    queue: Arc<Queue>,
+    // GPU handles. wgpu's `Device` and `Queue` are cheap to clone — they
+    // wrap an internal Arc — so we don't need an explicit Arc wrapper.
+    device: Device,
+    queue: Queue,
 
     // We need two uniform buffers and bind groups: one with no z-clipping (for BG),
     // and one with the user's clip range (for FG). That's because queue.write_buffer
@@ -129,6 +131,13 @@ pub struct Renderer {
     line_pipeline: RenderPipeline,
     mesh_pipeline: RenderPipeline,
     rhombus_pipeline: RenderPipeline,
+
+    // 4th pipeline + its bind group layout + sampler: copies the offscreen
+    // color texture onto egui's pass in `paint`. Sampler is static; bind
+    // group must be rebuilt when the offscreen texture is recreated (resize).
+    blit_pipeline: RenderPipeline,
+    blit_bgl: BindGroupLayout,
+    blit_sampler: Sampler,
 
     // Offscreen color+depth that 3D content renders into.
     offscreen: OffscreenTargets,
@@ -155,8 +164,8 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(
-        device: Arc<Device>,
-        queue: Arc<Queue>,
+        device: Device,
+        queue: Queue,
         color_format: TextureFormat,
         width: u32,
         height: u32
@@ -192,6 +201,18 @@ impl Renderer {
         let mesh_pipeline = pipelines::build_mesh_pipeline(&device, &frame_bgl, color_format);
         let rhombus_pipeline = pipelines::build_rhombus_pipeline(&device, &frame_bgl, color_format);
 
+        let blit_bgl = pipelines::build_blit_bgl(&device);
+        let blit_pipeline = pipelines::build_blit_pipeline(&device, &blit_bgl, color_format);
+        let blit_sampler = device.create_sampler(
+            &(SamplerDescriptor {
+                label: Some("blit_sampler"),
+                mag_filter: FilterMode::Nearest,
+                min_filter: FilterMode::Nearest,
+                mipmap_filter: FilterMode::Nearest,
+                ..Default::default()
+            })
+        );
+
         let offscreen = OffscreenTargets::new(&device, color_format, width, height);
 
         Self {
@@ -204,6 +225,9 @@ impl Renderer {
             line_pipeline,
             mesh_pipeline,
             rhombus_pipeline,
+            blit_pipeline,
+            blit_bgl,
+            blit_sampler,
             offscreen,
             mesh_buffer: None,
             slices_buffer: None,
@@ -570,6 +594,33 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    /// Per-frame: blit the offscreen color texture onto egui's render pass.
+    /// Called from inside the `egui_wgpu::CallbackFn::paint` closure.
+    ///
+    /// `render_pass` is egui's existing pass, color attachment is already set,
+    /// no depth attachment. We add one fullscreen-triangle draw to it.
+    pub fn paint(&self, render_pass: &mut RenderPass<'_>) {
+        let bind_group = self.device.create_bind_group(
+            &(BindGroupDescriptor {
+                label: Some("blit_bind_group"),
+                layout: &self.blit_bgl,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::TextureView(&self.offscreen.color_view),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::Sampler(&self.blit_sampler),
+                    },
+                ],
+            })
+        );
+        render_pass.set_pipeline(&self.blit_pipeline);
+        render_pass.set_bind_group(0, &bind_group, &[]);
+        render_pass.draw(0..3, 0..1); // 3 verts, 1 instance
     }
 
     fn push_segment(

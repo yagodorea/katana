@@ -248,3 +248,90 @@ pub fn build_rhombus_pipeline(
         })
     )
 }
+
+// ---------------------------------------------------------------------------
+// Blit pipeline (offscreen color → egui's pass)
+// ---------------------------------------------------------------------------
+//
+// Different from the three above: takes a sampled texture + sampler instead
+// of a uniform buffer, has no vertex buffer (geometry generated from
+// vertex_index), no depth test (egui's pass has no depth attachment), and
+// targets the egui surface format (we set it equal to the offscreen format
+// at startup, so a straight copy works).
+
+/// Bind group layout for the blit: texture at binding 0, sampler at binding 1.
+pub fn build_blit_bgl(device: &Device) -> BindGroupLayout {
+    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("blit_bgl"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+pub fn build_blit_pipeline(
+    device: &Device,
+    blit_bgl: &BindGroupLayout,
+    color_format: TextureFormat,
+) -> RenderPipeline {
+    let shader = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("blit_shader"),
+        source: ShaderSource::Wgsl(include_str!("shaders/blit.wgsl").into()),
+    });
+
+    let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("blit_pipeline_layout"),
+        bind_group_layouts: &[blit_bgl],
+        push_constant_ranges: &[],
+    });
+
+    device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("blit_pipeline"),
+        layout: Some(&layout),
+        vertex: VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: PipelineCompilationOptions::default(),
+            buffers: &[],   // no vertex buffer; geometry from vertex_index
+        },
+        fragment: Some(FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: PipelineCompilationOptions::default(),
+            // No alpha blend — we own every pixel of the central panel rect.
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            })],
+        }),
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: None,   // egui's pass has no depth attachment
+        multisample: MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
