@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 katana-core = { path = "../katana-core" }
-eframe = { version = "0.31", features = ["glow"] }
+eframe = { version = "0.31", features = ["glow", "wgpu"] }
+bytemuck = { version = "1", features = ["derive"] }
 glow = "0.16"
+wgpu = "24"
 clap = { version = "4", features = ["derive"] }

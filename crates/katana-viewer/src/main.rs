@@ -7,6 +7,7 @@ use eframe::glow;
 use katana_core::{offset, planner, slicer, stl};
 
 mod renderer;
+mod renderer_wgpu_port;
 
 #[derive(Parser)]
 #[command(name = "katana-viewer", about = "2D layer viewer for sliced meshes")]
