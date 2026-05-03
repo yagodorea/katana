@@ -448,11 +448,17 @@ impl Renderer {
 
         // build the per-frame uniform values, twice (once with no clip for BG,
         // and once with the user's clip range (FG layer culling)
+        // Remap GL NDC z [-1, +1] → wgpu NDC z [0, +1] by baking
+        //   new_z = old_z * 0.5 + 0.5 * w
+        // into the matrix's third row (column-major: indices 2/6/10/14).
+        // build_mvp was authored for GL conventions; without this remap,
+        // ~half the geometry's clip-space z falls outside [0, 1] and gets
+        // culled by wgpu's depth-clip stage before the depth test runs.
         let mvp_mat: [[f32; 4]; 4] = [
-            [mvp[0], mvp[1], mvp[2], mvp[3]],
-            [mvp[4], mvp[5], mvp[6], mvp[7]],
-            [mvp[8], mvp[9], mvp[10], mvp[11]],
-            [mvp[12], mvp[13], mvp[14], mvp[15]],
+            [mvp[0],  mvp[1],  mvp[2]  * 0.5,                 mvp[3]],
+            [mvp[4],  mvp[5],  mvp[6]  * 0.5,                 mvp[7]],
+            [mvp[8],  mvp[9],  mvp[10] * 0.5,                 mvp[11]],
+            [mvp[12], mvp[13], mvp[14] * 0.5 + 0.5 * mvp[15], mvp[15]],
         ];
         let light_dir4 = [light_dir[0], light_dir[1], light_dir[2], 0.0];
 
