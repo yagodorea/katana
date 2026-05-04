@@ -104,6 +104,25 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+                eframe::egui_wgpu::WgpuSetupCreateNew {
+                    device_descriptor: Arc::new(|adapter| {
+                        // Bump buffer max size for bigger STLs
+                        let mut limits = adapter.limits();
+                        limits.max_buffer_size = 1 << 30; // 1 GiB
+                        eframe::wgpu::DeviceDescriptor {
+                            label: Some("katana-viewer device"),
+                            required_features: eframe::wgpu::Features::empty(),
+                            required_limits: limits,
+                            memory_hints: eframe::wgpu::MemoryHints::default(),
+                        }
+                    }),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
