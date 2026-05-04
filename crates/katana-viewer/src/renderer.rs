@@ -1133,15 +1133,18 @@ pub fn build_mvp(
     let se = elevation.sin();
     let (tx, ty, tz) = (center[0], center[1], center[2]);
 
+    // Orbit camera at C = +R·(ce·sa, ce·ca, se) so positive elevation places
+    // the camera ABOVE the target. Right = (ca, -sa, 0); Up = (-se·sa, -se·ca, ce);
+    // Forward (into scene) = -(ce·sa, ce·ca, se); depth row = forward (so far → larger clip.z).
     let r00 = sx * ca;
     let r01 = sx * (-sa);
     let r02 = 0.0;
-    let r10 = sy * se * sa;
-    let r11 = sy * se * ca;
+    let r10 = sy * (-se) * sa;
+    let r11 = sy * (-se) * ca;
     let r12 = sy * ce;
-    let r20 = sz * ce * sa;
-    let r21 = sz * ce * ca;
-    let r22 = sz * se;
+    let r20 = -sz * ce * sa;
+    let r21 = -sz * ce * ca;
+    let r22 = -sz * se;
 
     // Translation to center on the target point
     // (pan is now handled by updating center directly in world space)

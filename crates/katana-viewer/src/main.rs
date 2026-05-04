@@ -164,7 +164,7 @@ fn main() -> eframe::Result {
                 slice_view: SliceView::Toolpaths,
                 center: [center_x, center_y, center_z],
                 extent,
-                azimuth: std::f32::consts::FRAC_PI_4,
+                azimuth: std::f32::consts::FRAC_PI_4 + std::f32::consts::PI,
                 elevation: std::f32::consts::FRAC_PI_6,
                 zoom: 1.0,
                 pan: egui::Vec2::ZERO,
