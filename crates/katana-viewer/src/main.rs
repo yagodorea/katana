@@ -3,10 +3,10 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
-use eframe::glow;
+use eframe::egui_wgpu;
 use katana_core::{offset, planner, slicer, stl};
 
-mod renderer;
+mod renderer_wgpu_port;
 
 #[derive(Parser)]
 #[command(name = "katana-viewer", about = "2D layer viewer for sliced meshes")]
@@ -101,6 +101,26 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+                eframe::egui_wgpu::WgpuSetupCreateNew {
+                    device_descriptor: Arc::new(|adapter| {
+                        // Bump buffer max size for bigger STLs
+                        let mut limits = adapter.limits();
+                        limits.max_buffer_size = 1 << 30; // 1 GiB
+                        eframe::wgpu::DeviceDescriptor {
+                            label: Some("katana-viewer device"),
+                            required_features: eframe::wgpu::Features::empty(),
+                            required_limits: limits,
+                            memory_hints: eframe::wgpu::MemoryHints::default(),
+                        }
+                    }),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -108,14 +128,19 @@ fn main() -> eframe::Result {
         "katana viewer",
         options,
         Box::new(move |cc| {
-            let gl = cc.gl.as_ref().expect("eframe glow backend required");
-            let mut gpu = renderer::Renderer::new(gl.clone());
+            let render_state = cc.wgpu_render_state.as_ref()
+                .expect("eframe wgpu backend required");
+            let device = render_state.device.clone();   // Arc<wgpu::Device>
+            let queue  = render_state.queue.clone();    // Arc<wgpu::Queue>
+            let target_format = render_state.target_format;
+
+            // Initial size is a placeholder; first frame's resize() fixes it.
+            let mut gpu = renderer_wgpu_port::Renderer::new(
+                device, queue, target_format, 1, 1,
+            );
 
             gpu.upload_mesh(&triangles);
             gpu.upload_all_slices(&layers, 1);
-
-            // Upload ALL contour + toolpath data once; layer visibility
-            // is controlled by the u_clip_z shader uniform.
             gpu.upload_current_slice(&layers);
             gpu.upload_planned_toolpath(&planned_result.layers, args.nozzle_width, args.layer_height);
 
@@ -137,7 +162,7 @@ fn main() -> eframe::Result {
                 slice_view: SliceView::Toolpaths,
                 center: [center_x, center_y, center_z],
                 extent,
-                azimuth: std::f32::consts::FRAC_PI_4,
+                azimuth: std::f32::consts::FRAC_PI_4 + std::f32::consts::PI,
                 elevation: std::f32::consts::FRAC_PI_6,
                 zoom: 1.0,
                 pan: egui::Vec2::ZERO,
@@ -182,7 +207,7 @@ struct Stats {
 }
 
 struct ViewerApp {
-    renderer: Arc<Mutex<renderer::Renderer>>,
+    renderer: Arc<Mutex<renderer_wgpu_port::Renderer>>,
     layers: Vec<slicer::Layer>,
     num_layers: usize,
     max_layer: usize,
@@ -407,7 +432,7 @@ impl eframe::App for ViewerApp {
 
                 let rect = response.rect;
                 let aspect = rect.width() / rect.height();
-                let mvp = renderer::build_mvp(
+                let mvp = renderer_wgpu_port::build_mvp(
                     self.center,
                     self.azimuth,
                     self.elevation,
@@ -418,25 +443,23 @@ impl eframe::App for ViewerApp {
                 );
 
                 let bg_mode = self.bg_mode;
-                let light_dir = renderer::headlight_dir(self.azimuth, self.elevation);
+                let light_dir = renderer_wgpu_port::headlight_dir(self.azimuth, self.elevation);
                 let renderer = self.renderer.clone();
                 let ppp = ctx.pixels_per_point();
-                let vw = (rect.width() * ppp) as i32;
-                let vh = (rect.height() * ppp) as i32;
+                let vw = (rect.width() * ppp).max(1.0) as u32;
+                let vh = (rect.height() * ppp).max(1.0) as u32;
 
-                let callback = egui::PaintCallback {
+                let callback = egui_wgpu::Callback::new_paint_callback(
                     rect,
-                    callback: Arc::new(eframe::egui_glow::CallbackFn::new(
-                        move |info, _painter| {
-                            let vp = info.viewport_in_pixels();
-                            let sx = vp.left_px;
-                            let sy = vp.from_bottom_px;
-                            renderer.lock().unwrap().draw(
-                                &mvp, &light_dir, &bg_mode, vw, vh, sx, sy,
-                            );
-                        },
-                    )),
-                };
+                    ViewerCallback {
+                        renderer,
+                        mvp,
+                        light_dir,
+                        bg_mode,
+                        width: vw,
+                        height: vh,
+                    },
+                );
                 painter.add(callback);
         });
 
@@ -449,9 +472,46 @@ impl eframe::App for ViewerApp {
 
     }
 
-    fn on_exit(&mut self, gl: Option<&glow::Context>) {
-        if gl.is_some() {
-            self.renderer.lock().unwrap().destroy();
-        }
+    // No on_exit needed: wgpu resources clean up via Drop.
+}
+
+// ---------------------------------------------------------------------------
+// PaintCallback bridge: ferries per-frame state from the egui side into our
+// Renderer's prepare() and paint() methods via the egui_wgpu callback trait.
+// ---------------------------------------------------------------------------
+
+struct ViewerCallback {
+    renderer: Arc<Mutex<renderer_wgpu_port::Renderer>>,
+    mvp: [f32; 16],
+    light_dir: [f32; 3],
+    bg_mode: BgMode,
+    width: u32,
+    height: u32,
+}
+
+impl egui_wgpu::CallbackTrait for ViewerCallback {
+    fn prepare(
+        &self,
+        device: &eframe::wgpu::Device,
+        queue: &eframe::wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        encoder: &mut eframe::wgpu::CommandEncoder,
+        _callback_resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<eframe::wgpu::CommandBuffer> {
+        self.renderer.lock().unwrap().prepare(
+            device, queue, encoder,
+            &self.mvp, &self.light_dir, self.bg_mode,
+            self.width, self.height,
+        );
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut eframe::wgpu::RenderPass<'static>,
+        _callback_resources: &egui_wgpu::CallbackResources,
+    ) {
+        self.renderer.lock().unwrap().paint(render_pass);
     }
 }
