@@ -8,7 +8,10 @@
 //!                 renders into before being blitted onto egui's pass.
 
 mod buffers;
+mod camera;
 mod pipelines;
+
+pub use camera::{ build_mvp, headlight_dir };
 
 use katana_core::planner::{ MoveKind, PointXY };
 use wgpu::*;
@@ -51,12 +54,15 @@ impl OffscreenTargets {
         }
     }
 
-    /// Recreate textures if dimensions changed. No-op otherwise (important, because creating a texture every frame would burn memory bandwidth)
-    pub fn resize(&mut self, device: &Device, width: u32, height: u32) {
+    /// Recreate textures if dimensions changed. Returns true if the textures
+    /// were actually recreated (so callers can invalidate dependent resources
+    /// like sampling bind groups). No-op + returns false otherwise.
+    pub fn resize(&mut self, device: &Device, width: u32, height: u32) -> bool {
         if self.width == width && self.height == height {
-            return;
+            return false;
         }
         *self = Self::new(device, self.color_format, width, height);
+        true
     }
 }
 
@@ -108,15 +114,10 @@ use buffers::{ FrameUniforms, GpuBuffer, InstancedBatch };
 
 use crate::renderer_wgpu_port::buffers::{ LineVertex, MeshVertex, RhombusInstance };
 
-// Re-export camera math from the legacy renderer module so main.rs can drop
-// `mod renderer;` once the port is stable. Source of truth lives there for now.
-pub use crate::renderer::{build_mvp, headlight_dir};
-
 pub struct Renderer {
-    // GPU handles. wgpu's `Device` and `Queue` are cheap to clone — they
-    // wrap an internal Arc — so we don't need an explicit Arc wrapper.
+    // wgpu's `Device` is cheap to clone (internal Arc); kept here so `paint`
+    // can build a transient bind group without threading device through.
     device: Device,
-    queue: Queue,
 
     // We need two uniform buffers and bind groups: one with no z-clipping (for BG),
     // and one with the user's clip range (for FG). That's because queue.write_buffer
@@ -138,6 +139,9 @@ pub struct Renderer {
     blit_pipeline: RenderPipeline,
     blit_bgl: BindGroupLayout,
     blit_sampler: Sampler,
+    // Cached blit bind group. Built once in `new`, invalidated on resize.
+    // `paint` reads it without allocating; was previously rebuilt every frame.
+    blit_bind_group: BindGroup,
 
     // Offscreen color+depth that 3D content renders into.
     offscreen: OffscreenTargets,
@@ -165,7 +169,7 @@ pub struct Renderer {
 impl Renderer {
     pub fn new(
         device: Device,
-        queue: Queue,
+        _queue: Queue,
         color_format: TextureFormat,
         width: u32,
         height: u32
@@ -214,10 +218,15 @@ impl Renderer {
         );
 
         let offscreen = OffscreenTargets::new(&device, color_format, width, height);
+        let blit_bind_group = build_blit_bind_group(
+            &device,
+            &blit_bgl,
+            &offscreen.color_view,
+            &blit_sampler
+        );
 
         Self {
             device,
-            queue,
             frame_uniform_buffer_bg,
             frame_bind_group_bg,
             frame_uniform_buffer_fg,
@@ -228,6 +237,7 @@ impl Renderer {
             blit_pipeline,
             blit_bgl,
             blit_sampler,
+            blit_bind_group,
             offscreen,
             mesh_buffer: None,
             slices_buffer: None,
@@ -444,7 +454,15 @@ impl Renderer {
         viewport_h: u32
     ) {
         // resize offscreen to match the viewport size.
-        self.offscreen.resize(device, viewport_w, viewport_h);
+        let resized = self.offscreen.resize(device, viewport_w, viewport_h);
+        if resized {
+            self.blit_bind_group = build_blit_bind_group(
+                device,
+                &self.blit_bgl,
+                &self.offscreen.color_view,
+                &self.blit_sampler
+            );
+        }
 
         // build the per-frame uniform values, twice (once with no clip for BG,
         // and once with the user's clip range (FG layer culling)
@@ -455,9 +473,9 @@ impl Renderer {
         // ~half the geometry's clip-space z falls outside [0, 1] and gets
         // culled by wgpu's depth-clip stage before the depth test runs.
         let mvp_mat: [[f32; 4]; 4] = [
-            [mvp[0],  mvp[1],  mvp[2]  * 0.5,                 mvp[3]],
-            [mvp[4],  mvp[5],  mvp[6]  * 0.5,                 mvp[7]],
-            [mvp[8],  mvp[9],  mvp[10] * 0.5,                 mvp[11]],
+            [mvp[0], mvp[1], mvp[2] * 0.5, mvp[3]],
+            [mvp[4], mvp[5], mvp[6] * 0.5, mvp[7]],
+            [mvp[8], mvp[9], mvp[10] * 0.5, mvp[11]],
             [mvp[12], mvp[13], mvp[14] * 0.5 + 0.5 * mvp[15], mvp[15]],
         ];
         let light_dir4 = [light_dir[0], light_dir[1], light_dir[2], 0.0];
@@ -608,24 +626,8 @@ impl Renderer {
     /// `render_pass` is egui's existing pass, color attachment is already set,
     /// no depth attachment. We add one fullscreen-triangle draw to it.
     pub fn paint(&self, render_pass: &mut RenderPass<'_>) {
-        let bind_group = self.device.create_bind_group(
-            &(BindGroupDescriptor {
-                label: Some("blit_bind_group"),
-                layout: &self.blit_bgl,
-                entries: &[
-                    BindGroupEntry {
-                        binding: 0,
-                        resource: BindingResource::TextureView(&self.offscreen.color_view),
-                    },
-                    BindGroupEntry {
-                        binding: 1,
-                        resource: BindingResource::Sampler(&self.blit_sampler),
-                    },
-                ],
-            })
-        );
         render_pass.set_pipeline(&self.blit_pipeline);
-        render_pass.set_bind_group(0, &bind_group, &[]);
+        render_pass.set_bind_group(0, &self.blit_bind_group, &[]);
         render_pass.draw(0..3, 0..1); // 3 verts, 1 instance
     }
 
@@ -776,4 +778,25 @@ fn draw_rhombus_batch(
     if let Some(rf) = run_first {
         pass.draw(0..36, rf..rf + run_total);
     }
+}
+
+/// Build the bind group used by the blit pipeline. Re-call whenever the
+/// offscreen color view is recreated (i.e. after `OffscreenTargets::resize`
+/// returns true).
+fn build_blit_bind_group(
+    device: &Device,
+    layout: &BindGroupLayout,
+    color_view: &TextureView,
+    sampler: &Sampler
+) -> BindGroup {
+    device.create_bind_group(
+        &(BindGroupDescriptor {
+            label: Some("blit_bind_group"),
+            layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(color_view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::Sampler(sampler) },
+            ],
+        })
+    )
 }

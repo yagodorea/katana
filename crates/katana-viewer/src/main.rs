@@ -6,8 +6,6 @@ use eframe::egui;
 use eframe::egui_wgpu;
 use katana_core::{offset, planner, slicer, stl};
 
-#[allow(dead_code)]
-mod renderer;          // legacy glow renderer, kept for reference; unused
 mod renderer_wgpu_port;
 
 #[derive(Parser)]
