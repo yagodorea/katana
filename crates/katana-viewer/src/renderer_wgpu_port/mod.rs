@@ -15,6 +15,7 @@ pub use camera::{ build_mvp, headlight_dir };
 
 use katana_core::planner::{ MoveKind, PointXY };
 use wgpu::*;
+use wgpu::util::DeviceExt;
 
 // ---------------------------------------------------------------------------
 // Offscreen render targets
@@ -112,6 +113,53 @@ use std::mem::size_of;
 
 use buffers::{ FrameUniforms, GpuBuffer, InstancedBatch };
 
+// ---------------------------------------------------------------------------
+// Rhombus vertex table — compile-time constant, 144 bytes, written once.
+// ---------------------------------------------------------------------------
+//
+// Each of 36 vertices is packed into one u32: cross_idx (bits 0-1),
+// along_f (bit 2), norm_idx (bits 3-5).
+//   cross_idx - which of 4 cross-section offsets {R, T, L, B}
+//   along_f   - 0 = start of segment, 1 = end of segment
+//   norm_idx  - which of 6 normals {N_RT, N_TL, N_LB, N_BR, N_NEG, N_POS}
+
+const R: u32 = 0;
+const T: u32 = 1;
+const L: u32 = 2;
+const B: u32 = 3;
+const N_RT: u32 = 0;
+const N_TL: u32 = 1;
+const N_LB: u32 = 2;
+const N_BR: u32 = 3;
+const N_NEG: u32 = 4;
+const N_POS: u32 = 5;
+
+const fn pack(cross: u32, along: u32, norm: u32) -> u32 {
+    cross | (along << 2) | (norm << 3)
+}
+
+#[rustfmt::skip]
+const VERTEX_TABLE: [u32; 36] = [
+    // Side face right-top (triangles 0-1)
+    pack(R, 0, N_RT), pack(T, 0, N_RT), pack(R, 1, N_RT),
+    pack(T, 0, N_RT), pack(T, 1, N_RT), pack(R, 1, N_RT),
+    // Side face top-left (triangles 2-3)
+    pack(T, 0, N_TL), pack(L, 0, N_TL), pack(T, 1, N_TL),
+    pack(L, 0, N_TL), pack(L, 1, N_TL), pack(T, 1, N_TL),
+    // Side face left-bottom (triangles 4-5)
+    pack(L, 0, N_LB), pack(B, 0, N_LB), pack(L, 1, N_LB),
+    pack(B, 0, N_LB), pack(B, 1, N_LB), pack(L, 1, N_LB),
+    // Side face bottom-right (triangles 6-7)
+    pack(B, 0, N_BR), pack(R, 0, N_BR), pack(B, 1, N_BR),
+    pack(R, 0, N_BR), pack(R, 1, N_BR), pack(B, 1, N_BR),
+    // Start cap (triangles 8-9), normal = -seg_dir
+    pack(R, 0, N_NEG), pack(T, 0, N_NEG), pack(L, 0, N_NEG),
+    pack(R, 0, N_NEG), pack(L, 0, N_NEG), pack(B, 0, N_NEG),
+    // End cap (triangles 10-11), normal = +seg_dir
+    pack(R, 1, N_POS), pack(L, 1, N_POS), pack(T, 1, N_POS),
+    pack(R, 1, N_POS), pack(B, 1, N_POS), pack(L, 1, N_POS),
+];
+
 use crate::renderer_wgpu_port::buffers::{ LineVertex, MeshVertex, RhombusInstance };
 
 pub struct Renderer {
@@ -127,6 +175,14 @@ pub struct Renderer {
     frame_bind_group_bg: BindGroup,
     frame_uniform_buffer_fg: Buffer,
     frame_bind_group_fg: BindGroup,
+
+    // Rhombus pipeline bind groups include both the frame uniform (binding 0)
+    // and the static vertex-table buffer (binding 1). Kept separate from the
+    // shared frame bind groups because line/mesh pipelines don't have binding 1.
+    // `_vertex_table_buffer` is held only for its lifetime; the bind group owns the GPU reference.
+    _vertex_table_buffer: Buffer,
+    _rhombus_bind_group_bg: BindGroup, // reserved for a future BG rhombus pass
+    rhombus_bind_group_fg: BindGroup,
 
     // The three pipelines, built once at startup.
     line_pipeline: RenderPipeline,
@@ -175,6 +231,7 @@ impl Renderer {
         height: u32
     ) -> Self {
         let frame_bgl = pipelines::build_frame_bgl(&device);
+        let rhombus_bgl = pipelines::build_rhombus_bgl(&device);
 
         // Small factories for uniform buffer and bind group
         let make_uniform_buffer = |label: &str| -> Buffer {
@@ -201,9 +258,46 @@ impl Renderer {
         let frame_bind_group_bg = make_bind_group("frame_bind_group_bg", &frame_uniform_buffer_bg);
         let frame_bind_group_fg = make_bind_group("frame_bind_group_fg", &frame_uniform_buffer_fg);
 
+        // Upload the static 36-entry vertex table once; never rewritten.
+        let table_bytes: &[u8] = bytemuck::cast_slice(&VERTEX_TABLE);
+        let vertex_table_buffer = device.create_buffer_init(
+            &(wgpu::util::BufferInitDescriptor {
+                label: Some("vertex_table"),
+                contents: table_bytes,
+                usage: BufferUsages::UNIFORM,
+            })
+        );
+        let make_rhombus_bind_group = |label: &str, frame_buf: &Buffer| -> BindGroup {
+            device.create_bind_group(
+                &(BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &rhombus_bgl,
+                    entries: &[
+                        BindGroupEntry { binding: 0, resource: frame_buf.as_entire_binding() },
+                        BindGroupEntry {
+                            binding: 1,
+                            resource: vertex_table_buffer.as_entire_binding(),
+                        },
+                    ],
+                })
+            )
+        };
+        let rhombus_bind_group_bg = make_rhombus_bind_group(
+            "rhombus_bind_group_bg",
+            &frame_uniform_buffer_bg
+        );
+        let rhombus_bind_group_fg = make_rhombus_bind_group(
+            "rhombus_bind_group_fg",
+            &frame_uniform_buffer_fg
+        );
+
         let line_pipeline = pipelines::build_line_pipeline(&device, &frame_bgl, color_format);
         let mesh_pipeline = pipelines::build_mesh_pipeline(&device, &frame_bgl, color_format);
-        let rhombus_pipeline = pipelines::build_rhombus_pipeline(&device, &frame_bgl, color_format);
+        let rhombus_pipeline = pipelines::build_rhombus_pipeline(
+            &device,
+            &rhombus_bgl,
+            color_format
+        );
 
         let blit_bgl = pipelines::build_blit_bgl(&device);
         let blit_pipeline = pipelines::build_blit_pipeline(&device, &blit_bgl, color_format);
@@ -231,6 +325,9 @@ impl Renderer {
             frame_bind_group_bg,
             frame_uniform_buffer_fg,
             frame_bind_group_fg,
+            _vertex_table_buffer: vertex_table_buffer,
+            _rhombus_bind_group_bg: rhombus_bind_group_bg,
+            rhombus_bind_group_fg,
             line_pipeline,
             mesh_pipeline,
             rhombus_pipeline,
@@ -588,7 +685,7 @@ impl Renderer {
                         draw_rhombus_batch(
                             &mut pass,
                             &self.rhombus_pipeline,
-                            &self.frame_bind_group_fg,
+                            &self.rhombus_bind_group_fg,
                             rhombuses,
                             self.clip_z_max,
                             self.clip_z_min,
@@ -608,8 +705,10 @@ impl Renderer {
                 // Conditionally draw travel moves (draw last because they're translucent)
                 if self.show_travel_moves {
                     if self.show_filaments {
-                        // Means rhombus pipeline was bound, need to rebind line pipeline
+                        // rhombus_bind_group_fg (2 bindings) was active; line pipeline uses
+                        // frame_bgl (1 binding) — must rebind the compatible frame bind group.
                         pass.set_pipeline(&self.line_pipeline);
+                        pass.set_bind_group(0, &self.frame_bind_group_fg, &[]);
                     }
                     if let Some(lb) = &self.toolpath_lines_buffer {
                         pass.set_vertex_buffer(0, lb.buffer.slice(..));

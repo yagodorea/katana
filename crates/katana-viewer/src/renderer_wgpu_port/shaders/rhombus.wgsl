@@ -12,6 +12,13 @@ struct Uniforms {
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
+// Uniform arrays require 16-byte element stride; pack 4 u32s per vec4.
+// 36 entries = 9 vec4<u32>s. Access: entries[vid >> 2u][vid & 3u].
+struct VertexTable {
+    entries: array<vec4<u32>, 9>,
+}
+@group(0) @binding(1) var<uniform> vertex_table: VertexTable;
+
 struct VsIn {
     @location(0) start:      vec3<f32>,
     @location(1) direction:  vec2<f32>,
@@ -37,66 +44,24 @@ struct VsOut {
     let perp = vec3(-in.direction.y, in.direction.x, 0.0);
     let up = vec3(0.0, 0.0, 1.0);
 
-    // 4 cross-section offsets
-    let r_off = perp * half_w;    // right
-    let t_off = up   * half_h;    // top
-    let l_off = -perp * half_w;   // left
-    let b_off = -up   * half_h;   // bottom
+    // 4 cross-section offsets indexed by cross_idx: R=0, T=1, L=2, B=3
+    let cross_offsets = array<vec3<f32>, 4>(
+        perp * half_w, up * half_h, -(perp * half_w), -(up * half_h));
 
-    // 4 side face normals (normalized bisectors of adjacent edges)
-    let n_rt = normalize(perp + up);     // right-top face
-    let n_tl = normalize(-perp + up);    // top-left face
-    let n_lb = normalize(-perp - up);    // left-bottom face
-    let n_br = normalize(perp - up);     // bottom-right face
+    // 6 normals indexed by norm_idx: N_RT=0, N_TL=1, N_LB=2, N_BR=3, N_NEG=4, N_POS=5
+    let normals = array<vec3<f32>, 6>(
+        normalize(perp + up), normalize(-perp + up),
+        normalize(-perp - up), normalize(perp - up),
+        -seg_dir, seg_dir);
 
-    var cross_off: vec3<f32>;
-    var along_off: vec3<f32>;
-    var norm: vec3<f32>;
+    let packed    = vertex_table.entries[vid >> 2u][vid & 3u];
+    let cross_idx = packed & 3u;
+    let along_f   = (packed >> 2u) & 1u;
+    let norm_idx  = (packed >> 3u) & 7u;
 
-    switch (vid) {
-        // Side face 0: right-top (triangles 0, 1)
-        case 0u:  { cross_off = r_off; along_off = vec3(0.0);              norm = n_rt; }
-        case 1u:  { cross_off = t_off; along_off = vec3(0.0);              norm = n_rt; }
-        case 2u:  { cross_off = r_off; along_off = seg_dir * seg_len;    norm = n_rt; }
-        case 3u:  { cross_off = t_off; along_off = vec3(0.0);              norm = n_rt; }
-        case 4u:  { cross_off = t_off; along_off = seg_dir * seg_len;    norm = n_rt; }
-        case 5u:  { cross_off = r_off; along_off = seg_dir * seg_len;    norm = n_rt; }
-        // Side face 1: top-left (triangles 2, 3)
-        case 6u:  { cross_off = t_off; along_off = vec3(0.0);              norm = n_tl; }
-        case 7u:  { cross_off = l_off; along_off = vec3(0.0);              norm = n_tl; }
-        case 8u:  { cross_off = t_off; along_off = seg_dir * seg_len;    norm = n_tl; }
-        case 9u:  { cross_off = l_off; along_off = vec3(0.0);              norm = n_tl; }
-        case 10u: { cross_off = l_off; along_off = seg_dir * seg_len;    norm = n_tl; }
-        case 11u: { cross_off = t_off; along_off = seg_dir * seg_len;    norm = n_tl; }
-        // Side face 2: left-bottom (triangles 4, 5)
-        case 12u: { cross_off = l_off; along_off = vec3(0.0);              norm = n_lb; }
-        case 13u: { cross_off = b_off; along_off = vec3(0.0);              norm = n_lb; }
-        case 14u: { cross_off = l_off; along_off = seg_dir * seg_len;    norm = n_lb; }
-        case 15u: { cross_off = b_off; along_off = vec3(0.0);              norm = n_lb; }
-        case 16u: { cross_off = b_off; along_off = seg_dir * seg_len;    norm = n_lb; }
-        case 17u: { cross_off = l_off; along_off = seg_dir * seg_len;    norm = n_lb; }
-        // Side face 3: bottom-right (triangles 6, 7)
-        case 18u: { cross_off = b_off; along_off = vec3(0.0);              norm = n_br; }
-        case 19u: { cross_off = r_off; along_off = vec3(0.0);              norm = n_br; }
-        case 20u: { cross_off = b_off; along_off = seg_dir * seg_len;    norm = n_br; }
-        case 21u: { cross_off = r_off; along_off = vec3(0.0);              norm = n_br; }
-        case 22u: { cross_off = r_off; along_off = seg_dir * seg_len;    norm = n_br; }
-        case 23u: { cross_off = b_off; along_off = seg_dir * seg_len;    norm = n_br; }
-        // Start cap (triangles 8, 9), normal = -seg_dir
-        case 24u: { cross_off = r_off; along_off = vec3(0.0);              norm = -seg_dir; }
-        case 25u: { cross_off = t_off; along_off = vec3(0.0);              norm = -seg_dir; }
-        case 26u: { cross_off = l_off; along_off = vec3(0.0);              norm = -seg_dir; }
-        case 27u: { cross_off = r_off; along_off = vec3(0.0);              norm = -seg_dir; }
-        case 28u: { cross_off = l_off; along_off = vec3(0.0);              norm = -seg_dir; }
-        case 29u: { cross_off = b_off; along_off = vec3(0.0);              norm = -seg_dir; }
-        // End cap (triangles 10, 11), normal = +seg_dir
-        case 30u: { cross_off = r_off; along_off = seg_dir * seg_len;    norm = seg_dir; }
-        case 31u: { cross_off = l_off; along_off = seg_dir * seg_len;    norm = seg_dir; }
-        case 32u: { cross_off = t_off; along_off = seg_dir * seg_len;    norm = seg_dir; }
-        case 33u: { cross_off = r_off; along_off = seg_dir * seg_len;    norm = seg_dir; }
-        case 34u: { cross_off = b_off; along_off = seg_dir * seg_len;    norm = seg_dir; }
-        default:  { cross_off = l_off; along_off = seg_dir * seg_len;    norm = seg_dir; }
-    }
+    let cross_off = cross_offsets[cross_idx];
+    let along_off = seg_dir * (seg_len * f32(along_f));
+    let norm      = normals[norm_idx];
 
     let world_pos = in.start + along_off + cross_off;
     out.clip_pos = u.mvp * vec4(world_pos, 1.0);

@@ -18,7 +18,7 @@ use super::buffers::{ LineVertex, MeshVertex, RhombusInstance };
 /// Depth buffer format
 pub const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth24Plus;
 
-/// Bind group layout shared by all three pipelines.
+/// Bind group layout shared by line + mesh pipelines.
 /// Binding 0 = `FrameUniforms` uniform buffer, visible to VS + FS.
 pub fn build_frame_bgl(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(
@@ -28,6 +28,37 @@ pub fn build_frame_bgl(device: &Device) -> BindGroupLayout {
                 BindGroupLayoutEntry {
                     binding: 0,
                     visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        })
+    )
+}
+
+/// Bind group layout for the rhombus pipeline.
+pub fn build_rhombus_bgl(device: &Device) -> BindGroupLayout {
+    device.create_bind_group_layout(
+        &(BindGroupLayoutDescriptor {
+            label: Some("rhombus_bgl"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::VERTEX,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -188,7 +219,7 @@ pub fn build_mesh_pipeline(
 
 pub fn build_rhombus_pipeline(
     device: &Device,
-    frame_bgl: &BindGroupLayout,
+    rhombus_bgl: &BindGroupLayout,
     color_format: TextureFormat
 ) -> RenderPipeline {
     // Load shader module
@@ -197,11 +228,11 @@ pub fn build_rhombus_pipeline(
         source: ShaderSource::Wgsl(include_str!("shaders/rhombus.wgsl").into()),
     });
 
-    // Build pipeline layout referencing frame_bgl
+    // Build pipeline layout referencing rhombus_bgl (frame uniform + vertex table)
     let layout = device.create_pipeline_layout(
         &(PipelineLayoutDescriptor {
             label: Some("rhombus_pipeline_layout"),
-            bind_group_layouts: &[frame_bgl],
+            bind_group_layouts: &[rhombus_bgl],
             push_constant_ranges: &[],
         })
     );
@@ -261,77 +292,85 @@ pub fn build_rhombus_pipeline(
 
 /// Bind group layout for the blit: texture at binding 0, sampler at binding 1.
 pub fn build_blit_bgl(device: &Device) -> BindGroupLayout {
-    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("blit_bgl"),
-        entries: &[
-            BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: true },
-                    view_dimension: TextureViewDimension::D2,
-                    multisampled: false,
+    device.create_bind_group_layout(
+        &(BindGroupLayoutDescriptor {
+            label: Some("blit_bgl"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 1,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
-    })
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        })
+    )
 }
 
 pub fn build_blit_pipeline(
     device: &Device,
     blit_bgl: &BindGroupLayout,
-    color_format: TextureFormat,
+    color_format: TextureFormat
 ) -> RenderPipeline {
     let shader = device.create_shader_module(ShaderModuleDescriptor {
         label: Some("blit_shader"),
         source: ShaderSource::Wgsl(include_str!("shaders/blit.wgsl").into()),
     });
 
-    let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("blit_pipeline_layout"),
-        bind_group_layouts: &[blit_bgl],
-        push_constant_ranges: &[],
-    });
+    let layout = device.create_pipeline_layout(
+        &(PipelineLayoutDescriptor {
+            label: Some("blit_pipeline_layout"),
+            bind_group_layouts: &[blit_bgl],
+            push_constant_ranges: &[],
+        })
+    );
 
-    device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some("blit_pipeline"),
-        layout: Some(&layout),
-        vertex: VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            compilation_options: PipelineCompilationOptions::default(),
-            buffers: &[],   // no vertex buffer; geometry from vertex_index
-        },
-        fragment: Some(FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            compilation_options: PipelineCompilationOptions::default(),
-            // No alpha blend — we own every pixel of the central panel rect.
-            targets: &[Some(ColorTargetState {
-                format: color_format,
-                blend: None,
-                write_mask: ColorWrites::ALL,
-            })],
-        }),
-        primitive: PrimitiveState {
-            topology: PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: FrontFace::Ccw,
-            cull_mode: None,
-            unclipped_depth: false,
-            polygon_mode: PolygonMode::Fill,
-            conservative: false,
-        },
-        depth_stencil: None,   // egui's pass has no depth attachment
-        multisample: MultisampleState::default(),
-        multiview: None,
-        cache: None,
-    })
+    device.create_render_pipeline(
+        &(RenderPipelineDescriptor {
+            label: Some("blit_pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[], // no vertex buffer; geometry from vertex_index
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                // No alpha blend — we own every pixel of the central panel rect.
+                targets: &[
+                    Some(ColorTargetState {
+                        format: color_format,
+                        blend: None,
+                        write_mask: ColorWrites::ALL,
+                    }),
+                ],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None, // egui's pass has no depth attachment
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        })
+    )
 }
