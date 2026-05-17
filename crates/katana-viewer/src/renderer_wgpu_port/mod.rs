@@ -111,7 +111,7 @@ fn create_depth_texture(device: &Device, w: u32, h: u32) -> Texture {
 
 use std::mem::size_of;
 
-use buffers::{ FrameUniforms, GpuBuffer, InstancedBatch };
+use buffers::{ FrameUniforms, GpuBuffer, InstancedBatch, LineBatch };
 
 // ---------------------------------------------------------------------------
 // Rhombus vertex table — compile-time constant, 144 bytes, written once.
@@ -184,10 +184,13 @@ pub struct Renderer {
     _rhombus_bind_group_bg: BindGroup, // reserved for a future BG rhombus pass
     rhombus_bind_group_fg: BindGroup,
 
-    // The three pipelines, built once at startup.
-    line_pipeline: RenderPipeline,
-    mesh_pipeline: RenderPipeline,
-    rhombus_pipeline: RenderPipeline,
+    // Six pipelines (opaque + transparent variant per geometry type), built once at startup.
+    line_opaque_pipeline: RenderPipeline,
+    line_transparent_pipeline: RenderPipeline,
+    mesh_opaque_pipeline: RenderPipeline,
+    _mesh_transparent_pipeline: RenderPipeline, // unused today, kept for parity
+    rhombus_opaque_pipeline: RenderPipeline,
+    _rhombus_transparent_pipeline: RenderPipeline, // unused today, kept for parity
 
     // 4th pipeline + its bind group layout + sampler: copies the offscreen
     // color texture onto egui's pass in `paint`. Sampler is static; bind
@@ -205,10 +208,10 @@ pub struct Renderer {
     // Static geometry uploaded by the public upload_* methods. `None` until
     // the first upload call. Public so main.rs can check for presence if needed.
     pub mesh_buffer: Option<GpuBuffer>,
-    pub slices_buffer: Option<GpuBuffer>,
+    pub slices_buffer: Option<LineBatch>,
     pub current_slice_buffer: Option<GpuBuffer>,
-    pub toolpath_lines_buffer: Option<GpuBuffer>, // travel moves
-    pub toolpath_path_lines_buffer: Option<GpuBuffer>, // toolpath as flat lines
+    pub toolpath_lines_buffer: Option<LineBatch>, // travel moves
+    pub toolpath_path_lines_buffer: Option<LineBatch>, // toolpath as flat lines
     pub toolpath_rhombuses: Option<InstancedBatch>,
     half_height: f32,
 
@@ -291,9 +294,32 @@ impl Renderer {
             &frame_uniform_buffer_fg
         );
 
-        let line_pipeline = pipelines::build_line_pipeline(&device, &frame_bgl, color_format);
-        let mesh_pipeline = pipelines::build_mesh_pipeline(&device, &frame_bgl, color_format);
-        let rhombus_pipeline = pipelines::build_rhombus_pipeline(
+        let line_opaque_pipeline = pipelines::build_line_opaque_pipeline(
+            &device,
+            &frame_bgl,
+            color_format
+        );
+        let line_transparent_pipeline = pipelines::build_line_transparent_pipeline(
+            &device,
+            &frame_bgl,
+            color_format
+        );
+        let mesh_opaque_pipeline = pipelines::build_mesh_opaque_pipeline(
+            &device,
+            &frame_bgl,
+            color_format
+        );
+        let mesh_transparent_pipeline = pipelines::build_mesh_transparent_pipeline(
+            &device,
+            &frame_bgl,
+            color_format
+        );
+        let rhombus_opaque_pipeline = pipelines::build_rhombus_opaque_pipeline(
+            &device,
+            &rhombus_bgl,
+            color_format
+        );
+        let rhombus_transparent_pipeline = pipelines::build_rhombus_transparent_pipeline(
             &device,
             &rhombus_bgl,
             color_format
@@ -328,9 +354,12 @@ impl Renderer {
             _vertex_table_buffer: vertex_table_buffer,
             _rhombus_bind_group_bg: rhombus_bind_group_bg,
             rhombus_bind_group_fg,
-            line_pipeline,
-            mesh_pipeline,
-            rhombus_pipeline,
+            line_opaque_pipeline,
+            line_transparent_pipeline,
+            mesh_opaque_pipeline,
+            _mesh_transparent_pipeline: mesh_transparent_pipeline,
+            rhombus_opaque_pipeline,
+            _rhombus_transparent_pipeline: rhombus_transparent_pipeline,
             blit_pipeline,
             blit_bgl,
             blit_sampler,
@@ -397,7 +426,7 @@ impl Renderer {
                 }
             }
         }
-        self.slices_buffer = Some(buffers::upload_lines(&self.device, &verts));
+        self.slices_buffer = Some(buffers::upload_lines_batched(&self.device, &verts));
     }
 
     pub fn upload_current_slice(&mut self, layers: &[katana_core::slicer::Layer]) {
@@ -472,8 +501,8 @@ impl Renderer {
                 let color = match mv.kind {
                     MoveKind::Travel => [1.0, 0.8, 0.2, 0.4],
                     MoveKind::Perimeter => [0.91, 0.27, 0.38, 1.0],
-                    MoveKind::Infill => [0.27, 0.91, 0.38, 0.8],
-                    MoveKind::SurfaceInfill => [0.9, 0.2, 0.7, 0.9],
+                    MoveKind::Infill => [0.27, 0.91, 0.38, 1.0],
+                    MoveKind::SurfaceInfill => [0.9, 0.2, 0.7, 1.0],
                 };
                 match mv.kind {
                     MoveKind::Travel => {
@@ -526,10 +555,10 @@ impl Renderer {
 
         // Upload
         self.toolpath_lines_buffer = (!line_verts.is_empty()).then(||
-            buffers::upload_lines(&self.device, &line_verts)
+            buffers::upload_lines_batched(&self.device, &line_verts)
         );
         self.toolpath_path_lines_buffer = (!path_line_verts.is_empty()).then(||
-            buffers::upload_lines(&self.device, &path_line_verts)
+            buffers::upload_lines_batched(&self.device, &path_line_verts)
         );
         self.toolpath_rhombuses = (!rhombus_instances.is_empty()).then(||
             buffers::upload_rhombus_batch(&self.device, &rhombus_instances)
@@ -629,16 +658,15 @@ impl Renderer {
             match bg_mode {
                 super::BgMode::Mesh => {
                     if let Some(m) = &self.mesh_buffer {
-                        pass.set_pipeline(&self.mesh_pipeline);
+                        pass.set_pipeline(&self.mesh_opaque_pipeline);
                         pass.set_vertex_buffer(0, m.buffer.slice(..));
                         pass.draw(0..m.vertex_count, 0..1);
                     }
                 }
                 super::BgMode::Layers => {
                     if let Some(s) = &self.slices_buffer {
-                        pass.set_pipeline(&self.line_pipeline);
-                        pass.set_vertex_buffer(0, s.buffer.slice(..));
-                        pass.draw(0..s.vertex_count, 0..1);
+                        pass.set_pipeline(&self.line_transparent_pipeline);
+                        draw_line_batch(&mut pass, s, -1e30, 1e30); // BG: no clip
                     }
                 }
                 super::BgMode::None => {}
@@ -674,7 +702,7 @@ impl Renderer {
             // 2 view modes: `Contours` and `Toolpaths`
             if self.draw_contours {
                 if let Some(c) = &self.current_slice_buffer {
-                    pass.set_pipeline(&self.line_pipeline);
+                    pass.set_pipeline(&self.line_opaque_pipeline);
                     pass.set_vertex_buffer(0, c.buffer.slice(..));
                     pass.draw(0..c.vertex_count, 0..1);
                 }
@@ -684,7 +712,7 @@ impl Renderer {
                     if let Some(rhombuses) = &self.toolpath_rhombuses {
                         draw_rhombus_batch(
                             &mut pass,
-                            &self.rhombus_pipeline,
+                            &self.rhombus_opaque_pipeline,
                             &self.rhombus_bind_group_fg,
                             rhombuses,
                             self.clip_z_max,
@@ -696,9 +724,8 @@ impl Renderer {
                 } else {
                     // Otherwise draw simple line toolpaths
                     if let Some(plb) = &self.toolpath_path_lines_buffer {
-                        pass.set_pipeline(&self.line_pipeline);
-                        pass.set_vertex_buffer(0, plb.buffer.slice(..));
-                        pass.draw(0..plb.vertex_count, 0..1);
+                        pass.set_pipeline(&self.line_transparent_pipeline);
+                        draw_line_batch(&mut pass, plb, self.clip_z_min, self.clip_z_max);
                     }
                 }
 
@@ -707,12 +734,11 @@ impl Renderer {
                     if self.show_filaments {
                         // rhombus_bind_group_fg (2 bindings) was active; line pipeline uses
                         // frame_bgl (1 binding) — must rebind the compatible frame bind group.
-                        pass.set_pipeline(&self.line_pipeline);
+                        pass.set_pipeline(&self.line_transparent_pipeline);
                         pass.set_bind_group(0, &self.frame_bind_group_fg, &[]);
                     }
                     if let Some(lb) = &self.toolpath_lines_buffer {
-                        pass.set_vertex_buffer(0, lb.buffer.slice(..));
-                        pass.draw(0..lb.vertex_count, 0..1);
+                        draw_line_batch(&mut pass, lb, self.clip_z_min, self.clip_z_max);
                     }
                 }
             }
@@ -815,7 +841,6 @@ impl Renderer {
 // the view frustum, and merging contiguous non-culled layers into a single
 // `pass.draw(0..36, first_instance..first_instance + total)` — the wgpu
 // equivalent of glDrawArraysInstancedBaseInstance with no per-layer VAOs.
-
 fn draw_rhombus_batch(
     pass: &mut RenderPass<'_>,
     pipeline: &RenderPipeline,
@@ -876,6 +901,27 @@ fn draw_rhombus_batch(
     // Flush any trailing run.
     if let Some(rf) = run_first {
         pass.draw(0..36, rf..rf + run_total);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Line batch draw with CPU-side layer culling.
+// ---------------------------------------------------------------------------
+//
+// Mirrors draw_rhombus_batch but for line geometry. Pipeline and bind group
+// must be set by the caller before invoking this function.
+fn draw_line_batch(pass: &mut RenderPass<'_>, batch: &LineBatch, clip_z_min: f32, clip_z_max: f32) {
+    // Binary search the visible layers
+    let start_idx = batch.layer_entries.partition_point(|e| e.layer_z < clip_z_min);
+    let end_idx = batch.layer_entries.partition_point(|e| e.layer_z <= clip_z_max);
+    if start_idx >= end_idx {
+        return;
+    }
+
+    pass.set_vertex_buffer(0, batch.buffer.slice(..));
+
+    for entry in &batch.layer_entries[start_idx..end_idx] {
+        pass.draw(entry.first_vertex..entry.first_vertex + entry.vertex_count, 0..1);
     }
 }
 

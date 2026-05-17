@@ -73,10 +73,6 @@ struct VsOut {
 }
 
 @fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    if (in.layer_z > u.clip_z_max || in.layer_z < u.clip_z_min) {
-        discard;
-    }
-
     let diffuse = abs(dot(in.normal, u.light_dir.xyz));
     let ambient = 0.15;
     let light = ambient + (1.0 - ambient) * diffuse;

@@ -33,9 +33,5 @@ struct VsOut {
 }
 
 @fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    if (in.z > u.clip_z_max || in.z < u.clip_z_min) {
-        discard;
-    }
-
     return in.color;
 }

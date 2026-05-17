@@ -67,6 +67,17 @@ pub struct InstancedBatch {
     pub layer_entries: Vec<LayerEntry>,
 }
 
+pub struct LineLayerEntry {
+    pub layer_z: f32,
+    pub first_vertex: u32,
+    pub vertex_count: u32,
+}
+
+pub struct LineBatch {
+    pub buffer: wgpu::Buffer,
+    pub layer_entries: Vec<LineLayerEntry>,
+}
+
 pub fn upload_lines(device: &Device, verts: &[LineVertex]) -> GpuBuffer {
     let buffer = device.create_buffer_init(
         &(wgpu::util::BufferInitDescriptor {
@@ -77,6 +88,38 @@ pub fn upload_lines(device: &Device, verts: &[LineVertex]) -> GpuBuffer {
     );
     let vertex_count = verts.len() as u32;
     GpuBuffer { buffer, vertex_count }
+}
+
+pub fn upload_lines_batched(device: &Device, verts: &[LineVertex]) -> LineBatch {
+    let buffer = device.create_buffer_init(
+        &(wgpu::util::BufferInitDescriptor {
+            label: Some("line_batch_vbo"),
+            contents: bytemuck::cast_slice(verts),
+            usage: BufferUsages::VERTEX,
+        })
+    );
+    let mut layer_entries: Vec<LineLayerEntry> = Vec::new();
+    if verts.is_empty() {
+        return LineBatch { buffer, layer_entries };
+    }
+    let mut current_z = verts[0].pos[2];
+    let mut layer_start = 0usize;
+    for i in 1..=verts.len() {
+        let at_end = i == verts.len();
+        let z_changed = !at_end && verts[i].pos[2] != current_z;
+        if at_end || z_changed {
+            layer_entries.push(LineLayerEntry {
+                layer_z: current_z,
+                first_vertex: layer_start as u32,
+                vertex_count: (i - layer_start) as u32,
+            });
+            if !at_end {
+                current_z = verts[i].pos[2];
+                layer_start = i;
+            }
+        }
+    }
+    LineBatch { buffer, layer_entries }
 }
 
 pub fn upload_mesh(device: &Device, verts: &[MeshVertex]) -> GpuBuffer {

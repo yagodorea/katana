@@ -71,31 +71,30 @@ pub fn build_rhombus_bgl(device: &Device) -> BindGroupLayout {
     )
 }
 
-/// Standard alpha-blend color target with the swapchain's format.
-/// Used by all three pipelines.
-fn color_target(format: TextureFormat) -> ColorTargetState {
+fn color_target_for(format: TextureFormat, blend: bool) -> ColorTargetState {
     ColorTargetState {
         format,
-        blend: Some(BlendState::ALPHA_BLENDING),
+        blend: if blend { Some(BlendState::ALPHA_BLENDING) } else { None },
         write_mask: ColorWrites::ALL,
     }
 }
 
-/// Standard depth-test config: write enabled, less-equal compare.
-fn depth_state() -> DepthStencilState {
+fn depth_state_for(depth_write: bool) -> DepthStencilState {
     DepthStencilState {
         format: DEPTH_FORMAT,
-        depth_write_enabled: true,
+        depth_write_enabled: depth_write,
         depth_compare: CompareFunction::LessEqual,
         stencil: StencilState::default(),
         bias: DepthBiasState::default(),
     }
 }
 
-pub fn build_line_pipeline(
+fn build_line_pipeline_inner(
     device: &Device,
     frame_bgl: &BindGroupLayout,
-    color_format: TextureFormat
+    color_format: TextureFormat,
+    blend: bool,
+    depth_write: bool,
 ) -> RenderPipeline {
     // Load shader module
     let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -135,7 +134,7 @@ pub fn build_line_pipeline(
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(color_target(color_format))],
+                targets: &[Some(color_target_for(color_format, blend))],
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::LineList,
@@ -146,7 +145,7 @@ pub fn build_line_pipeline(
                 polygon_mode: PolygonMode::Fill,
                 conservative: false,
             },
-            depth_stencil: Some(depth_state()),
+            depth_stencil: Some(depth_state_for(depth_write)),
             multisample: MultisampleState::default(),
             multiview: None,
             cache: None,
@@ -154,10 +153,19 @@ pub fn build_line_pipeline(
     )
 }
 
-pub fn build_mesh_pipeline(
+pub fn build_line_opaque_pipeline(device: &Device, frame_bgl: &BindGroupLayout, color_format: TextureFormat) -> RenderPipeline {
+    build_line_pipeline_inner(device, frame_bgl, color_format, false, true)
+}
+pub fn build_line_transparent_pipeline(device: &Device, frame_bgl: &BindGroupLayout, color_format: TextureFormat) -> RenderPipeline {
+    build_line_pipeline_inner(device, frame_bgl, color_format, true, false)
+}
+
+fn build_mesh_pipeline_inner(
     device: &Device,
     frame_bgl: &BindGroupLayout,
-    color_format: TextureFormat
+    color_format: TextureFormat,
+    blend: bool,
+    depth_write: bool,
 ) -> RenderPipeline {
     // Load shader module
     let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -198,7 +206,7 @@ pub fn build_mesh_pipeline(
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(color_target(color_format))],
+                targets: &[Some(color_target_for(color_format, blend))],
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
@@ -209,7 +217,7 @@ pub fn build_mesh_pipeline(
                 polygon_mode: PolygonMode::Fill,
                 conservative: false,
             },
-            depth_stencil: Some(depth_state()),
+            depth_stencil: Some(depth_state_for(depth_write)),
             multisample: MultisampleState::default(),
             multiview: None,
             cache: None,
@@ -217,10 +225,19 @@ pub fn build_mesh_pipeline(
     )
 }
 
-pub fn build_rhombus_pipeline(
+pub fn build_mesh_opaque_pipeline(device: &Device, frame_bgl: &BindGroupLayout, color_format: TextureFormat) -> RenderPipeline {
+    build_mesh_pipeline_inner(device, frame_bgl, color_format, false, true)
+}
+pub fn build_mesh_transparent_pipeline(device: &Device, frame_bgl: &BindGroupLayout, color_format: TextureFormat) -> RenderPipeline {
+    build_mesh_pipeline_inner(device, frame_bgl, color_format, true, false)
+}
+
+fn build_rhombus_pipeline_inner(
     device: &Device,
     rhombus_bgl: &BindGroupLayout,
-    color_format: TextureFormat
+    color_format: TextureFormat,
+    blend: bool,
+    depth_write: bool,
 ) -> RenderPipeline {
     // Load shader module
     let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -261,7 +278,7 @@ pub fn build_rhombus_pipeline(
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(color_target(color_format))],
+                targets: &[Some(color_target_for(color_format, blend))],
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
@@ -272,12 +289,19 @@ pub fn build_rhombus_pipeline(
                 polygon_mode: PolygonMode::Fill,
                 conservative: false,
             },
-            depth_stencil: Some(depth_state()),
+            depth_stencil: Some(depth_state_for(depth_write)),
             multisample: MultisampleState::default(),
             multiview: None,
             cache: None,
         })
     )
+}
+
+pub fn build_rhombus_opaque_pipeline(device: &Device, rhombus_bgl: &BindGroupLayout, color_format: TextureFormat) -> RenderPipeline {
+    build_rhombus_pipeline_inner(device, rhombus_bgl, color_format, false, true)
+}
+pub fn build_rhombus_transparent_pipeline(device: &Device, rhombus_bgl: &BindGroupLayout, color_format: TextureFormat) -> RenderPipeline {
+    build_rhombus_pipeline_inner(device, rhombus_bgl, color_format, true, false)
 }
 
 // ---------------------------------------------------------------------------
