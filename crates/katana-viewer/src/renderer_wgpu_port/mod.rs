@@ -176,11 +176,11 @@ pub struct Renderer {
     frame_uniform_buffer_fg: Buffer,
     frame_bind_group_fg: BindGroup,
 
-    // Rhombus pipeline bind groups include both the frame uniform (binding 0)
-    // and the static vertex-table buffer (binding 1). Kept separate from the
-    // shared frame bind groups because line/mesh pipelines don't have binding 1.
-    // `_vertex_table_buffer` is held only for its lifetime; the bind group owns the GPU reference.
+    // Rhombus pipeline bind groups include the frame uniform (binding 0),
+    // the static vertex-table (binding 1), and the color palette (binding 2).
+    // Lifetime holders — the bind group owns the GPU references.
     _vertex_table_buffer: Buffer,
+    _palette_buffer: Buffer,
     _rhombus_bind_group_bg: BindGroup, // reserved for a future BG rhombus pass
     rhombus_bind_group_fg: BindGroup,
 
@@ -214,6 +214,7 @@ pub struct Renderer {
     pub toolpath_path_lines_buffer: Option<LineBatch>, // toolpath as flat lines
     pub toolpath_rhombuses: Option<InstancedBatch>,
     half_height: f32,
+    half_width: f32,
 
     // Public flags driving per-frame draw decisions. Set by the egui side
     // each frame before the callback runs.
@@ -270,6 +271,17 @@ impl Renderer {
                 usage: BufferUsages::UNIFORM,
             })
         );
+
+        // Upload the static color palette (binding 2); never rewritten.
+        let palette_uniforms = buffers::PaletteUniforms { colors: buffers::COLOR_PALETTE };
+        let palette_buffer = device.create_buffer_init(
+            &(wgpu::util::BufferInitDescriptor {
+                label: Some("palette_buffer"),
+                contents: bytemuck::bytes_of(&palette_uniforms),
+                usage: BufferUsages::UNIFORM,
+            })
+        );
+
         let make_rhombus_bind_group = |label: &str, frame_buf: &Buffer| -> BindGroup {
             device.create_bind_group(
                 &(BindGroupDescriptor {
@@ -281,6 +293,7 @@ impl Renderer {
                             binding: 1,
                             resource: vertex_table_buffer.as_entire_binding(),
                         },
+                        BindGroupEntry { binding: 2, resource: palette_buffer.as_entire_binding() },
                     ],
                 })
             )
@@ -352,6 +365,7 @@ impl Renderer {
             frame_uniform_buffer_fg,
             frame_bind_group_fg,
             _vertex_table_buffer: vertex_table_buffer,
+            _palette_buffer: palette_buffer,
             _rhombus_bind_group_bg: rhombus_bind_group_bg,
             rhombus_bind_group_fg,
             line_opaque_pipeline,
@@ -372,6 +386,7 @@ impl Renderer {
             toolpath_path_lines_buffer: None,
             toolpath_rhombuses: None,
             half_height: 0.1,
+            half_width: 0.2,
             clip_z_max: 1e30,
             clip_z_min: -1e30,
             draw_contours: false,
@@ -461,6 +476,7 @@ impl Renderer {
         layer_height: f32
     ) {
         self.half_height = layer_height * 0.5;
+        self.half_width = nozzle_width * 0.5;
         // TODO: Evaluate the trade-off of estimating the count instead of actually doing it (trade memory for CPU)
         let mut line_count = 0 as usize;
         let mut path_line_count = 0 as usize;
@@ -497,25 +513,31 @@ impl Renderer {
                 if pts.len() < 2 {
                     continue;
                 }
-                // TODO: move this color to a const or cli param
-                let color = match mv.kind {
-                    MoveKind::Travel => [1.0, 0.8, 0.2, 0.4],
-                    MoveKind::Perimeter => [0.91, 0.27, 0.38, 1.0],
-                    MoveKind::Infill => [0.27, 0.91, 0.38, 1.0],
-                    MoveKind::SurfaceInfill => [0.9, 0.2, 0.7, 1.0],
+                let (color_id, flags, line_color): (u8, u8, [f32; 4]) = match mv.kind {
+                    MoveKind::Travel => (3, 3, [1.0, 0.8, 0.2, 0.4]),
+                    MoveKind::Perimeter => (0, 0, [0.91, 0.27, 0.38, 1.0]),
+                    MoveKind::Infill => (1, 1, [0.27, 0.91, 0.38, 1.0]),
+                    MoveKind::SurfaceInfill => (2, 2, [0.9, 0.2, 0.7, 1.0]),
                 };
                 match mv.kind {
                     MoveKind::Travel => {
-                        line_verts.push(LineVertex { pos: [pts[0].x, pts[0].y, pl.z], color });
-                        line_verts.push(LineVertex { pos: [pts[1].x, pts[1].y, pl.z], color });
+                        line_verts.push(LineVertex {
+                            pos: [pts[0].x, pts[0].y, pl.z],
+                            color: line_color,
+                        });
+                        line_verts.push(LineVertex {
+                            pos: [pts[1].x, pts[1].y, pl.z],
+                            color: line_color,
+                        });
                     }
                     MoveKind::Infill | MoveKind::SurfaceInfill => {
                         self.push_segment(
                             &pts[0],
                             &pts[1],
                             pl.z,
-                            color,
-                            nozzle_width,
+                            line_color,
+                            color_id,
+                            flags,
                             &mut path_line_verts,
                             &mut rhombus_instances
                         );
@@ -527,8 +549,9 @@ impl Renderer {
                                 &pts[0],
                                 &pts[1],
                                 pl.z,
-                                color,
-                                nozzle_width,
+                                line_color,
+                                color_id,
+                                flags,
                                 &mut path_line_verts,
                                 &mut rhombus_instances
                             );
@@ -541,8 +564,9 @@ impl Renderer {
                                     a,
                                     b,
                                     pl.z,
-                                    color,
-                                    nozzle_width,
+                                    line_color,
+                                    color_id,
+                                    flags,
                                     &mut path_line_verts,
                                     &mut rhombus_instances
                                 );
@@ -612,7 +636,7 @@ impl Renderer {
             clip_z_max: 1e30,
             clip_z_min: -1e30,
             half_height: self.half_height,
-            _pad: 0.0,
+            half_width: self.half_width,
         };
         let fg_uniforms = FrameUniforms {
             mvp: mvp_mat,
@@ -620,7 +644,7 @@ impl Renderer {
             clip_z_max: self.clip_z_max,
             clip_z_min: self.clip_z_min,
             half_height: self.half_height,
-            _pad: 0.0,
+            half_width: self.half_width,
         };
         queue.write_buffer(&self.frame_uniform_buffer_bg, 0, bytemuck::bytes_of(&bg_uniforms));
         queue.write_buffer(&self.frame_uniform_buffer_fg, 0, bytemuck::bytes_of(&fg_uniforms));
@@ -761,13 +785,14 @@ impl Renderer {
         a: &PointXY<f32>,
         b: &PointXY<f32>,
         z: f32,
-        color: [f32; 4],
-        nozzle_width: f32,
+        line_color: [f32; 4],
+        color_id: u8,
+        flags: u8,
         path_line_verts: &mut Vec<LineVertex>,
         rhombus_instances: &mut Vec<RhombusInstance>
     ) {
-        path_line_verts.push(LineVertex { pos: [a.x, a.y, z], color });
-        path_line_verts.push(LineVertex { pos: [b.x, b.y, z], color });
+        path_line_verts.push(LineVertex { pos: [a.x, a.y, z], color: line_color });
+        path_line_verts.push(LineVertex { pos: [b.x, b.y, z], color: line_color });
 
         let dx = b.x - a.x;
         let dy = b.y - a.y;
@@ -779,10 +804,9 @@ impl Renderer {
 
         rhombus_instances.push(RhombusInstance {
             start: [a.x, a.y, z],
-            direction: [dx / length, dy / length],
-            scale: [length, nozzle_width * 0.5], // (length, half_width)
-            color,
-            layer_z: z,
+            dir: [dx / length, dy / length],
+            length,
+            color_flags: (color_id as u32) | ((flags as u32) << 8),
         });
     }
 

@@ -43,7 +43,7 @@ fn parse_args() -> Args {
         stl: get("--stl").unwrap_or_else(|| usage()),
         warmup_secs: get("--warmup")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(3),
+            .unwrap_or(5),
         measure_secs: get("--measure")
             .and_then(|s| s.parse().ok())
             .unwrap_or(10),
@@ -164,11 +164,18 @@ exit(1)
         .ok()?;
     child.stdin.take()?.write_all(src.as_bytes()).ok()?;
     let out = child.wait_with_output().ok()?;
-    if !out.status.success() { return None; }
+    if !out.status.success() {
+        return None;
+    }
 
     let s = String::from_utf8_lossy(&out.stdout);
-    let nums: Vec<i32> = s.split_whitespace().filter_map(|n| n.parse().ok()).collect();
-    if nums.len() != 4 { return None; }
+    let nums: Vec<i32> = s
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    if nums.len() != 4 {
+        return None;
+    }
     Some((nums[0], nums[1], nums[2].unsigned_abs(), nums[3].unsigned_abs()))
 }
 
@@ -251,16 +258,26 @@ fn measure_fps(bounds: (i32, i32, u32, u32), duration: Duration) -> f64 {
     let mut unique = 0u64;
     let start = Instant::now();
 
+    println!("duration: {}", duration.as_millis());
+    println!("before hashing {}", start.elapsed().as_millis());
     while start.elapsed() < duration {
-        if let Ok(img) = screen.capture_area(cap_x, cap_y, cap_w, cap_h) {
-            let h = hash_pixels(img.as_raw());
-            if h != prev_hash {
-                unique += 1;
-                prev_hash = h;
+        let res = screen.capture_area(cap_x, cap_y, cap_w, cap_h);
+        match res {
+            Ok(img) => {
+                let h = hash_pixels(img.as_raw());
+                // println!("hash: {}", h);
+                if h != prev_hash {
+                    unique += 1;
+                    prev_hash = h;
+                }
+            }
+            Err(e) => {
+                println!("Error {}", e);
             }
         }
         thread::sleep(Duration::from_millis(4)); // aim for ~250 Hz capture ceiling
     }
+    println!("after hashing {}", start.elapsed().as_millis());
 
     let _ = orbit_thread.join();
     (unique as f64) / duration.as_secs_f64()

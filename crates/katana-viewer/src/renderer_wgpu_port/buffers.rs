@@ -15,7 +15,7 @@ pub struct FrameUniforms {
     pub clip_z_max: f32,
     pub clip_z_min: f32,
     pub half_height: f32,
-    pub _pad: f32,
+    pub half_width: f32,
 }
 const _: () = assert!(std::mem::size_of::<FrameUniforms>() == 96);
 
@@ -37,16 +37,42 @@ pub struct MeshVertex {
 }
 const _: () = assert!(std::mem::size_of::<MeshVertex>() == 44);
 
+/// Color palette for the rhombus pipeline
+pub const COLOR_PALETTE: [[f32; 4]; 16] = [
+    [0.91, 0.27, 0.38, 1.0], // Perimeter
+    [0.27, 0.91, 0.38, 1.0], // Infill
+    [0.9, 0.2, 0.7, 1.0], // SurfaceInfill
+    [1.0, 0.8, 0.2, 0.4], // Travel
+    [0.0, 0.0, 0.0, 0.0], // Reserved...
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0],
+];
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct PaletteUniforms {
+    pub colors: [[f32; 4]; 16],
+}
+const _: () = assert!(std::mem::size_of::<PaletteUniforms>() == 256);
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct RhombusInstance {
-    pub start: [f32; 3],
-    pub direction: [f32; 2],
-    pub scale: [f32; 2], // (length, half_width)
-    pub color: [f32; 4],
-    pub layer_z: f32,
+    pub start: [f32; 3], // 12B
+    pub dir: [f32; 2], //  8B, unit direction vector
+    pub length: f32, //  4B, segment length; half_width lives in FrameUniforms
+    pub color_flags: u32, //  4B, color_id in bits 0-7, kind flags in bits 8-15
 }
-const _: () = assert!(std::mem::size_of::<RhombusInstance>() == 48);
+const _: () = assert!(std::mem::size_of::<RhombusInstance>() == 28);
 
 pub struct GpuBuffer {
     pub buffer: wgpu::Buffer,
@@ -151,11 +177,11 @@ pub fn upload_rhombus_batch(device: &Device, instances: &[RhombusInstance]) -> I
     }
 
     // Find layer boundaries and compute AABB per layer
-    let mut current_z = instances[0].layer_z;
+    let mut current_z = instances[0].start[2];
     let mut layer_start = 0 as usize;
     for i in 1..=instances.len() {
         let at_end = i == instances.len();
-        let z_changed = !at_end && instances[i].layer_z != current_z;
+        let z_changed = !at_end && instances[i].start[2] != current_z;
         if at_end || z_changed {
             let aabb = compute_layer_aabb(&instances[layer_start..i]);
             layer_entries.push(LayerEntry {
@@ -167,7 +193,7 @@ pub fn upload_rhombus_batch(device: &Device, instances: &[RhombusInstance]) -> I
                 aabb_max_y: aabb.3,
             });
             if !at_end {
-                current_z = instances[i].layer_z;
+                current_z = instances[i].start[2];
                 layer_start = i;
             }
         }
@@ -180,8 +206,10 @@ fn compute_layer_aabb(slice: &[RhombusInstance]) -> (f32, f32, f32, f32) {
     let (mut mx_x, mut mx_y) = (f32::MIN, f32::MIN);
     for inst in slice {
         let [ax, ay, _] = inst.start;
-        let [dx, dy] = inst.direction;
-        let [len, half_w] = inst.scale;
+        let dx = inst.dir[0];
+        let dy = inst.dir[1];
+        let len = inst.length;
+        let half_w = 0.0_f32; // half_width is in FrameUniforms; conservative AABB is fine
         let bx = ax + dx * len;
         let by = ay + dy * len;
         mn_x = mn_x.min(ax.min(bx) - half_w);

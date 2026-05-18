@@ -7,7 +7,7 @@ struct Uniforms {
     clip_z_max:  f32,         //  4 B, offset 80
     clip_z_min:  f32,         //  4 B, offset 84
     half_height: f32,         //  4 B, offset 88
-    _pad:        f32,         //  4 B, offset 92 — round struct size to 96
+    half_width:  f32,         //  4 B, offset 92
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -19,12 +19,16 @@ struct VertexTable {
 }
 @group(0) @binding(1) var<uniform> vertex_table: VertexTable;
 
+struct Palette {
+    colors: array<vec4<f32>, 16>,
+}
+@group(0) @binding(2) var<uniform> palette: Palette;
+
 struct VsIn {
-    @location(0) start:      vec3<f32>,
-    @location(1) direction:  vec2<f32>,
-    @location(2) scale:      vec2<f32>, // (length, half_width)
-    @location(3) color:      vec4<f32>,
-    @location(4) layer_z:    f32,
+    @location(0) start:       vec3<f32>,  // (Float32x3, offset 0)
+    @location(1) dir:         vec2<f32>,  // (Snorm16x2, offset 12; hardware divides i16 by 32767)
+    @location(2) length:      f32,        // (Float32, offset 16)
+    @location(3) color_flags: u32,        // (Uint32, offset 20; color_id in bits 0-7)
 }
 
 struct VsOut {
@@ -36,19 +40,20 @@ struct VsOut {
 
 @vertex fn vs_main(in: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
     var out: VsOut;
-    let seg_len = in.scale.x;
-    let half_w = in.scale.y;
-    let half_h = u.half_height;
 
-    let seg_dir = vec3(in.direction, 0.0);
-    let perp = vec3(-in.direction.y, in.direction.x, 0.0);
+    let color_id = in.color_flags & 0xFFu;
+
+    // ----- begin geometry -----
+    let half_h  = u.half_height;
+    let half_w  = u.half_width;
+    let seg_dir = vec3(in.dir, 0.0);
+    let perp    = vec3(-seg_dir.y, seg_dir.x, 0.0);
+    let seg_len = in.length;
     let up = vec3(0.0, 0.0, 1.0);
 
-    // 4 cross-section offsets indexed by cross_idx: R=0, T=1, L=2, B=3
     let cross_offsets = array<vec3<f32>, 4>(
         perp * half_w, up * half_h, -(perp * half_w), -(up * half_h));
 
-    // 6 normals indexed by norm_idx: N_RT=0, N_TL=1, N_LB=2, N_BR=3, N_NEG=4, N_POS=5
     let normals = array<vec3<f32>, 6>(
         normalize(perp + up), normalize(-perp + up),
         normalize(-perp - up), normalize(perp - up),
@@ -66,8 +71,9 @@ struct VsOut {
     let world_pos = in.start + along_off + cross_off;
     out.clip_pos = u.mvp * vec4(world_pos, 1.0);
     out.normal = norm;
-    out.color = in.color;
-    out.layer_z = in.layer_z;
+    out.color  = palette.colors[color_id];
+    out.layer_z = in.start.z;
+    // ----- end geometry -----
 
     return out;
 }

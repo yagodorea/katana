@@ -41,6 +41,7 @@ pub fn build_frame_bgl(device: &Device) -> BindGroupLayout {
 }
 
 /// Bind group layout for the rhombus pipeline.
+/// binding 0: FrameUniforms (VS+FS), binding 1: VertexTable (VS), binding 2: Palette (VS).
 pub fn build_rhombus_bgl(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(
         &(BindGroupLayoutDescriptor {
@@ -66,6 +67,16 @@ pub fn build_rhombus_bgl(device: &Device) -> BindGroupLayout {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::VERTEX,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         })
     )
@@ -74,7 +85,11 @@ pub fn build_rhombus_bgl(device: &Device) -> BindGroupLayout {
 fn color_target_for(format: TextureFormat, blend: bool) -> ColorTargetState {
     ColorTargetState {
         format,
-        blend: if blend { Some(BlendState::ALPHA_BLENDING) } else { None },
+        blend: if blend {
+            Some(BlendState::ALPHA_BLENDING)
+        } else {
+            None
+        },
         write_mask: ColorWrites::ALL,
     }
 }
@@ -94,7 +109,7 @@ fn build_line_pipeline_inner(
     frame_bgl: &BindGroupLayout,
     color_format: TextureFormat,
     blend: bool,
-    depth_write: bool,
+    depth_write: bool
 ) -> RenderPipeline {
     // Load shader module
     let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -153,10 +168,18 @@ fn build_line_pipeline_inner(
     )
 }
 
-pub fn build_line_opaque_pipeline(device: &Device, frame_bgl: &BindGroupLayout, color_format: TextureFormat) -> RenderPipeline {
+pub fn build_line_opaque_pipeline(
+    device: &Device,
+    frame_bgl: &BindGroupLayout,
+    color_format: TextureFormat
+) -> RenderPipeline {
     build_line_pipeline_inner(device, frame_bgl, color_format, false, true)
 }
-pub fn build_line_transparent_pipeline(device: &Device, frame_bgl: &BindGroupLayout, color_format: TextureFormat) -> RenderPipeline {
+pub fn build_line_transparent_pipeline(
+    device: &Device,
+    frame_bgl: &BindGroupLayout,
+    color_format: TextureFormat
+) -> RenderPipeline {
     build_line_pipeline_inner(device, frame_bgl, color_format, true, false)
 }
 
@@ -165,7 +188,7 @@ fn build_mesh_pipeline_inner(
     frame_bgl: &BindGroupLayout,
     color_format: TextureFormat,
     blend: bool,
-    depth_write: bool,
+    depth_write: bool
 ) -> RenderPipeline {
     // Load shader module
     let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -225,10 +248,18 @@ fn build_mesh_pipeline_inner(
     )
 }
 
-pub fn build_mesh_opaque_pipeline(device: &Device, frame_bgl: &BindGroupLayout, color_format: TextureFormat) -> RenderPipeline {
+pub fn build_mesh_opaque_pipeline(
+    device: &Device,
+    frame_bgl: &BindGroupLayout,
+    color_format: TextureFormat
+) -> RenderPipeline {
     build_mesh_pipeline_inner(device, frame_bgl, color_format, false, true)
 }
-pub fn build_mesh_transparent_pipeline(device: &Device, frame_bgl: &BindGroupLayout, color_format: TextureFormat) -> RenderPipeline {
+pub fn build_mesh_transparent_pipeline(
+    device: &Device,
+    frame_bgl: &BindGroupLayout,
+    color_format: TextureFormat
+) -> RenderPipeline {
     build_mesh_pipeline_inner(device, frame_bgl, color_format, true, false)
 }
 
@@ -237,7 +268,7 @@ fn build_rhombus_pipeline_inner(
     rhombus_bgl: &BindGroupLayout,
     color_format: TextureFormat,
     blend: bool,
-    depth_write: bool,
+    depth_write: bool
 ) -> RenderPipeline {
     // Load shader module
     let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -254,9 +285,9 @@ fn build_rhombus_pipeline_inner(
         })
     );
 
-    // Declare vertex buffer layout for RhombusInstance
-    const ATTRS: [VertexAttribute; 5] =
-        vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x2, 3 => Float32x4, 4 => Float32];
+    // Declare vertex buffer layout for RhombusInstance (packed: 24 B stride)
+    const ATTRS: [VertexAttribute; 4] =
+        vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32, 3 => Uint32];
     let vbuf_layout = VertexBufferLayout {
         array_stride: size_of::<RhombusInstance>() as BufferAddress,
         step_mode: VertexStepMode::Instance, // per-instance
@@ -297,10 +328,18 @@ fn build_rhombus_pipeline_inner(
     )
 }
 
-pub fn build_rhombus_opaque_pipeline(device: &Device, rhombus_bgl: &BindGroupLayout, color_format: TextureFormat) -> RenderPipeline {
+pub fn build_rhombus_opaque_pipeline(
+    device: &Device,
+    rhombus_bgl: &BindGroupLayout,
+    color_format: TextureFormat
+) -> RenderPipeline {
     build_rhombus_pipeline_inner(device, rhombus_bgl, color_format, false, true)
 }
-pub fn build_rhombus_transparent_pipeline(device: &Device, rhombus_bgl: &BindGroupLayout, color_format: TextureFormat) -> RenderPipeline {
+pub fn build_rhombus_transparent_pipeline(
+    device: &Device,
+    rhombus_bgl: &BindGroupLayout,
+    color_format: TextureFormat
+) -> RenderPipeline {
     build_rhombus_pipeline_inner(device, rhombus_bgl, color_format, true, false)
 }
 
