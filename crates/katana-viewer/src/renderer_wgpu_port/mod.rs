@@ -26,38 +26,49 @@ use wgpu::util::DeviceExt;
 // into them during `prepare`, then blit the color onto egui's pass during
 // `paint`. This is the wgpu equivalent of the GL renderer's FBO.
 
-/// Offscreen color + depth, sized to the central panel rect.
+/// Offscreen antialiasing color + depth + single-sample resolve target, sized to the panel rect.
+///
+/// All 3D passes render into the MSAA textures. After the final FG pass resolves
+/// into `resolve_color_view`, the blit pipeline copies that single-sample view
+/// onto egui's surface.
 pub struct OffscreenTargets {
-    pub color_view: TextureView,
-    pub depth_view: TextureView,
+    // 4× MSAA render targets
+    pub msaa_color_view: TextureView,
+    pub msaa_depth_view: TextureView,
+    // Single-sample resolve target (sampled by the blit pipeline)
+    pub resolve_color_view: TextureView,
     pub color_format: TextureFormat,
     pub width: u32,
     pub height: u32,
-    // Textures are kept alive so the views remain valid; not used directly outside of resize
-    _color_texture: Texture,
-    _depth_texture: Texture,
+    _msaa_color: Texture,
+    _msaa_depth: Texture,
+    _resolve_color: Texture,
 }
 
 impl OffscreenTargets {
     pub fn new(device: &Device, color_format: TextureFormat, width: u32, height: u32) -> Self {
-        let color_texture = create_color_texture(device, color_format, width, height);
-        let depth_texture = create_depth_texture(device, width, height);
-        let color_view = color_texture.create_view(&TextureViewDescriptor::default());
-        let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
-        Self {
-            color_view,
-            depth_view,
+        let msaa_color = create_color_texture(
+            device,
             color_format,
             width,
             height,
-            _color_texture: color_texture,
-            _depth_texture: depth_texture,
+            pipelines::MSAA_SAMPLES
+        );
+        let msaa_depth = create_depth_texture(device, width, height, pipelines::MSAA_SAMPLES);
+        let resolve_color = create_color_texture(device, color_format, width, height, 1);
+        Self {
+            msaa_color_view: msaa_color.create_view(&TextureViewDescriptor::default()),
+            msaa_depth_view: msaa_depth.create_view(&TextureViewDescriptor::default()),
+            resolve_color_view: resolve_color.create_view(&TextureViewDescriptor::default()),
+            color_format,
+            width,
+            height,
+            _msaa_color: msaa_color,
+            _msaa_depth: msaa_depth,
+            _resolve_color: resolve_color,
         }
     }
 
-    /// Recreate textures if dimensions changed. Returns true if the textures
-    /// were actually recreated (so callers can invalidate dependent resources
-    /// like sampling bind groups). No-op + returns false otherwise.
     pub fn resize(&mut self, device: &Device, width: u32, height: u32) -> bool {
         if self.width == width && self.height == height {
             return false;
@@ -67,36 +78,39 @@ impl OffscreenTargets {
     }
 }
 
-fn create_color_texture(device: &Device, format: TextureFormat, w: u32, h: u32) -> Texture {
+fn create_color_texture(
+    device: &Device,
+    format: TextureFormat,
+    w: u32,
+    h: u32,
+    sample_count: u32
+) -> Texture {
     device.create_texture(
         &(TextureDescriptor {
             label: Some("offscreen_color"),
-            size: Extent3d {
-                width: w.max(1), // never create a 0×0 texture
-                height: h.max(1),
-                depth_or_array_layers: 1,
-            },
+            size: Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
             mip_level_count: 1,
-            sample_count: 1, // no MSAA
+            sample_count,
             dimension: TextureDimension::D2,
             format,
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            // single-sample resolve target needs TEXTURE_BINDING for the blit pipeline
+            usage: if sample_count == 1 {
+                TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING
+            } else {
+                TextureUsages::RENDER_ATTACHMENT
+            },
             view_formats: &[],
         })
     )
 }
 
-fn create_depth_texture(device: &Device, w: u32, h: u32) -> Texture {
+fn create_depth_texture(device: &Device, w: u32, h: u32, sample_count: u32) -> Texture {
     device.create_texture(
         &(TextureDescriptor {
             label: Some("offscreen_depth"),
-            size: Extent3d {
-                width: w.max(1),
-                height: h.max(1),
-                depth_or_array_layers: 1,
-            },
+            size: Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count,
             dimension: TextureDimension::D2,
             format: pipelines::DEPTH_FORMAT,
             usage: TextureUsages::RENDER_ATTACHMENT,
@@ -112,53 +126,6 @@ fn create_depth_texture(device: &Device, w: u32, h: u32) -> Texture {
 use std::mem::size_of;
 
 use buffers::{ FrameUniforms, GpuBuffer, InstancedBatch, LineBatch };
-
-// ---------------------------------------------------------------------------
-// Rhombus vertex table — compile-time constant, 144 bytes, written once.
-// ---------------------------------------------------------------------------
-//
-// Each of 36 vertices is packed into one u32: cross_idx (bits 0-1),
-// along_f (bit 2), norm_idx (bits 3-5).
-//   cross_idx - which of 4 cross-section offsets {R, T, L, B}
-//   along_f   - 0 = start of segment, 1 = end of segment
-//   norm_idx  - which of 6 normals {N_RT, N_TL, N_LB, N_BR, N_NEG, N_POS}
-
-const R: u32 = 0;
-const T: u32 = 1;
-const L: u32 = 2;
-const B: u32 = 3;
-const N_RT: u32 = 0;
-const N_TL: u32 = 1;
-const N_LB: u32 = 2;
-const N_BR: u32 = 3;
-const N_NEG: u32 = 4;
-const N_POS: u32 = 5;
-
-const fn pack(cross: u32, along: u32, norm: u32) -> u32 {
-    cross | (along << 2) | (norm << 3)
-}
-
-#[rustfmt::skip]
-const VERTEX_TABLE: [u32; 36] = [
-    // Side face right-top (triangles 0-1)
-    pack(R, 0, N_RT), pack(T, 0, N_RT), pack(R, 1, N_RT),
-    pack(T, 0, N_RT), pack(T, 1, N_RT), pack(R, 1, N_RT),
-    // Side face top-left (triangles 2-3)
-    pack(T, 0, N_TL), pack(L, 0, N_TL), pack(T, 1, N_TL),
-    pack(L, 0, N_TL), pack(L, 1, N_TL), pack(T, 1, N_TL),
-    // Side face left-bottom (triangles 4-5)
-    pack(L, 0, N_LB), pack(B, 0, N_LB), pack(L, 1, N_LB),
-    pack(B, 0, N_LB), pack(B, 1, N_LB), pack(L, 1, N_LB),
-    // Side face bottom-right (triangles 6-7)
-    pack(B, 0, N_BR), pack(R, 0, N_BR), pack(B, 1, N_BR),
-    pack(R, 0, N_BR), pack(R, 1, N_BR), pack(B, 1, N_BR),
-    // Start cap (triangles 8-9), normal = -seg_dir
-    pack(R, 0, N_NEG), pack(T, 0, N_NEG), pack(L, 0, N_NEG),
-    pack(R, 0, N_NEG), pack(L, 0, N_NEG), pack(B, 0, N_NEG),
-    // End cap (triangles 10-11), normal = +seg_dir
-    pack(R, 1, N_POS), pack(L, 1, N_POS), pack(T, 1, N_POS),
-    pack(R, 1, N_POS), pack(B, 1, N_POS), pack(L, 1, N_POS),
-];
 
 use crate::renderer_wgpu_port::buffers::{ LineVertex, MeshVertex, RhombusInstance };
 
@@ -176,21 +143,18 @@ pub struct Renderer {
     frame_uniform_buffer_fg: Buffer,
     frame_bind_group_fg: BindGroup,
 
-    // Rhombus pipeline bind groups include the frame uniform (binding 0),
-    // the static vertex-table (binding 1), and the color palette (binding 2).
-    // Lifetime holders — the bind group owns the GPU references.
-    _vertex_table_buffer: Buffer,
+    // Impostor pipeline bind groups: binding 0 = FrameUniforms, binding 1 = Palette.
     _palette_buffer: Buffer,
-    _rhombus_bind_group_bg: BindGroup, // reserved for a future BG rhombus pass
-    rhombus_bind_group_fg: BindGroup,
+    _impostor_bind_group_bg: BindGroup,
+    impostor_bind_group_fg: BindGroup,
 
     // Six pipelines (opaque + transparent variant per geometry type), built once at startup.
     line_opaque_pipeline: RenderPipeline,
     line_transparent_pipeline: RenderPipeline,
     mesh_opaque_pipeline: RenderPipeline,
-    _mesh_transparent_pipeline: RenderPipeline, // unused today, kept for parity
-    rhombus_opaque_pipeline: RenderPipeline,
-    _rhombus_transparent_pipeline: RenderPipeline, // unused today, kept for parity
+    _mesh_transparent_pipeline: RenderPipeline,
+    impostor_opaque_pipeline: RenderPipeline,
+    _impostor_transparent_pipeline: RenderPipeline,
 
     // 4th pipeline + its bind group layout + sampler: copies the offscreen
     // color texture onto egui's pass in `paint`. Sampler is static; bind
@@ -235,9 +199,8 @@ impl Renderer {
         height: u32
     ) -> Self {
         let frame_bgl = pipelines::build_frame_bgl(&device);
-        let rhombus_bgl = pipelines::build_rhombus_bgl(&device);
+        let impostor_bgl = pipelines::build_impostor_bgl(&device);
 
-        // Small factories for uniform buffer and bind group
         let make_uniform_buffer = |label: &str| -> Buffer {
             device.create_buffer(
                 &(BufferDescriptor {
@@ -262,17 +225,7 @@ impl Renderer {
         let frame_bind_group_bg = make_bind_group("frame_bind_group_bg", &frame_uniform_buffer_bg);
         let frame_bind_group_fg = make_bind_group("frame_bind_group_fg", &frame_uniform_buffer_fg);
 
-        // Upload the static 36-entry vertex table once; never rewritten.
-        let table_bytes: &[u8] = bytemuck::cast_slice(&VERTEX_TABLE);
-        let vertex_table_buffer = device.create_buffer_init(
-            &(wgpu::util::BufferInitDescriptor {
-                label: Some("vertex_table"),
-                contents: table_bytes,
-                usage: BufferUsages::UNIFORM,
-            })
-        );
-
-        // Upload the static color palette (binding 2); never rewritten.
+        // Color palette — binding 1 in the impostor BGL.
         let palette_uniforms = buffers::PaletteUniforms { colors: buffers::COLOR_PALETTE };
         let palette_buffer = device.create_buffer_init(
             &(wgpu::util::BufferInitDescriptor {
@@ -282,28 +235,24 @@ impl Renderer {
             })
         );
 
-        let make_rhombus_bind_group = |label: &str, frame_buf: &Buffer| -> BindGroup {
+        let make_impostor_bind_group = |label: &str, frame_buf: &Buffer| -> BindGroup {
             device.create_bind_group(
                 &(BindGroupDescriptor {
                     label: Some(label),
-                    layout: &rhombus_bgl,
+                    layout: &impostor_bgl,
                     entries: &[
                         BindGroupEntry { binding: 0, resource: frame_buf.as_entire_binding() },
-                        BindGroupEntry {
-                            binding: 1,
-                            resource: vertex_table_buffer.as_entire_binding(),
-                        },
-                        BindGroupEntry { binding: 2, resource: palette_buffer.as_entire_binding() },
+                        BindGroupEntry { binding: 1, resource: palette_buffer.as_entire_binding() },
                     ],
                 })
             )
         };
-        let rhombus_bind_group_bg = make_rhombus_bind_group(
-            "rhombus_bind_group_bg",
+        let impostor_bind_group_bg = make_impostor_bind_group(
+            "impostor_bind_group_bg",
             &frame_uniform_buffer_bg
         );
-        let rhombus_bind_group_fg = make_rhombus_bind_group(
-            "rhombus_bind_group_fg",
+        let impostor_bind_group_fg = make_impostor_bind_group(
+            "impostor_bind_group_fg",
             &frame_uniform_buffer_fg
         );
 
@@ -327,14 +276,14 @@ impl Renderer {
             &frame_bgl,
             color_format
         );
-        let rhombus_opaque_pipeline = pipelines::build_rhombus_opaque_pipeline(
+        let impostor_opaque_pipeline = pipelines::build_impostor_opaque_pipeline(
             &device,
-            &rhombus_bgl,
+            &impostor_bgl,
             color_format
         );
-        let rhombus_transparent_pipeline = pipelines::build_rhombus_transparent_pipeline(
+        let impostor_transparent_pipeline = pipelines::build_impostor_transparent_pipeline(
             &device,
-            &rhombus_bgl,
+            &impostor_bgl,
             color_format
         );
 
@@ -354,7 +303,7 @@ impl Renderer {
         let blit_bind_group = build_blit_bind_group(
             &device,
             &blit_bgl,
-            &offscreen.color_view,
+            &offscreen.resolve_color_view,
             &blit_sampler
         );
 
@@ -364,16 +313,15 @@ impl Renderer {
             frame_bind_group_bg,
             frame_uniform_buffer_fg,
             frame_bind_group_fg,
-            _vertex_table_buffer: vertex_table_buffer,
             _palette_buffer: palette_buffer,
-            _rhombus_bind_group_bg: rhombus_bind_group_bg,
-            rhombus_bind_group_fg,
+            _impostor_bind_group_bg: impostor_bind_group_bg,
+            impostor_bind_group_fg,
             line_opaque_pipeline,
             line_transparent_pipeline,
             mesh_opaque_pipeline,
             _mesh_transparent_pipeline: mesh_transparent_pipeline,
-            rhombus_opaque_pipeline,
-            _rhombus_transparent_pipeline: rhombus_transparent_pipeline,
+            impostor_opaque_pipeline,
+            _impostor_transparent_pipeline: impostor_transparent_pipeline,
             blit_pipeline,
             blit_bgl,
             blit_sampler,
@@ -609,7 +557,7 @@ impl Renderer {
             self.blit_bind_group = build_blit_bind_group(
                 device,
                 &self.blit_bgl,
-                &self.offscreen.color_view,
+                &self.offscreen.resolve_color_view,
                 &self.blit_sampler
             );
         }
@@ -629,6 +577,8 @@ impl Renderer {
             [mvp[12], mvp[13], mvp[14] * 0.5 + 0.5 * mvp[15], mvp[15]],
         ];
         let light_dir4 = [light_dir[0], light_dir[1], light_dir[2], 0.0];
+        // For this headlight camera, cam_forward equals light_dir (headlight mounted on camera).
+        let cam_forward4 = light_dir4;
 
         let bg_uniforms = FrameUniforms {
             mvp: mvp_mat,
@@ -637,6 +587,7 @@ impl Renderer {
             clip_z_min: -1e30,
             half_height: self.half_height,
             half_width: self.half_width,
+            cam_forward: cam_forward4,
         };
         let fg_uniforms = FrameUniforms {
             mvp: mvp_mat,
@@ -645,6 +596,7 @@ impl Renderer {
             clip_z_min: self.clip_z_min,
             half_height: self.half_height,
             half_width: self.half_width,
+            cam_forward: cam_forward4,
         };
         queue.write_buffer(&self.frame_uniform_buffer_bg, 0, bytemuck::bytes_of(&bg_uniforms));
         queue.write_buffer(&self.frame_uniform_buffer_fg, 0, bytemuck::bytes_of(&fg_uniforms));
@@ -656,7 +608,7 @@ impl Renderer {
                     label: Some("bg_pass"),
                     color_attachments: &[
                         Some(RenderPassColorAttachment {
-                            view: &self.offscreen.color_view,
+                            view: &self.offscreen.msaa_color_view,
                             resolve_target: None,
                             ops: Operations {
                                 // TODO: move this color to a const/config, etc
@@ -666,7 +618,7 @@ impl Renderer {
                         }),
                     ],
                     depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                        view: &self.offscreen.depth_view,
+                        view: &self.offscreen.msaa_depth_view,
                         depth_ops: Some(Operations {
                             load: LoadOp::Clear(1.0),
                             store: StoreOp::Store,
@@ -704,13 +656,13 @@ impl Renderer {
                     label: Some("fg_pass"),
                     color_attachments: &[
                         Some(RenderPassColorAttachment {
-                            view: &self.offscreen.color_view,
-                            resolve_target: None,
-                            ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
+                            view: &self.offscreen.msaa_color_view,
+                            resolve_target: Some(&self.offscreen.resolve_color_view),
+                            ops: Operations { load: LoadOp::Load, store: StoreOp::Discard },
                         }),
                     ],
                     depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                        view: &self.offscreen.depth_view,
+                        view: &self.offscreen.msaa_depth_view,
                         depth_ops: Some(Operations {
                             load: LoadOp::Clear(1.0),
                             store: StoreOp::Store,
@@ -736,8 +688,8 @@ impl Renderer {
                     if let Some(rhombuses) = &self.toolpath_rhombuses {
                         draw_rhombus_batch(
                             &mut pass,
-                            &self.rhombus_opaque_pipeline,
-                            &self.rhombus_bind_group_fg,
+                            &self.impostor_opaque_pipeline,
+                            &self.impostor_bind_group_fg,
                             rhombuses,
                             self.clip_z_max,
                             self.clip_z_min,
@@ -756,7 +708,7 @@ impl Renderer {
                 // Conditionally draw travel moves (draw last because they're translucent)
                 if self.show_travel_moves {
                     if self.show_filaments {
-                        // rhombus_bind_group_fg (2 bindings) was active; line pipeline uses
+                        // impostor_bind_group_fg (2 bindings) was active; line pipeline uses
                         // frame_bgl (1 binding) — must rebind the compatible frame bind group.
                         pass.set_pipeline(&self.line_transparent_pipeline);
                         pass.set_bind_group(0, &self.frame_bind_group_fg, &[]);
@@ -910,7 +862,7 @@ fn draw_rhombus_batch(
         if outside {
             // Flush the in-progress run, if any.
             if let Some(rf) = run_first.take() {
-                pass.draw(0..36, rf..rf + run_total);
+                pass.draw(0..6, rf..rf + run_total);
                 run_total = 0;
             }
         } else {
@@ -924,7 +876,7 @@ fn draw_rhombus_batch(
     }
     // Flush any trailing run.
     if let Some(rf) = run_first {
-        pass.draw(0..36, rf..rf + run_total);
+        pass.draw(0..6, rf..rf + run_total);
     }
 }
 

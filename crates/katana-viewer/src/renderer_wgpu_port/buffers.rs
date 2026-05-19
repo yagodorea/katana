@@ -10,14 +10,15 @@ use wgpu::{ BufferUsages, Device, util::DeviceExt };
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct FrameUniforms {
-    pub mvp: [[f32; 4]; 4],
-    pub light_dir: [f32; 4],
-    pub clip_z_max: f32,
-    pub clip_z_min: f32,
-    pub half_height: f32,
-    pub half_width: f32,
+    pub mvp: [[f32; 4]; 4], // 64 B, offset   0
+    pub light_dir: [f32; 4], // 16 B, offset  64 (.xyz used; .w unused)
+    pub clip_z_max: f32, //  4 B, offset  80
+    pub clip_z_min: f32, //  4 B, offset  84
+    pub half_height: f32, //  4 B, offset  88
+    pub half_width: f32, //  4 B, offset  92
+    pub cam_forward: [f32; 4], // 16 B, offset  96 (.xyz = ortho ray dir; .w unused)
 }
-const _: () = assert!(std::mem::size_of::<FrameUniforms>() == 96);
+const _: () = assert!(std::mem::size_of::<FrameUniforms>() == 112);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

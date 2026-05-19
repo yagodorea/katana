@@ -18,6 +18,13 @@ use super::buffers::{ LineVertex, MeshVertex, RhombusInstance };
 /// Depth buffer format
 pub const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth24Plus;
 
+/// MSAA sample count for all 3D pipelines.
+pub const MSAA_SAMPLES: u32 = 4;
+
+fn msaa_state() -> MultisampleState {
+    MultisampleState { count: MSAA_SAMPLES, mask: !0, alpha_to_coverage_enabled: false }
+}
+
 /// Bind group layout shared by line + mesh pipelines.
 /// Binding 0 = `FrameUniforms` uniform buffer, visible to VS + FS.
 pub fn build_frame_bgl(device: &Device) -> BindGroupLayout {
@@ -40,12 +47,12 @@ pub fn build_frame_bgl(device: &Device) -> BindGroupLayout {
     )
 }
 
-/// Bind group layout for the rhombus pipeline.
-/// binding 0: FrameUniforms (VS+FS), binding 1: VertexTable (VS), binding 2: Palette (VS).
-pub fn build_rhombus_bgl(device: &Device) -> BindGroupLayout {
+/// Bind group layout for the impostor pipeline.
+/// binding 0: FrameUniforms (VS+FS), binding 1: Palette (VS+FS).
+pub fn build_impostor_bgl(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(
         &(BindGroupLayoutDescriptor {
-            label: Some("rhombus_bgl"),
+            label: Some("impostor_bgl"),
             entries: &[
                 BindGroupLayoutEntry {
                     binding: 0,
@@ -59,17 +66,7 @@ pub fn build_rhombus_bgl(device: &Device) -> BindGroupLayout {
                 },
                 BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: ShaderStages::VERTEX,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::VERTEX,
+                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -161,7 +158,7 @@ fn build_line_pipeline_inner(
                 conservative: false,
             },
             depth_stencil: Some(depth_state_for(depth_write)),
-            multisample: MultisampleState::default(),
+            multisample: msaa_state(),
             multiview: None,
             cache: None,
         })
@@ -241,7 +238,7 @@ fn build_mesh_pipeline_inner(
                 conservative: false,
             },
             depth_stencil: Some(depth_state_for(depth_write)),
-            multisample: MultisampleState::default(),
+            multisample: msaa_state(),
             multiview: None,
             cache: None,
         })
@@ -263,41 +260,38 @@ pub fn build_mesh_transparent_pipeline(
     build_mesh_pipeline_inner(device, frame_bgl, color_format, true, false)
 }
 
-fn build_rhombus_pipeline_inner(
+fn build_impostor_pipeline_inner(
     device: &Device,
-    rhombus_bgl: &BindGroupLayout,
+    impostor_bgl: &BindGroupLayout,
     color_format: TextureFormat,
     blend: bool,
     depth_write: bool
 ) -> RenderPipeline {
-    // Load shader module
     let shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("rhombus_shader"),
-        source: ShaderSource::Wgsl(include_str!("shaders/rhombus.wgsl").into()),
+        label: Some("impostor_shader"),
+        source: ShaderSource::Wgsl(include_str!("shaders/rhombus_impostor.wgsl").into()),
     });
 
-    // Build pipeline layout referencing rhombus_bgl (frame uniform + vertex table)
     let layout = device.create_pipeline_layout(
         &(PipelineLayoutDescriptor {
-            label: Some("rhombus_pipeline_layout"),
-            bind_group_layouts: &[rhombus_bgl],
+            label: Some("impostor_pipeline_layout"),
+            bind_group_layouts: &[impostor_bgl],
             push_constant_ranges: &[],
         })
     );
 
-    // Declare vertex buffer layout for RhombusInstance (packed: 24 B stride)
+    // Per-instance buffer: RhombusInstance (28 B stride)
     const ATTRS: [VertexAttribute; 4] =
         vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32, 3 => Uint32];
     let vbuf_layout = VertexBufferLayout {
         array_stride: size_of::<RhombusInstance>() as BufferAddress,
-        step_mode: VertexStepMode::Instance, // per-instance
+        step_mode: VertexStepMode::Instance,
         attributes: &ATTRS,
     };
 
-    // Build the render pipeline
     device.create_render_pipeline(
         &(RenderPipelineDescriptor {
-            label: Some("rhombus_pipeline"),
+            label: Some("impostor_pipeline"),
             layout: Some(&layout),
             vertex: VertexState {
                 module: &shader,
@@ -321,26 +315,26 @@ fn build_rhombus_pipeline_inner(
                 conservative: false,
             },
             depth_stencil: Some(depth_state_for(depth_write)),
-            multisample: MultisampleState::default(),
+            multisample: msaa_state(),
             multiview: None,
             cache: None,
         })
     )
 }
 
-pub fn build_rhombus_opaque_pipeline(
+pub fn build_impostor_opaque_pipeline(
     device: &Device,
-    rhombus_bgl: &BindGroupLayout,
+    impostor_bgl: &BindGroupLayout,
     color_format: TextureFormat
 ) -> RenderPipeline {
-    build_rhombus_pipeline_inner(device, rhombus_bgl, color_format, false, true)
+    build_impostor_pipeline_inner(device, impostor_bgl, color_format, false, true)
 }
-pub fn build_rhombus_transparent_pipeline(
+pub fn build_impostor_transparent_pipeline(
     device: &Device,
-    rhombus_bgl: &BindGroupLayout,
+    impostor_bgl: &BindGroupLayout,
     color_format: TextureFormat
 ) -> RenderPipeline {
-    build_rhombus_pipeline_inner(device, rhombus_bgl, color_format, true, false)
+    build_impostor_pipeline_inner(device, impostor_bgl, color_format, true, false)
 }
 
 // ---------------------------------------------------------------------------
