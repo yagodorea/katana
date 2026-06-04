@@ -13,7 +13,7 @@ mod pipelines;
 
 pub use camera::{ build_mvp, headlight_dir };
 
-use katana_core::planner::{ MoveKind, PointXY };
+use katana_core::planner::MoveKind;
 use wgpu::*;
 use wgpu::util::DeviceExt;
 
@@ -162,6 +162,9 @@ const VERTEX_TABLE: [u32; 36] = [
 
 use crate::renderer_wgpu_port::buffers::{ LineVertex, MeshVertex, RhombusInstance };
 
+/// Brightness multiplier applied to layers *below* the one being scrubbed
+const SCRUB_DIM: f32 = 0.25;
+
 pub struct Renderer {
     // wgpu's `Device` is cheap to clone (internal Arc); kept here so `paint`
     // can build a transient bind group without threading device through.
@@ -224,6 +227,13 @@ pub struct Renderer {
     pub draw_toolpaths: bool,
     pub show_travel_moves: bool,
     pub show_filaments: bool,
+
+    // Intra-layer scrubber, normalized [0, 1]
+    pub scrub_fraction: f32,
+    // When true, layers below the scrubbed top layer are dimmed to highlight it.
+    pub is_scrubbing: bool,
+    // World z of the layer currently being scrubbed
+    pub scrub_top_z: f32,
 }
 
 impl Renderer {
@@ -393,6 +403,9 @@ impl Renderer {
             draw_toolpaths: true,
             show_travel_moves: true,
             show_filaments: true,
+            scrub_fraction: 1.0,
+            is_scrubbing: false,
+            scrub_top_z: 0.0,
         }
     }
 
@@ -477,115 +490,131 @@ impl Renderer {
     ) {
         self.half_height = layer_height * 0.5;
         self.half_width = nozzle_width * 0.5;
-        // TODO: Evaluate the trade-off of estimating the count instead of actually doing it (trade memory for CPU)
-        let mut line_count = 0 as usize;
-        let mut path_line_count = 0 as usize;
-        // First pass, count verts
-        for pl in planned_layers {
-            for mv in &pl.moves {
-                let pts = mv.points.len();
-                if pts < 2 {
-                    continue;
-                }
-                match mv.kind {
-                    MoveKind::Travel => {
-                        line_count += 2;
-                    }
-                    MoveKind::Perimeter if pts >= 3 => {
-                        path_line_count += pts * 2;
-                    }
-                    MoveKind::Perimeter | MoveKind::Infill | MoveKind::SurfaceInfill => {
-                        path_line_count += 2;
-                    }
-                }
-            }
-        }
-        let mut line_verts: Vec<buffers::LineVertex> = Vec::with_capacity(line_count);
-        let mut path_line_verts: Vec<buffers::LineVertex> = Vec::with_capacity(path_line_count);
-        let mut rhombus_instances: Vec<buffers::RhombusInstance> = Vec::with_capacity(
-            path_line_count / 2
-        );
 
-        // Second pass, push verts
+        // Three concatenated buffers, each built in print order across all
+        // layers, plus the parallel cumulative-time arrays that drive scrubbing.
+        let mut travel_verts: Vec<LineVertex> = Vec::new();
+        let mut travel_seg_times: Vec<f32> = Vec::new();
+        let mut travel_entries: Vec<buffers::LineLayerEntry> = Vec::new();
+
+        let mut path_verts: Vec<LineVertex> = Vec::new();
+        let mut path_seg_times: Vec<f32> = Vec::new();
+        let mut path_entries: Vec<buffers::LineLayerEntry> = Vec::new();
+
+        let mut rhombus_instances: Vec<RhombusInstance> = Vec::new();
+        let mut rhombus_times: Vec<f32> = Vec::new();
+        let mut rhombus_entries: Vec<buffers::LayerEntry> = Vec::new();
+
         for pl in planned_layers {
+            // One timeline per layer, accumulating travel + extrusion time in
+            // the order the nozzle actually prints them.
+            let mut elapsed_s = 0.0f32;
+            let travel_v0 = travel_verts.len();
+            let path_v0 = path_verts.len();
+            let rho0 = rhombus_instances.len();
+
             for mv in &pl.moves {
                 let pts = &mv.points;
                 if pts.len() < 2 {
                     continue;
                 }
+                let speed = mv.speed.max(1e-3); // guard against div-by-zero
                 let (color_id, flags, line_color): (u8, u8, [f32; 4]) = match mv.kind {
                     MoveKind::Travel => (3, 3, [1.0, 0.8, 0.2, 0.4]),
                     MoveKind::Perimeter => (0, 0, [0.91, 0.27, 0.38, 1.0]),
                     MoveKind::Infill => (1, 1, [0.27, 0.91, 0.38, 1.0]),
                     MoveKind::SurfaceInfill => (2, 2, [0.9, 0.2, 0.7, 1.0]),
                 };
-                match mv.kind {
-                    MoveKind::Travel => {
-                        line_verts.push(LineVertex {
-                            pos: [pts[0].x, pts[0].y, pl.z],
-                            color: line_color,
-                        });
-                        line_verts.push(LineVertex {
-                            pos: [pts[1].x, pts[1].y, pl.z],
-                            color: line_color,
-                        });
+
+                // Perimeters with >= 3 points are closed loops (wrap the last
+                // segment back to the start); everything else is sequential.
+                let is_closed = mv.kind == MoveKind::Perimeter && pts.len() >= 3;
+                let seg_count = if is_closed { pts.len() } else { pts.len() - 1 };
+
+                for s in 0..seg_count {
+                    let a = pts[s];
+                    let b = pts[(s + 1) % pts.len()];
+                    let dx = b.x - a.x;
+                    let dy = b.y - a.y;
+                    let seg_len = (dx * dx + dy * dy).sqrt();
+                    if seg_len < 1e-9 {
+                        continue;
                     }
-                    MoveKind::Infill | MoveKind::SurfaceInfill => {
-                        self.push_segment(
-                            &pts[0],
-                            &pts[1],
-                            pl.z,
-                            line_color,
-                            color_id,
-                            flags,
-                            &mut path_line_verts,
-                            &mut rhombus_instances
-                        );
-                    }
-                    MoveKind::Perimeter => {
-                        if pts.len() == 2 {
-                            // Open segment
-                            self.push_segment(
-                                &pts[0],
-                                &pts[1],
-                                pl.z,
-                                line_color,
-                                color_id,
-                                flags,
-                                &mut path_line_verts,
-                                &mut rhombus_instances
-                            );
-                        } else {
-                            // closed loop
-                            for i in 0..pts.len() {
-                                let a = &pts[i];
-                                let b = &pts[(i + 1) % pts.len()];
-                                self.push_segment(
-                                    a,
-                                    b,
-                                    pl.z,
-                                    line_color,
-                                    color_id,
-                                    flags,
-                                    &mut path_line_verts,
-                                    &mut rhombus_instances
-                                );
-                            }
-                        }
+                    // Whole segment, stamped with the print time at its end. Time
+                    // (not segment count) drives scrubbing: a long fast infill
+                    // run advances the same wall-clock as a short slow perimeter.
+                    // Mid-segment smoothing is a top-layer-only concern, handled
+                    // separately, so lower layers stay one-primitive-per-segment.
+                    elapsed_s += seg_len / speed;
+
+                    if mv.kind == MoveKind::Travel {
+                        travel_verts.push(LineVertex { pos: [a.x, a.y, pl.z], color: line_color });
+                        travel_verts.push(LineVertex { pos: [b.x, b.y, pl.z], color: line_color });
+                        travel_seg_times.push(elapsed_s);
+                    } else {
+                        // Extrusion: emit both the flat path line and the 3D rhombus.
+                        path_verts.push(LineVertex { pos: [a.x, a.y, pl.z], color: line_color });
+                        path_verts.push(LineVertex { pos: [b.x, b.y, pl.z], color: line_color });
+                        path_seg_times.push(elapsed_s);
+
+                        rhombus_instances.push(RhombusInstance {
+                            start: [a.x, a.y, pl.z],
+                            dir: [dx / seg_len, dy / seg_len],
+                            length: seg_len,
+                            color_flags: (color_id as u32) | ((flags as u32) << 8),
+                        });
+                        rhombus_times.push(elapsed_s);
                     }
                 }
+            }
+
+            // Same full-layer time stamped on every buffer's entry, so one
+            // threshold cuts travel and extrusion at the same instant.
+            let layer_total = elapsed_s;
+            if travel_verts.len() > travel_v0 {
+                travel_entries.push(buffers::LineLayerEntry {
+                    layer_z: pl.z,
+                    first_vertex: travel_v0 as u32,
+                    vertex_count: (travel_verts.len() - travel_v0) as u32,
+                    time_total: layer_total,
+                });
+            }
+            if path_verts.len() > path_v0 {
+                path_entries.push(buffers::LineLayerEntry {
+                    layer_z: pl.z,
+                    first_vertex: path_v0 as u32,
+                    vertex_count: (path_verts.len() - path_v0) as u32,
+                    time_total: layer_total,
+                });
+            }
+            if rhombus_instances.len() > rho0 {
+                let aabb = buffers::compute_layer_aabb(&rhombus_instances[rho0..]);
+                rhombus_entries.push(buffers::LayerEntry {
+                    layer_z: pl.z,
+                    instance_count: (rhombus_instances.len() - rho0) as i32,
+                    aabb_min_x: aabb.0,
+                    aabb_min_y: aabb.1,
+                    aabb_max_x: aabb.2,
+                    aabb_max_y: aabb.3,
+                    time_total: layer_total,
+                });
             }
         }
 
         // Upload
-        self.toolpath_lines_buffer = (!line_verts.is_empty()).then(||
-            buffers::upload_lines_batched(&self.device, &line_verts)
+        self.toolpath_lines_buffer = (!travel_verts.is_empty()).then(||
+            buffers::make_line_batch(&self.device, &travel_verts, travel_entries, travel_seg_times)
         );
-        self.toolpath_path_lines_buffer = (!path_line_verts.is_empty()).then(||
-            buffers::upload_lines_batched(&self.device, &path_line_verts)
+        self.toolpath_path_lines_buffer = (!path_verts.is_empty()).then(||
+            buffers::make_line_batch(&self.device, &path_verts, path_entries, path_seg_times)
         );
         self.toolpath_rhombuses = (!rhombus_instances.is_empty()).then(||
-            buffers::upload_rhombus_batch(&self.device, &rhombus_instances)
+            buffers::make_instanced_batch(
+                &self.device,
+                &rhombus_instances,
+                rhombus_entries,
+                rhombus_times
+            )
         );
     }
 
@@ -630,6 +659,9 @@ impl Renderer {
         ];
         let light_dir4 = [light_dir[0], light_dir[1], light_dir[2], 0.0];
 
+        // Dimming is only active while scrubbing
+        let fg_scrub_dim = if self.is_scrubbing { SCRUB_DIM } else { 1.0 };
+
         let bg_uniforms = FrameUniforms {
             mvp: mvp_mat,
             light_dir: light_dir4,
@@ -637,6 +669,10 @@ impl Renderer {
             clip_z_min: -1e30,
             half_height: self.half_height,
             half_width: self.half_width,
+            scrub_top_z: -1e30, // background never dims
+            scrub_dim: 1.0,
+            _pad0: 0.0,
+            _pad1: 0.0,
         };
         let fg_uniforms = FrameUniforms {
             mvp: mvp_mat,
@@ -645,6 +681,10 @@ impl Renderer {
             clip_z_min: self.clip_z_min,
             half_height: self.half_height,
             half_width: self.half_width,
+            scrub_top_z: self.scrub_top_z,
+            scrub_dim: fg_scrub_dim,
+            _pad0: 0.0,
+            _pad1: 0.0,
         };
         queue.write_buffer(&self.frame_uniform_buffer_bg, 0, bytemuck::bytes_of(&bg_uniforms));
         queue.write_buffer(&self.frame_uniform_buffer_fg, 0, bytemuck::bytes_of(&fg_uniforms));
@@ -690,7 +730,7 @@ impl Renderer {
                 super::BgMode::Layers => {
                     if let Some(s) = &self.slices_buffer {
                         pass.set_pipeline(&self.line_transparent_pipeline);
-                        draw_line_batch(&mut pass, s, -1e30, 1e30); // BG: no clip
+                        draw_line_batch(&mut pass, s, -1e30, 1e30, 1.0); // BG: no clip, full
                     }
                 }
                 super::BgMode::None => {}
@@ -742,14 +782,21 @@ impl Renderer {
                             self.clip_z_max,
                             self.clip_z_min,
                             mvp,
-                            self.half_height
+                            self.half_height,
+                            self.scrub_fraction
                         );
                     }
                 } else {
                     // Otherwise draw simple line toolpaths
                     if let Some(plb) = &self.toolpath_path_lines_buffer {
                         pass.set_pipeline(&self.line_transparent_pipeline);
-                        draw_line_batch(&mut pass, plb, self.clip_z_min, self.clip_z_max);
+                        draw_line_batch(
+                            &mut pass,
+                            plb,
+                            self.clip_z_min,
+                            self.clip_z_max,
+                            self.scrub_fraction
+                        );
                     }
                 }
 
@@ -762,7 +809,13 @@ impl Renderer {
                         pass.set_bind_group(0, &self.frame_bind_group_fg, &[]);
                     }
                     if let Some(lb) = &self.toolpath_lines_buffer {
-                        draw_line_batch(&mut pass, lb, self.clip_z_min, self.clip_z_max);
+                        draw_line_batch(
+                            &mut pass,
+                            lb,
+                            self.clip_z_min,
+                            self.clip_z_max,
+                            self.scrub_fraction
+                        );
                     }
                 }
             }
@@ -778,36 +831,6 @@ impl Renderer {
         render_pass.set_pipeline(&self.blit_pipeline);
         render_pass.set_bind_group(0, &self.blit_bind_group, &[]);
         render_pass.draw(0..3, 0..1); // 3 verts, 1 instance
-    }
-
-    fn push_segment(
-        &mut self,
-        a: &PointXY<f32>,
-        b: &PointXY<f32>,
-        z: f32,
-        line_color: [f32; 4],
-        color_id: u8,
-        flags: u8,
-        path_line_verts: &mut Vec<LineVertex>,
-        rhombus_instances: &mut Vec<RhombusInstance>
-    ) {
-        path_line_verts.push(LineVertex { pos: [a.x, a.y, z], color: line_color });
-        path_line_verts.push(LineVertex { pos: [b.x, b.y, z], color: line_color });
-
-        let dx = b.x - a.x;
-        let dy = b.y - a.y;
-        let length = (dx * dx + dy * dy).sqrt();
-        if length < 1e-9 {
-            // skip degenerate segments
-            return;
-        }
-
-        rhombus_instances.push(RhombusInstance {
-            start: [a.x, a.y, z],
-            dir: [dx / length, dy / length],
-            length,
-            color_flags: (color_id as u32) | ((flags as u32) << 8),
-        });
     }
 
     /// Extract 6 frustum planes from MVP matrix using Gribb-Hartmann derivation
@@ -873,7 +896,8 @@ fn draw_rhombus_batch(
     clip_z_max: f32,
     clip_z_min: f32,
     mvp: &[f32; 16],
-    half_height: f32
+    half_height: f32,
+    scrub_fraction: f32
 ) {
     // Binary-search the visible layer range. layer_entries is sorted ascending.
     let start_idx = batch.layer_entries.partition_point(|e| e.layer_z < clip_z_min);
@@ -897,7 +921,24 @@ fn draw_rhombus_batch(
     let mut run_first: Option<u32> = None;
     let mut run_total: u32 = 0;
 
-    for entry in &batch.layer_entries[start_idx..end_idx] {
+    // Instances are stored in planner move order within each layer, so the
+    // scrubber just shortens the draw range of the *top* visible layer.
+    let top_idx = end_idx - 1;
+
+    for (i, entry) in batch.layer_entries[start_idx..end_idx].iter().enumerate() {
+        let full = entry.instance_count as u32;
+        // Only the topmost visible layer is scrubbed; layers below are full.
+        // The cutoff is time-based: keep instances whose cumulative layer-time
+        // is within `scrub_fraction` of the layer's total print time.
+        let draw_count = if start_idx + i == top_idx && scrub_fraction < 1.0 {
+            let threshold = scrub_fraction * entry.time_total;
+            let lo = layer_first_instance as usize;
+            let times = &batch.instance_times[lo..lo + (full as usize)];
+            times.partition_point(|&t| t <= threshold) as u32
+        } else {
+            full
+        };
+
         let outside = Renderer::aabb_outside_frustum(
             &planes,
             entry.aabb_min_x,
@@ -907,8 +948,9 @@ fn draw_rhombus_batch(
             entry.aabb_max_y,
             entry.layer_z + half_height
         );
-        if outside {
-            // Flush the in-progress run, if any.
+        if outside || draw_count == 0 {
+            // Flush the in-progress run, if any. (A zero-count top layer also
+            // breaks the run — there's nothing after it to merge with anyway.)
             if let Some(rf) = run_first.take() {
                 pass.draw(0..36, rf..rf + run_total);
                 run_total = 0;
@@ -918,9 +960,11 @@ fn draw_rhombus_batch(
             if run_first.is_none() {
                 run_first = Some(layer_first_instance);
             }
-            run_total += entry.instance_count as u32;
+            run_total += draw_count;
         }
-        layer_first_instance += entry.instance_count as u32;
+        // Advance by the FULL count so later layers' offsets stay correct even
+        // when the top layer drew only a prefix of its instances.
+        layer_first_instance += full;
     }
     // Flush any trailing run.
     if let Some(rf) = run_first {
@@ -934,7 +978,13 @@ fn draw_rhombus_batch(
 //
 // Mirrors draw_rhombus_batch but for line geometry. Pipeline and bind group
 // must be set by the caller before invoking this function.
-fn draw_line_batch(pass: &mut RenderPass<'_>, batch: &LineBatch, clip_z_min: f32, clip_z_max: f32) {
+fn draw_line_batch(
+    pass: &mut RenderPass<'_>,
+    batch: &LineBatch,
+    clip_z_min: f32,
+    clip_z_max: f32,
+    scrub_fraction: f32
+) {
     // Binary search the visible layers
     let start_idx = batch.layer_entries.partition_point(|e| e.layer_z < clip_z_min);
     let end_idx = batch.layer_entries.partition_point(|e| e.layer_z <= clip_z_max);
@@ -944,8 +994,27 @@ fn draw_line_batch(pass: &mut RenderPass<'_>, batch: &LineBatch, clip_z_min: f32
 
     pass.set_vertex_buffer(0, batch.buffer.slice(..));
 
-    for entry in &batch.layer_entries[start_idx..end_idx] {
-        pass.draw(entry.first_vertex..entry.first_vertex + entry.vertex_count, 0..1);
+    // Verts come in pairs (one line segment = 2 verts), in planner move order.
+    // The scrubber shortens only the top visible layer, cutting on cumulative
+    // print time so travel and extrusion advance together. `segment_times` is
+    // empty for non-scrubbed batches (background slices) → always draw full.
+    let top_idx = end_idx - 1;
+    for (i, entry) in batch.layer_entries[start_idx..end_idx].iter().enumerate() {
+        let scrub_top =
+            start_idx + i == top_idx && scrub_fraction < 1.0 && !batch.segment_times.is_empty();
+        let vcount = if scrub_top {
+            let threshold = scrub_fraction * entry.time_total;
+            let seg0 = (entry.first_vertex / 2) as usize;
+            let seg_count = (entry.vertex_count / 2) as usize;
+            let times = &batch.segment_times[seg0..seg0 + seg_count];
+            (times.partition_point(|&t| t <= threshold) as u32) * 2
+        } else {
+            entry.vertex_count
+        };
+        if vcount == 0 {
+            continue;
+        }
+        pass.draw(entry.first_vertex..entry.first_vertex + vcount, 0..1);
     }
 }
 

@@ -27,6 +27,38 @@ pub struct Move {
     /// - Perimeter: [p0, p1, ..., pN] closed loop (last connects back to first)
     /// - Infill: [start, end] (2 points)
     pub points: Vec<Point2<f32>>,
+    /// Nozzle move speed, in mm/s. Drives time-based scrubbing in
+    /// the viewer and the F word during G-code generation.
+    pub speed: f32,
+    /// Extrusion rate (volumetric / E-feed). Zero for travels. Computed at the
+    /// G-code stage from `speed` and the bead cross-section; 0.0 for now.
+    pub flow: f32,
+}
+
+impl Move {
+    fn new(kind: MoveKind, points: Vec<Point2<f32>>, cfg: &SpeedConfig) -> Self {
+        let speed = match kind {
+            MoveKind::Travel => cfg.travel,
+            MoveKind::Perimeter => cfg.perimeter,
+            MoveKind::Infill => cfg.infill,
+            MoveKind::SurfaceInfill => cfg.surface,
+        };
+        Move { kind, points, speed, flow: 0.0 }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SpeedConfig {
+    pub travel: f32,
+    pub perimeter: f32,
+    pub infill: f32,
+    pub surface: f32,
+}
+
+impl Default for SpeedConfig {
+    fn default() -> Self {
+        Self { travel: 150.0, perimeter: 30.0, infill: 60.0, surface: 40.0 }
+    }
 }
 
 pub type PointXY<T> = Point2<T>;
@@ -51,12 +83,15 @@ pub struct PlannedResult {
 
 /// Plan all toolpath layers, adding travel moves and optimizing print order.
 /// Layers are planned sequentially so each starts from the last position of the previous layer.
-pub fn plan_toolpaths(toolpath_result: &ToolpathResult) -> PlannedResult {
+pub fn plan_toolpaths(
+    toolpath_result: &ToolpathResult,
+    speed_config: &SpeedConfig
+) -> PlannedResult {
     let mut current_pos = Point2::new(0.0, 0.0);
     let mut layers = Vec::with_capacity(toolpath_result.layers.len());
 
     for layer in &toolpath_result.layers {
-        let planned = plan_layer(layer, current_pos);
+        let planned = plan_layer(layer, current_pos, speed_config);
         current_pos = layer_end_position(&planned).unwrap_or(current_pos);
         layers.push(planned);
     }
@@ -75,7 +110,7 @@ fn layer_end_position(layer: &PlannedLayer) -> Option<Point2<f32>> {
 }
 
 /// Plan a single layer: order segments and insert travel moves.
-fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>) -> PlannedLayer {
+fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>, cfg: &SpeedConfig) -> PlannedLayer {
     let mut moves = Vec::new();
     let mut current_pos = start_pos;
 
@@ -108,17 +143,11 @@ fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>) -> PlannedLayer {
 
                 // Travel to the perimeter start if needed
                 if !points_equal(&current_pos, &loop_start) {
-                    moves.push(Move {
-                        kind: MoveKind::Travel,
-                        points: vec![current_pos, loop_start],
-                    });
+                    moves.push(Move::new(MoveKind::Travel, vec![current_pos, loop_start], cfg));
                 }
 
                 // Add perimeter move
-                moves.push(Move {
-                    kind: MoveKind::Perimeter,
-                    points,
-                });
+                moves.push(Move::new(MoveKind::Perimeter, points, cfg));
 
                 // Nozzle returns to loop start after closing the perimeter
                 current_pos = loop_start;
@@ -140,17 +169,11 @@ fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>) -> PlannedLayer {
 
             // Add travel move if needed
             if !points_equal(&current_pos, &start) {
-                moves.push(Move {
-                    kind: MoveKind::Travel,
-                    points: vec![current_pos, start],
-                });
+                moves.push(Move::new(MoveKind::Travel, vec![current_pos, start], cfg));
             }
 
             // Add infill move
-            moves.push(Move {
-                kind: MoveKind::Infill,
-                points: vec![start, end],
-            });
+            moves.push(Move::new(MoveKind::Infill, vec![start, end], cfg));
 
             current_pos = end;
         }
@@ -203,24 +226,15 @@ fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>) -> PlannedLayer {
             if !points_equal(&current_pos, &start) {
                 if inside_surface {
                     // Adjacent scanlines: connect with extrusion (distance ~nozzle_width)
-                    moves.push(Move {
-                        kind: MoveKind::SurfaceInfill,
-                        points: vec![current_pos, start],
-                    });
+                    moves.push(Move::new(MoveKind::SurfaceInfill, vec![current_pos, start], cfg));
                 } else {
                     // First line: travel to it
-                    moves.push(Move {
-                        kind: MoveKind::Travel,
-                        points: vec![current_pos, start],
-                    });
+                    moves.push(Move::new(MoveKind::Travel, vec![current_pos, start], cfg));
                 }
             }
 
             // Add surface infill move
-            moves.push(Move {
-                kind: MoveKind::SurfaceInfill,
-                points: vec![start, end],
-            });
+            moves.push(Move::new(MoveKind::SurfaceInfill, vec![start, end], cfg));
 
             current_pos = end;
             forward = !forward;

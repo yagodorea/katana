@@ -7,7 +7,11 @@ struct Uniforms {
     clip_z_max:  f32,         //  4 B, offset 80
     clip_z_min:  f32,         //  4 B, offset 84
     half_height: f32,         //  4 B, offset 88
-    _pad:        f32,         //  4 B, offset 92 — round struct size to 96
+    half_width:  f32,         //  4 B, offset 92 (unused here; kept for layout parity)
+    scrub_top_z: f32,         //  4 B, offset 96
+    scrub_dim:   f32,         //  4 B, offset 100
+    _pad0:       f32,         //  4 B, offset 104
+    _pad1:       f32,         //  4 B, offset 108 — round struct size to 112
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -33,5 +37,7 @@ struct VsOut {
 }
 
 @fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return in.color;
+    // select(if_false, if_true, condition) <- pretty weird notation
+    let dim = select(u.scrub_dim, 1.0, in.z >= u.scrub_top_z);
+    return vec4(in.color.rgb * dim, in.color.a);
 }

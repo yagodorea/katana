@@ -8,6 +8,10 @@ struct Uniforms {
     clip_z_min:  f32,         //  4 B, offset 84
     half_height: f32,         //  4 B, offset 88
     half_width:  f32,         //  4 B, offset 92
+    scrub_top_z: f32,         //  4 B, offset 96
+    scrub_dim:   f32,         //  4 B, offset 100
+    _pad0:       f32,         //  4 B, offset 104
+    _pad1:       f32,         //  4 B, offset 108 — round struct size to 112
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -82,5 +86,8 @@ struct VsOut {
     let diffuse = abs(dot(in.normal, u.light_dir.xyz));
     let ambient = 0.15;
     let light = ambient + (1.0 - ambient) * diffuse;
-    return vec4(in.color.rgb * light, in.color.a);
+
+    let dim = select(u.scrub_dim, 1.0, in.layer_z >= u.scrub_top_z);
+
+    return vec4(in.color.rgb * light * dim, in.color.a);
 }

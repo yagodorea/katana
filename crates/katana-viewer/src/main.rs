@@ -1,10 +1,10 @@
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{ Arc, Mutex };
+use std::time::{ Duration, Instant };
 
 use clap::Parser;
 use eframe::egui;
 use eframe::egui_wgpu;
-use katana_core::{offset, planner, slicer, stl};
+use katana_core::{ offset, planner, slicer, stl };
 
 mod renderer_wgpu_port;
 
@@ -31,6 +31,15 @@ struct Args {
     /// Number of top solid layers
     #[arg(long, default_value_t = 3)]
     top_layers: usize,
+    /// Speed configs in mm/s
+    #[arg(long, default_value_t = 150.0)]
+    travel_speed: f32,
+    #[arg(long, default_value_t = 30.0)]
+    perimeter_speed: f32,
+    #[arg(long, default_value_t = 60.0)]
+    infill_speed: f32,
+    #[arg(long, default_value_t = 40.0)]
+    surface_speed: f32,
 }
 
 fn main() -> eframe::Result {
@@ -60,7 +69,7 @@ fn main() -> eframe::Result {
         layer_height: args.layer_height,
     };
     let infill_config = offset::InfillConfig {
-        density: args.infill_density as f32 / 100.0,
+        density: (args.infill_density as f32) / 100.0,
         nozzle_width: args.nozzle_width,
     };
     let surface_config = offset::SurfaceConfig {
@@ -69,23 +78,32 @@ fn main() -> eframe::Result {
     };
 
     let t_offset = Instant::now();
-    let toolpath_result = offset::generate_toolpaths(&result, &perim_config, &infill_config, &surface_config);
+    let toolpath_result = offset::generate_toolpaths(
+        &result,
+        &perim_config,
+        &infill_config,
+        &surface_config
+    );
     let offset_ms = t_offset.elapsed().as_secs_f64() * 1000.0;
 
+    let speed_config = planner::SpeedConfig {
+        travel: args.travel_speed,
+        perimeter: args.perimeter_speed,
+        infill: args.infill_speed,
+        surface: args.surface_speed,
+    };
+
     let t_plan = Instant::now();
-    let planned_result = planner::plan_toolpaths(&toolpath_result);
+    let planned_result = planner::plan_toolpaths(&toolpath_result, &speed_config);
     let plan_ms = t_plan.elapsed().as_secs_f64() * 1000.0;
 
-    println!(
-        "Loaded {} ({} triangles) in {:.1}ms",
-        args.file, num_triangles, load_ms
-    );
+    println!("Loaded {} ({} triangles) in {:.1}ms", args.file, num_triangles, load_ms);
     println!(
         "Sliced {} layers in {:.1}ms, perimeters in {:.1}ms, planning in {:.1}ms",
         result.layers.len(),
         slice_ms,
         offset_ms,
-        plan_ms,
+        plan_ms
     );
 
     let center_x = (mesh_min.x + mesh_max.x) / 2.0;
@@ -117,7 +135,7 @@ fn main() -> eframe::Result {
                         }
                     }),
                     ..Default::default()
-                },
+                }
             ),
             ..Default::default()
         },
@@ -153,35 +171,39 @@ fn main() -> eframe::Result {
 
             let renderer = Arc::new(Mutex::new(gpu));
 
-            Ok(Box::new(ViewerApp {
-                renderer,
-                layers,
-                num_layers,
-                max_layer: last_layer,
-                min_layer: 0,
-                slice_view: SliceView::Toolpaths,
-                center: [center_x, center_y, center_z],
-                extent,
-                azimuth: std::f32::consts::FRAC_PI_4 + std::f32::consts::PI,
-                elevation: std::f32::consts::FRAC_PI_6,
-                zoom: 1.0,
-                pan: egui::Vec2::ZERO,
-                bg_mode: BgMode::Mesh,
-                stats: Stats {
-                    triangles: num_triangles,
-                    load_ms,
-                    slice_ms,
-                    offset_ms,
-                    plan_ms,
-                },
-                show_travel_moves: true,
-                show_filaments: true,
-                fps: 0.0,
-                frame_time: 0.0,
-                last_update: Instant::now(),
-                frame_count: 0,
-            }))
-        }),
+            Ok(
+                Box::new(ViewerApp {
+                    renderer,
+                    layers,
+                    num_layers,
+                    max_layer: last_layer,
+                    prev_max_layer: last_layer,
+                    min_layer: 0,
+                    slice_view: SliceView::Toolpaths,
+                    center: [center_x, center_y, center_z],
+                    extent,
+                    azimuth: std::f32::consts::FRAC_PI_4 + std::f32::consts::PI,
+                    elevation: std::f32::consts::FRAC_PI_6,
+                    zoom: 1.0,
+                    pan: egui::Vec2::ZERO,
+                    bg_mode: BgMode::Mesh,
+                    stats: Stats {
+                        triangles: num_triangles,
+                        load_ms,
+                        slice_ms,
+                        offset_ms,
+                        plan_ms,
+                    },
+                    show_travel_moves: true,
+                    show_filaments: true,
+                    scrub: 1.0,
+                    fps: 0.0,
+                    frame_time: 0.0,
+                    last_update: Instant::now(),
+                    frame_count: 0,
+                })
+            )
+        })
     )
 }
 
@@ -211,6 +233,8 @@ struct ViewerApp {
     layers: Vec<slicer::Layer>,
     num_layers: usize,
     max_layer: usize,
+    /// `max_layer` from the previous frame, to detect layer change and reset the scrubber
+    prev_max_layer: usize,
     min_layer: usize,
     slice_view: SliceView,
     center: [f32; 3],
@@ -222,6 +246,7 @@ struct ViewerApp {
     bg_mode: BgMode,
     show_travel_moves: bool,
     show_filaments: bool,
+    scrub: f32,
     stats: Stats,
     fps: f32,
     frame_time: f32,
@@ -332,6 +357,23 @@ impl eframe::App for ViewerApp {
                 );
             });
 
+        // Bottom panel: horizontal scrubber for the top layer
+        egui::TopBottomPanel::bottom("scrubber")
+            .resizable(false)
+            .show(ctx, |ui| {
+                if self.num_layers == 0 {
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Layer progress");
+                    ui.spacing_mut().slider_width = (ui.available_width() - 80.0).max(64.0);
+                    ui.add(
+                        egui::Slider::new(&mut self.scrub, 0.0..=1.0)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                    );
+                });
+            });
+
         // Central panel
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(26, 26, 46)))
@@ -419,6 +461,12 @@ impl eframe::App for ViewerApp {
                     }
                 });
 
+                // Switching the top layer snaps the scrubber back to 1
+                if self.max_layer != self.prev_max_layer {
+                    self.scrub = 1.0;
+                    self.prev_max_layer = self.max_layer;
+                }
+
                 // Update renderer state (clip_z, draw mode) — no re-upload needed
                 if !self.layers.is_empty() {
                     let mut r = self.renderer.lock().unwrap();
@@ -428,6 +476,11 @@ impl eframe::App for ViewerApp {
                     r.draw_toolpaths = self.slice_view == SliceView::Toolpaths;
                     r.show_travel_moves = self.show_travel_moves;
                     r.show_filaments = self.show_filaments;
+                    r.scrub_fraction = self.scrub;
+                    // Anything below full means we're actively scrubbing,
+                    // which dims the layers beneath the top one to highlight it.
+                    r.is_scrubbing = self.scrub < 0.999;
+                    r.scrub_top_z = self.layers[self.max_layer].z - 0.0001;
                 }
 
                 let rect = response.rect;

@@ -16,8 +16,13 @@ pub struct FrameUniforms {
     pub clip_z_min: f32,
     pub half_height: f32,
     pub half_width: f32,
+    // Scrubber highlight
+    pub scrub_top_z: f32,
+    pub scrub_dim: f32,
+    pub _pad0: f32,
+    pub _pad1: f32,
 }
-const _: () = assert!(std::mem::size_of::<FrameUniforms>() == 96);
+const _: () = assert!(std::mem::size_of::<FrameUniforms>() == 112);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -86,22 +91,28 @@ pub struct LayerEntry {
     pub aabb_min_y: f32,
     pub aabb_max_x: f32,
     pub aabb_max_y: f32,
+    /// Full print time of this layer
+    pub time_total: f32,
 }
 
 pub struct InstancedBatch {
     pub buffer: wgpu::Buffer,
     pub layer_entries: Vec<LayerEntry>,
+    /// Cumulative layer-time (s) at the end of each instance, ascending within each layer. Empty for non-scrubbed batches.
+    pub instance_times: Vec<f32>,
 }
 
 pub struct LineLayerEntry {
     pub layer_z: f32,
     pub first_vertex: u32,
     pub vertex_count: u32,
+    pub time_total: f32,
 }
 
 pub struct LineBatch {
     pub buffer: wgpu::Buffer,
     pub layer_entries: Vec<LineLayerEntry>,
+    pub segment_times: Vec<f32>,
 }
 
 pub fn upload_lines(device: &Device, verts: &[LineVertex]) -> GpuBuffer {
@@ -126,7 +137,7 @@ pub fn upload_lines_batched(device: &Device, verts: &[LineVertex]) -> LineBatch 
     );
     let mut layer_entries: Vec<LineLayerEntry> = Vec::new();
     if verts.is_empty() {
-        return LineBatch { buffer, layer_entries };
+        return LineBatch { buffer, layer_entries, segment_times: Vec::new() };
     }
     let mut current_z = verts[0].pos[2];
     let mut layer_start = 0usize;
@@ -138,6 +149,7 @@ pub fn upload_lines_batched(device: &Device, verts: &[LineVertex]) -> LineBatch 
                 layer_z: current_z,
                 first_vertex: layer_start as u32,
                 vertex_count: (i - layer_start) as u32,
+                time_total: 0.0, // not scrubbed (background slices)
             });
             if !at_end {
                 current_z = verts[i].pos[2];
@@ -145,7 +157,41 @@ pub fn upload_lines_batched(device: &Device, verts: &[LineVertex]) -> LineBatch 
             }
         }
     }
-    LineBatch { buffer, layer_entries }
+    LineBatch { buffer, layer_entries, segment_times: Vec::new() }
+}
+
+/// Wrap pre-built line geometry + per-layer entries + per-segment cumulative times into a `LineBatch`
+pub fn make_line_batch(
+    device: &Device,
+    verts: &[LineVertex],
+    layer_entries: Vec<LineLayerEntry>,
+    segment_times: Vec<f32>
+) -> LineBatch {
+    let buffer = device.create_buffer_init(
+        &(wgpu::util::BufferInitDescriptor {
+            label: Some("line_batch_timed_vbo"),
+            contents: bytemuck::cast_slice(verts),
+            usage: BufferUsages::VERTEX,
+        })
+    );
+    LineBatch { buffer, layer_entries, segment_times }
+}
+
+/// Wrap pre-built rhombus instances + per-layer entries + per-instance cumulative times into an `InstancedBatch`
+pub fn make_instanced_batch(
+    device: &Device,
+    instances: &[RhombusInstance],
+    layer_entries: Vec<LayerEntry>,
+    instance_times: Vec<f32>
+) -> InstancedBatch {
+    let buffer = device.create_buffer_init(
+        &(wgpu::util::BufferInitDescriptor {
+            label: Some("rhombus_instance_buffer"),
+            contents: bytemuck::cast_slice(instances),
+            usage: BufferUsages::VERTEX,
+        })
+    );
+    InstancedBatch { buffer, layer_entries, instance_times }
 }
 
 pub fn upload_mesh(device: &Device, verts: &[MeshVertex]) -> GpuBuffer {
@@ -160,48 +206,9 @@ pub fn upload_mesh(device: &Device, verts: &[MeshVertex]) -> GpuBuffer {
     GpuBuffer { buffer, vertex_count }
 }
 
-pub fn upload_rhombus_batch(device: &Device, instances: &[RhombusInstance]) -> InstancedBatch {
-    use wgpu::util::DeviceExt;
-
-    let buffer = device.create_buffer_init(
-        &(wgpu::util::BufferInitDescriptor {
-            label: Some("rhombus_instance_buffer"),
-            contents: bytemuck::cast_slice(instances),
-            usage: BufferUsages::VERTEX,
-        })
-    );
-
-    let mut layer_entries: Vec<LayerEntry> = Vec::new();
-    if instances.is_empty() {
-        return InstancedBatch { buffer, layer_entries };
-    }
-
-    // Find layer boundaries and compute AABB per layer
-    let mut current_z = instances[0].start[2];
-    let mut layer_start = 0 as usize;
-    for i in 1..=instances.len() {
-        let at_end = i == instances.len();
-        let z_changed = !at_end && instances[i].start[2] != current_z;
-        if at_end || z_changed {
-            let aabb = compute_layer_aabb(&instances[layer_start..i]);
-            layer_entries.push(LayerEntry {
-                layer_z: current_z,
-                instance_count: (i - layer_start) as i32,
-                aabb_min_x: aabb.0,
-                aabb_min_y: aabb.1,
-                aabb_max_x: aabb.2,
-                aabb_max_y: aabb.3,
-            });
-            if !at_end {
-                current_z = instances[i].start[2];
-                layer_start = i;
-            }
-        }
-    }
-    InstancedBatch { buffer, layer_entries }
-}
-
-fn compute_layer_aabb(slice: &[RhombusInstance]) -> (f32, f32, f32, f32) {
+/// Conservative XY bounding box of a layer's rhombus instances. Public so the
+/// renderer can build `LayerEntry`s while assigning per-instance times.
+pub fn compute_layer_aabb(slice: &[RhombusInstance]) -> (f32, f32, f32, f32) {
     let (mut mn_x, mut mn_y) = (f32::MAX, f32::MAX);
     let (mut mx_x, mut mx_y) = (f32::MIN, f32::MIN);
     for inst in slice {
