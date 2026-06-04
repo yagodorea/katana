@@ -52,3 +52,14 @@ pub fn headlight_dir(azimuth: f32, elevation: f32) -> [f32; 3] {
     let se = elevation.sin();
     [-sa * ce, ca * ce, se]
 }
+
+/// World-space camera-forward direction (the orthographic ray direction into
+/// the scene). Matches the "Forward (into scene)" comment in `build_mvp`:
+/// pushing world_pos along this direction moves things to larger NDC z.
+pub fn camera_forward(azimuth: f32, elevation: f32) -> [f32; 3] {
+    let ca = azimuth.cos();
+    let sa = azimuth.sin();
+    let ce = elevation.cos();
+    let se = elevation.sin();
+    [-ce * sa, -ce * ca, -se]
+}

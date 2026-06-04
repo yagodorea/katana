@@ -11,7 +11,7 @@ mod buffers;
 mod camera;
 mod pipelines;
 
-pub use camera::{ build_mvp, headlight_dir };
+pub use camera::{ build_mvp, camera_forward, headlight_dir };
 
 use katana_core::planner::{ MoveKind, PointXY };
 use wgpu::*;
@@ -155,6 +155,7 @@ pub struct Renderer {
     _mesh_transparent_pipeline: RenderPipeline,
     impostor_opaque_pipeline: RenderPipeline,
     _impostor_transparent_pipeline: RenderPipeline,
+    _impostor_depth_prepass_pipeline: RenderPipeline,
 
     // 4th pipeline + its bind group layout + sampler: copies the offscreen
     // color texture onto egui's pass in `paint`. Sampler is static; bind
@@ -286,6 +287,10 @@ impl Renderer {
             &impostor_bgl,
             color_format
         );
+        let impostor_depth_prepass_pipeline = pipelines::build_impostor_depth_prepass_pipeline(
+            &device,
+            &impostor_bgl
+        );
 
         let blit_bgl = pipelines::build_blit_bgl(&device);
         let blit_pipeline = pipelines::build_blit_pipeline(&device, &blit_bgl, color_format);
@@ -322,6 +327,7 @@ impl Renderer {
             _mesh_transparent_pipeline: mesh_transparent_pipeline,
             impostor_opaque_pipeline,
             _impostor_transparent_pipeline: impostor_transparent_pipeline,
+            _impostor_depth_prepass_pipeline: impostor_depth_prepass_pipeline,
             blit_pipeline,
             blit_bgl,
             blit_sampler,
@@ -547,6 +553,7 @@ impl Renderer {
         encoder: &mut CommandEncoder,
         mvp: &[f32; 16],
         light_dir: &[f32; 3],
+        cam_forward: &[f32; 3],
         bg_mode: super::BgMode,
         viewport_w: u32,
         viewport_h: u32
@@ -577,8 +584,7 @@ impl Renderer {
             [mvp[12], mvp[13], mvp[14] * 0.5 + 0.5 * mvp[15], mvp[15]],
         ];
         let light_dir4 = [light_dir[0], light_dir[1], light_dir[2], 0.0];
-        // For this headlight camera, cam_forward equals light_dir (headlight mounted on camera).
-        let cam_forward4 = light_dir4;
+        let cam_forward4 = [cam_forward[0], cam_forward[1], cam_forward[2], 0.0];
 
         let bg_uniforms = FrameUniforms {
             mvp: mvp_mat,
@@ -649,7 +655,9 @@ impl Renderer {
             }
         }
 
-        // Foreground pass: load color, clear depth
+        // Foreground pass: load color, clear depth (so BG mesh depth doesn't
+        // occlude impostors above it). Single pass — discard in the impostor FS
+        // resolves the silhouette and depth test sorts overlapping billboards.
         {
             let mut pass = encoder.begin_render_pass(
                 &(RenderPassDescriptor {

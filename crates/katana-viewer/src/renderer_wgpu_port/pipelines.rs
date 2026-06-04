@@ -329,6 +329,72 @@ pub fn build_impostor_opaque_pipeline(
 ) -> RenderPipeline {
     build_impostor_pipeline_inner(device, impostor_bgl, color_format, false, true)
 }
+
+/// Depth-only pre-pass pipeline for the impostor.
+///
+/// Shares the impostor VS, has no fragment stage (rasterizer interpolates depth
+/// from billboard corners). Depth-only pipelines are not compatible with render
+/// passes that have color attachments, so this MUST be issued in its own pass.
+pub fn build_impostor_depth_prepass_pipeline(
+    device: &Device,
+    impostor_bgl: &BindGroupLayout
+) -> RenderPipeline {
+    let shader = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("impostor_shader"),
+        source: ShaderSource::Wgsl(include_str!("shaders/rhombus_impostor.wgsl").into()),
+    });
+
+    let layout = device.create_pipeline_layout(
+        &(PipelineLayoutDescriptor {
+            label: Some("impostor_depth_prepass_pipeline_layout"),
+            bind_group_layouts: &[impostor_bgl],
+            push_constant_ranges: &[],
+        })
+    );
+
+    const ATTRS: [VertexAttribute; 4] =
+        vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32, 3 => Uint32];
+    let vbuf_layout = VertexBufferLayout {
+        array_stride: size_of::<RhombusInstance>() as BufferAddress,
+        step_mode: VertexStepMode::Instance,
+        attributes: &ATTRS,
+    };
+
+    device.create_render_pipeline(
+        &(RenderPipelineDescriptor {
+            label: Some("impostor_depth_prepass_pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main_prepass"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[vbuf_layout],
+            },
+            // Fragment runs the intersection and discards on silhouette miss,
+            // but writes no color (empty targets) — depth comes from the
+            // interpolated pushed VS output.
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main_prepass"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(depth_state_for(true)),
+            multisample: msaa_state(),
+            multiview: None,
+            cache: None,
+        })
+    )
+}
 pub fn build_impostor_transparent_pipeline(
     device: &Device,
     impostor_bgl: &BindGroupLayout,

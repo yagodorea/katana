@@ -40,27 +40,25 @@ struct VsOut {
 }
 
 fn get_axis_short(axis_long: vec3<f32>) -> vec3<f32> {
-    let axis_short = normalize(cross(axis_long, u.cam_forward.xyz));
-    if length(axis_short) >= 0.01 {
-        return axis_short;
-    }
-    // Fallback 1
-    let axis_short_f1 = normalize(cross(axis_long, vec3<f32>(0.0, 0.0, 1.0)));
-    if length(axis_short_f1) >= 0.01 {
-        return axis_short_f1;
-    }
-    // Fallback 2
-    return normalize(cross(axis_long, vec3<f32>(1.0, 0.0, 0.0)));
+    var side = cross(axis_long, u.cam_forward.xyz);
+    if length(side) < 1e-5 { side = cross(axis_long, vec3<f32>(0.0, 0.0, 1.0)); }
+    if length(side) < 1e-5 { side = cross(axis_long, vec3<f32>(1.0, 0.0, 0.0)); }
+    return normalize(side);
 }
 
-@vertex fn vs_main(in: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
+// R = bounding circle radius of the rhombus cross-section (vertex-to-center
+// of the rhombus diamond). Used for both billboard sizing and the depth
+// pre-pass push.
+fn rhombus_r() -> f32 {
+    return sqrt(u.half_width * u.half_width + u.half_height * u.half_height);
+}
+
+fn build_billboard(in: VsIn, vid: u32) -> VsOut {
     var out: VsOut;
-    let half_w   = u.half_width;
-    let half_h   = u.half_height;
     let color_id = in.color_flags & 0xFFu;
 
     let axis_long = vec3<f32>(in.dir, 0.0); // placeholder (correct direction, wrong position)
-    let r = sqrt(half_h * half_h + half_h * half_h);
+    let r = rhombus_r();
     let axis_short = get_axis_short(axis_long);
 
     /**
@@ -95,11 +93,43 @@ fn get_axis_short(axis_long: vec3<f32>) -> vec3<f32> {
     return out;
 }
 
+@vertex fn vs_main(in: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
+    return build_billboard(in, vid);
+}
+
+// Depth-only pre-pass entry point. Builds the same billboard, then shifts
+// the rasterized depth so it is a SAFE upper bound on the actual rhombus
+// surface depth at every pixel. The color pass uses LessEqual against this
+// depth, so visible fragments must pass — meaning the pre-pass depth must
+// be >= the deepest possible rhombus surface point.
+//
+// Why this enables HiZ:
+//   After the pre-pass, the depth buffer holds (for each pixel) the smallest
+//   such upper bound across all impostors covering it. The color pass tests
+//   actual_surface_z <= stored_upper_bound: passes for visible fragments,
+//   but hardware HiZ can early-reject fragments behind already-rendered
+//   closer rhombi (where actual_z would exceed the tile's max stored z).
+@vertex fn vs_main_prepass(in: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
+    var out = build_billboard(in, vid);
+    // Any rhombus surface point is within R of the centerline, so its
+    // component along cam_forward is bounded by R. Pushing the billboard
+    // by R along +cam_forward makes the rasterized depth a safe upper
+    // bound on the surface depth at every pixel, for any camera angle.
+    let pushed = out.world_pos + u.cam_forward.xyz * rhombus_r();
+    out.world_pos = pushed;
+    out.clip_pos = u.mvp * vec4<f32>(pushed, 1.0);
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Fragment shader — ray-rhombus-prism intersection
 // ---------------------------------------------------------------------------
 
-@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+// Ray-rhombus-prism intersection. Discards on miss; on hit returns the
+// enter_face index (0-3 = side faces, 4 = start cap, 5 = end cap) used by
+// fs_main for normal/shading. Both the color FS and the depth pre-pass FS
+// must call this so they agree on which pixels are inside the silhouette.
+fn intersect_or_discard(in: VsOut) -> i32 {
     let half_w = u.half_width;
     let half_h = u.half_height;
 
@@ -113,17 +143,15 @@ fn get_axis_short(axis_long: vec3<f32>) -> vec3<f32> {
     let ray_o = in.world_pos;
     let ray_d = u.cam_forward.xyz;
 
-    // Transform ray into segment-local space.
     let rel     = ray_o - in.seg_start;
     let local_o = vec3<f32>(dot(rel, axis_x),   dot(rel, axis_y),   dot(rel, axis_z));
     let local_d = vec3<f32>(dot(ray_d, axis_x), dot(ray_d, axis_y), dot(ray_d, axis_z));
 
-    // ---- X slab: x ∈ [0, seg_length] (start/end caps) ----
-    // enter_face: 4 = start cap (−x normal), 5 = end cap (+x normal), 0-3 = side faces
     var t_enter: f32 = -1e30;
     var t_exit:  f32 =  1e30;
     var enter_face: i32 = -1;
 
+    // X slab: x ∈ [0, seg_length]
     let dx = local_d.x;
     let ox = local_o.x;
     if abs(dx) < 1e-9 {
@@ -140,10 +168,7 @@ fn get_axis_short(axis_long: vec3<f32>) -> vec3<f32> {
         }
     }
 
-    // ---- 4 rhombus side-face planes: sy*y/hw + sz*z/hh = 1 ----
-    // Face i: sy = (-1)^(~i&1), sz = (-1)^(~(i>>1)&1)
-    // d_den < 0 → ray entering the half-space → t is enter candidate
-    // d_den > 0 → ray exiting the half-space  → t is exit candidate
+    // 4 rhombus side-face planes
     for (var i = 0u; i < 4u; i = i + 1u) {
         let sy = select(-1.0, 1.0, (i & 1u) == 1u);
         let sz = select(-1.0, 1.0, (i & 2u) == 2u);
@@ -153,7 +178,7 @@ fn get_axis_short(axis_long: vec3<f32>) -> vec3<f32> {
         let d_den = ny * local_d.y + nz * local_d.z;
 
         if abs(d_den) < 1e-9 {
-            if d_num < 0.0 { discard; } // parallel and outside this half-space
+            if d_num < 0.0 { discard; }
         } else if d_den < 0.0 {
             let t = d_num / d_den;
             if t > t_enter { t_enter = t; enter_face = i32(i); }
@@ -164,11 +189,16 @@ fn get_axis_short(axis_long: vec3<f32>) -> vec3<f32> {
     }
 
     if t_enter > t_exit || t_exit < 0.0 { discard; }
-    let t_hit = max(t_enter, 0.0);
+    return enter_face;
+}
 
-    // Reconstruct world-space hit point.
-    let lh       = local_o + t_hit * local_d;
-    let world_hit = in.seg_start + lh.x * axis_x + lh.y * axis_y + lh.z * axis_z;
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let enter_face = intersect_or_discard(in);
+    let half_w = u.half_width;
+    let half_h = u.half_height;
+    let axis_x = in.axis_long;
+    let axis_y = normalize(vec3<f32>(-axis_x.y, axis_x.x, 0.0));
+    let axis_z = vec3<f32>(0.0, 0.0, 1.0);
 
     // Normal from enter_face → world space.
     var n_local: vec3<f32>;
@@ -186,4 +216,14 @@ fn get_axis_short(axis_long: vec3<f32>) -> vec3<f32> {
     let light    = 0.15 + 0.85 * diffuse;
 
     return vec4<f32>(in.color.rgb * light, in.color.a);
+}
+
+// Depth pre-pass FS: discards on miss so the depth buffer is only written
+// for pixels actually inside the rhombus silhouette. Without this, billboard
+// corner pixels (outside the silhouette) would write phantom pushed depths
+// that incorrectly reject other billboards' surfaces at the same pixel in
+// the color pass, leaving the BG mesh visible through what should be opaque
+// filament.
+@fragment fn fs_main_prepass(in: VsOut) {
+    _ = intersect_or_discard(in);
 }

@@ -444,6 +444,7 @@ impl eframe::App for ViewerApp {
 
                 let bg_mode = self.bg_mode;
                 let light_dir = renderer_wgpu_port::headlight_dir(self.azimuth, self.elevation);
+                let cam_forward = renderer_wgpu_port::camera_forward(self.azimuth, self.elevation);
                 let renderer = self.renderer.clone();
                 let ppp = ctx.pixels_per_point();
                 let vw = (rect.width() * ppp).max(1.0) as u32;
@@ -455,6 +456,7 @@ impl eframe::App for ViewerApp {
                         renderer,
                         mvp,
                         light_dir,
+                        cam_forward,
                         bg_mode,
                         width: vw,
                         height: vh,
@@ -484,6 +486,7 @@ struct ViewerCallback {
     renderer: Arc<Mutex<renderer_wgpu_port::Renderer>>,
     mvp: [f32; 16],
     light_dir: [f32; 3],
+    cam_forward: [f32; 3],
     bg_mode: BgMode,
     width: u32,
     height: u32,
@@ -500,7 +503,7 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
     ) -> Vec<eframe::wgpu::CommandBuffer> {
         self.renderer.lock().unwrap().prepare(
             device, queue, encoder,
-            &self.mvp, &self.light_dir, self.bg_mode,
+            &self.mvp, &self.light_dir, &self.cam_forward, self.bg_mode,
             self.width, self.height,
         );
         Vec::new()
