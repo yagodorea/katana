@@ -19,8 +19,9 @@ pub struct FrameUniforms {
     // Scrubber highlight
     pub scrub_top_z: f32,
     pub scrub_dim: f32,
-    pub _pad0: f32,
-    pub _pad1: f32,
+    // Mid-segment scrub smoothing
+    pub scrub_partial_index: u32,
+    pub scrub_partial_frac: f32,
 }
 const _: () = assert!(std::mem::size_of::<FrameUniforms>() == 112);
 
@@ -100,6 +101,9 @@ pub struct InstancedBatch {
     pub layer_entries: Vec<LayerEntry>,
     /// Cumulative layer-time (s) at the end of each instance, ascending within each layer. Empty for non-scrubbed batches.
     pub instance_times: Vec<f32>,
+    /// Cumulative layer-time (s) at the *start* of each instance (parallel to
+    /// `instance_times`). Lets the scrubber truncate the in-progress segment.
+    pub instance_start_times: Vec<f32>,
 }
 
 pub struct LineLayerEntry {
@@ -182,7 +186,8 @@ pub fn make_instanced_batch(
     device: &Device,
     instances: &[RhombusInstance],
     layer_entries: Vec<LayerEntry>,
-    instance_times: Vec<f32>
+    instance_times: Vec<f32>,
+    instance_start_times: Vec<f32>
 ) -> InstancedBatch {
     let buffer = device.create_buffer_init(
         &(wgpu::util::BufferInitDescriptor {
@@ -191,7 +196,7 @@ pub fn make_instanced_batch(
             usage: BufferUsages::VERTEX,
         })
     );
-    InstancedBatch { buffer, layer_entries, instance_times }
+    InstancedBatch { buffer, layer_entries, instance_times, instance_start_times }
 }
 
 pub fn upload_mesh(device: &Device, verts: &[MeshVertex]) -> GpuBuffer {

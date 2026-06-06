@@ -166,7 +166,7 @@ use crate::renderer_wgpu_port::buffers::{ LineVertex, MeshVertex, RhombusInstanc
 const SCRUB_DIM: f32 = 0.25;
 
 /// Nozzle radial segments
-const NOZZLE_SEGMENTS: u32 = 24;
+const NOZZLE_SEGMENTS: u32 = 12;
 /// Vertices written for the nozzle each frame: cone side + top cap, 3 per tri.
 const NOZZLE_VERT_COUNT: u32 = NOZZLE_SEGMENTS * 3 * 2;
 /// Metallic grey, opaque
@@ -535,6 +535,7 @@ impl Renderer {
 
         let mut rhombus_instances: Vec<RhombusInstance> = Vec::new();
         let mut rhombus_times: Vec<f32> = Vec::new();
+        let mut rhombus_start_times: Vec<f32> = Vec::new();
         let mut rhombus_entries: Vec<buffers::LayerEntry> = Vec::new();
 
         let mut head_tracks: Vec<LayerHeadTrack> = Vec::new();
@@ -611,6 +612,7 @@ impl Renderer {
                             color_flags: (color_id as u32) | ((flags as u32) << 8),
                         });
                         rhombus_times.push(elapsed_s);
+                        rhombus_start_times.push(elapsed_s - seg_len / speed);
                     }
                 }
             }
@@ -663,7 +665,8 @@ impl Renderer {
                 &self.device,
                 &rhombus_instances,
                 rhombus_entries,
-                rhombus_times
+                rhombus_times,
+                rhombus_start_times
             )
         );
         self.head_tracks = head_tracks;
@@ -713,6 +716,10 @@ impl Renderer {
         // Dimming is only active while scrubbing
         let fg_scrub_dim = if self.is_scrubbing { SCRUB_DIM } else { 1.0 };
 
+        // In-progress top-layer segment to truncate
+        let partial = self.rhombus_partial_cut();
+        let (partial_index, partial_frac) = partial.map_or((u32::MAX, 1.0), |(i, f)| (i, f));
+
         let bg_uniforms = FrameUniforms {
             mvp: mvp_mat,
             light_dir: light_dir4,
@@ -722,8 +729,8 @@ impl Renderer {
             half_width: self.half_width,
             scrub_top_z: -1e30, // background never dims
             scrub_dim: 1.0,
-            _pad0: 0.0,
-            _pad1: 0.0,
+            scrub_partial_index: u32::MAX, // background never truncates
+            scrub_partial_frac: 1.0,
         };
         let fg_uniforms = FrameUniforms {
             mvp: mvp_mat,
@@ -734,8 +741,8 @@ impl Renderer {
             half_width: self.half_width,
             scrub_top_z: self.scrub_top_z,
             scrub_dim: fg_scrub_dim,
-            _pad0: 0.0,
-            _pad1: 0.0,
+            scrub_partial_index: partial_index,
+            scrub_partial_frac: partial_frac,
         };
         queue.write_buffer(&self.frame_uniform_buffer_bg, 0, bytemuck::bytes_of(&bg_uniforms));
         queue.write_buffer(&self.frame_uniform_buffer_fg, 0, bytemuck::bytes_of(&fg_uniforms));
@@ -795,7 +802,7 @@ impl Renderer {
             let tip = [hx, hy, self.scrub_top_z + self.half_height];
             let radius = self.half_width * 6.0;
             let height = radius * 4.0;
-            let verts = build_nozzle_verts(tip, radius, height);
+            let verts = build_nozzle_verts(tip, radius, height, self.scrub_top_z);
             queue.write_buffer(&self.nozzle_buffer.buffer, 0, bytemuck::cast_slice(&verts));
         }
 
@@ -845,7 +852,8 @@ impl Renderer {
                             self.clip_z_min,
                             mvp,
                             self.half_height,
-                            self.scrub_fraction
+                            self.scrub_fraction,
+                            partial_index
                         );
                     }
                 } else {
@@ -955,6 +963,43 @@ impl Renderer {
         let threshold = self.scrub_fraction * total;
         Some(head_position_at(track, threshold))
     }
+
+    /// Returns the index of the current rhombus being scrubbed and the fraction of it we need to show
+    fn rhombus_partial_cut(&self) -> Option<(u32, f32)> {
+        if !self.is_scrubbing {
+            return None;
+        }
+        let batch = self.toolpath_rhombuses.as_ref()?;
+        let scrubbed_layer = batch.layer_entries
+            .partition_point(|e| e.layer_z <= self.clip_z_max)
+            .checked_sub(1)?;
+        let entry = batch.layer_entries.get(scrubbed_layer)?;
+        let instance_count = entry.instance_count as usize;
+        let instances_below: usize = batch.layer_entries[..scrubbed_layer]
+            .iter()
+            .map(|e| e.instance_count as usize)
+            .sum();
+
+        let threshold = self.scrub_fraction * entry.time_total;
+        // Whole segments completed by `threshold`
+        let draw_count = batch.instance_times[
+            instances_below..instances_below + instance_count
+        ].partition_point(|&t| t <= threshold);
+        if draw_count >= instance_count {
+            return None; // layer fully printed; no segment in progress
+        }
+        // instance index
+        let gidx = instances_below + draw_count;
+        let start_t = batch.instance_start_times[gidx];
+        let end_t = batch.instance_times[gidx];
+        if threshold <= start_t {
+            return None; // head is on a travel move before this extrusion starts
+        }
+        let span = end_t - start_t;
+        // instance fraction
+        let frac = if span > 1e-9 { (threshold - start_t) / span } else { 1.0 };
+        Some((gidx as u32, frac.clamp(0.0, 1.0)))
+    }
 }
 
 /// Returns the position to sit the nozzle tip over. `track` is guaranteed non-empty.
@@ -978,9 +1023,10 @@ fn head_position_at(track: &LayerHeadTrack, threshold: f32) -> [f32; 2] {
 
 /// Build a downward-pointing cone (the nozzle): tip at `tip`, opening upward to
 /// a circle of `radius` at z = `tip.z + height`. Flat-shaded (one face normal
-/// per triangle). Every vertex carries `layer_z = -1e30` so the mesh shader's
-/// fragment z-clip never discards it. Returns exactly `NOZZLE_VERT_COUNT` verts.
-fn build_nozzle_verts(tip: [f32; 3], radius: f32, height: f32) -> Vec<MeshVertex> {
+/// per triangle). Every vertex carries `clip_z` as its `layer_z` clip key so it
+/// survives the mesh shader's fragment z-clip — pass a value inside the active
+/// [clip_z_min, clip_z_max] range. Returns exactly `NOZZLE_VERT_COUNT` verts.
+fn build_nozzle_verts(tip: [f32; 3], radius: f32, height: f32, clip_z: f32) -> Vec<MeshVertex> {
     let n = NOZZLE_SEGMENTS;
     let base_z = tip[2] + height;
     let center_top = [tip[0], tip[1], base_z];
@@ -1004,7 +1050,7 @@ fn build_nozzle_verts(tip: [f32; 3], radius: f32, height: f32) -> Vec<MeshVertex
         let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt().max(1e-6);
         nrm = [nrm[0] / len, nrm[1] / len, nrm[2] / len];
         for p in [p0, p1, p2] {
-            verts.push(MeshVertex { pos: p, normal: nrm, color: NOZZLE_COLOR, layer_z: -1e30 });
+            verts.push(MeshVertex { pos: p, normal: nrm, color: NOZZLE_COLOR, layer_z: clip_z });
         }
     };
 
@@ -1035,7 +1081,8 @@ fn draw_rhombus_batch(
     clip_z_min: f32,
     mvp: &[f32; 16],
     half_height: f32,
-    scrub_fraction: f32
+    scrub_fraction: f32,
+    partial_index: u32
 ) {
     // Binary-search the visible layer range. layer_entries is sorted ascending.
     let start_idx = batch.layer_entries.partition_point(|e| e.layer_z < clip_z_min);
@@ -1068,7 +1115,7 @@ fn draw_rhombus_batch(
         // Only the topmost visible layer is scrubbed; layers below are full.
         // The cutoff is time-based: keep instances whose cumulative layer-time
         // is within `scrub_fraction` of the layer's total print time.
-        let draw_count = if start_idx + i == top_idx && scrub_fraction < 1.0 {
+        let mut draw_count = if start_idx + i == top_idx && scrub_fraction < 1.0 {
             let threshold = scrub_fraction * entry.time_total;
             let lo = layer_first_instance as usize;
             let times = &batch.instance_times[lo..lo + (full as usize)];
@@ -1076,6 +1123,11 @@ fn draw_rhombus_batch(
         } else {
             full
         };
+        // Include the in-progress segment (top layer only; the shader shrinks it to its printed fraction)
+        // Guarding on top_idx avoids a false match at a layer boundary when the in-progress segment is the top layer's first.
+        if start_idx + i == top_idx && partial_index == layer_first_instance + draw_count {
+            draw_count += 1;
+        }
 
         let outside = Renderer::aabb_outside_frustum(
             &planes,

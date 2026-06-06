@@ -10,8 +10,8 @@ struct Uniforms {
     half_width:  f32,         //  4 B, offset 92
     scrub_top_z: f32,         //  4 B, offset 96
     scrub_dim:   f32,         //  4 B, offset 100
-    _pad0:       f32,         //  4 B, offset 104
-    _pad1:       f32,         //  4 B, offset 108 — round struct size to 112
+    scrub_partial_index: u32, //  4 B, offset 104 — instance to truncate (u32::MAX = none)
+    scrub_partial_frac:  f32, //  4 B, offset 108 — fraction of its length to keep
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -42,7 +42,11 @@ struct VsOut {
     @location(2)                    layer_z:  f32,
 }
 
-@vertex fn vs_main(in: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
+@vertex fn vs_main(
+    in: VsIn,
+    @builtin(vertex_index) vid: u32,
+    @builtin(instance_index) iid: u32,
+) -> VsOut {
     var out: VsOut;
 
     let color_id = in.color_flags & 0xFFu;
@@ -52,7 +56,10 @@ struct VsOut {
     let half_w  = u.half_width;
     let seg_dir = vec3(in.dir, 0.0);
     let perp    = vec3(-seg_dir.y, seg_dir.x, 0.0);
-    let seg_len = in.length;
+    // Truncate the single in-progress segment so the filament grows smoothly
+    // with the scrubber instead of snapping in whole-segment steps.
+    let frac    = select(1.0, u.scrub_partial_frac, iid == u.scrub_partial_index);
+    let seg_len = in.length * frac;
     let up = vec3(0.0, 0.0, 1.0);
 
     let cross_offsets = array<vec3<f32>, 4>(
