@@ -165,6 +165,20 @@ use crate::renderer_wgpu_port::buffers::{ LineVertex, MeshVertex, RhombusInstanc
 /// Brightness multiplier applied to layers *below* the one being scrubbed
 const SCRUB_DIM: f32 = 0.25;
 
+/// Nozzle radial segments
+const NOZZLE_SEGMENTS: u32 = 24;
+/// Vertices written for the nozzle each frame: cone side + top cap, 3 per tri.
+const NOZZLE_VERT_COUNT: u32 = NOZZLE_SEGMENTS * 3 * 2;
+/// Metallic grey, opaque
+const NOZZLE_COLOR: [f32; 4] = [0.75, 0.76, 0.8, 1.0];
+
+/// Print-head positions over time for a single layer, in print order with travel and extrusion merged.
+struct LayerHeadTrack {
+    layer_z: f32,
+    times: Vec<f32>,
+    points: Vec<[f32; 2]>,
+}
+
 pub struct Renderer {
     // wgpu's `Device` is cheap to clone (internal Arc); kept here so `paint`
     // can build a transient bind group without threading device through.
@@ -234,6 +248,10 @@ pub struct Renderer {
     pub is_scrubbing: bool,
     // World z of the layer currently being scrubbed
     pub scrub_top_z: f32,
+
+    // Per-layer print-head timelines, ascending by layer_z.
+    head_tracks: Vec<LayerHeadTrack>,
+    nozzle_buffer: GpuBuffer,
 }
 
 impl Renderer {
@@ -368,6 +386,18 @@ impl Renderer {
             &blit_sampler
         );
 
+        let nozzle_buffer = GpuBuffer {
+            buffer: device.create_buffer(
+                &(BufferDescriptor {
+                    label: Some("nozzle_vbo"),
+                    size: (NOZZLE_VERT_COUNT as u64) * (size_of::<MeshVertex>() as u64),
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            ),
+            vertex_count: NOZZLE_VERT_COUNT,
+        };
+
         Self {
             device,
             frame_uniform_buffer_bg,
@@ -406,6 +436,8 @@ impl Renderer {
             scrub_fraction: 1.0,
             is_scrubbing: false,
             scrub_top_z: 0.0,
+            head_tracks: Vec::new(),
+            nozzle_buffer,
         }
     }
 
@@ -505,10 +537,17 @@ impl Renderer {
         let mut rhombus_times: Vec<f32> = Vec::new();
         let mut rhombus_entries: Vec<buffers::LayerEntry> = Vec::new();
 
+        let mut head_tracks: Vec<LayerHeadTrack> = Vec::new();
+
         for pl in planned_layers {
             // One timeline per layer, accumulating travel + extrusion time in
             // the order the nozzle actually prints them.
             let mut elapsed_s = 0.0f32;
+            let mut track = LayerHeadTrack {
+                layer_z: pl.z,
+                times: Vec::new(),
+                points: Vec::new(),
+            };
             let travel_v0 = travel_verts.len();
             let path_v0 = path_verts.len();
             let rho0 = rhombus_instances.len();
@@ -545,7 +584,15 @@ impl Renderer {
                     // run advances the same wall-clock as a short slow perimeter.
                     // Mid-segment smoothing is a top-layer-only concern, handled
                     // separately, so lower layers stay one-primitive-per-segment.
+                    // Seed the timeline with the layer's very first point at t=0,
+                    // then stamp each segment's endpoint at its arrival time.
+                    if track.points.is_empty() {
+                        track.times.push(0.0);
+                        track.points.push([a.x, a.y]);
+                    }
                     elapsed_s += seg_len / speed;
+                    track.times.push(elapsed_s);
+                    track.points.push([b.x, b.y]);
 
                     if mv.kind == MoveKind::Travel {
                         travel_verts.push(LineVertex { pos: [a.x, a.y, pl.z], color: line_color });
@@ -571,6 +618,9 @@ impl Renderer {
             // Same full-layer time stamped on every buffer's entry, so one
             // threshold cuts travel and extrusion at the same instant.
             let layer_total = elapsed_s;
+            if !track.points.is_empty() {
+                head_tracks.push(track);
+            }
             if travel_verts.len() > travel_v0 {
                 travel_entries.push(buffers::LineLayerEntry {
                     layer_z: pl.z,
@@ -616,6 +666,7 @@ impl Renderer {
                 rhombus_times
             )
         );
+        self.head_tracks = head_tracks;
     }
 
     /// Per-frame: write uniforms, resize offscreen if needed, render the 3D
@@ -737,6 +788,17 @@ impl Renderer {
             }
         }
 
+        // While scrubbing, place the nozzle over the current print-head position
+        let head = if self.is_scrubbing { self.nozzle_head_position() } else { None };
+        let draw_nozzle = head.is_some();
+        if let Some([hx, hy]) = head {
+            let tip = [hx, hy, self.scrub_top_z + self.half_height];
+            let radius = self.half_width * 6.0;
+            let height = radius * 4.0;
+            let verts = build_nozzle_verts(tip, radius, height);
+            queue.write_buffer(&self.nozzle_buffer.buffer, 0, bytemuck::cast_slice(&verts));
+        }
+
         // Foreground pass: load color, clear depth
         {
             let mut pass = encoder.begin_render_pass(
@@ -819,6 +881,13 @@ impl Renderer {
                     }
                 }
             }
+
+            if draw_nozzle {
+                pass.set_pipeline(&self.mesh_opaque_pipeline);
+                pass.set_bind_group(0, &self.frame_bind_group_fg, &[]);
+                pass.set_vertex_buffer(0, self.nozzle_buffer.buffer.slice(..));
+                pass.draw(0..self.nozzle_buffer.vertex_count, 0..1);
+            }
         }
     }
 
@@ -877,6 +946,75 @@ impl Renderer {
         }
         false
     }
+
+    /// XY of the print head at the current scrub instant on the top visible layer, or `None` when there's no toolpath to follow.
+    fn nozzle_head_position(&self) -> Option<[f32; 2]> {
+        let idx = self.head_tracks.partition_point(|t| t.layer_z <= self.clip_z_max);
+        let track = self.head_tracks.get(idx.checked_sub(1)?)?;
+        let total = *track.times.last()?;
+        let threshold = self.scrub_fraction * total;
+        Some(head_position_at(track, threshold))
+    }
+}
+
+/// Returns the position to sit the nozzle tip over. `track` is guaranteed non-empty.
+fn head_position_at(track: &LayerHeadTrack, threshold: f32) -> [f32; 2] {
+    // `reached` = count of samples at or before threshold = index of the first
+    // sample after it. The head sits on segment [reached-1, reached], advanced
+    // through it by how far `threshold` falls into that segment's time span.
+    let reached = track.times.partition_point(|&t| t <= threshold);
+    if reached == 0 {
+        return track.points[0]; // before the first sample (times[0] == 0)
+    }
+    if reached >= track.points.len() {
+        return track.points[track.points.len() - 1]; // at/past the final sample
+    }
+    let (p0, p1) = (track.points[reached - 1], track.points[reached]);
+    let (t0, t1) = (track.times[reached - 1], track.times[reached]);
+    let span = t1 - t0;
+    let f = if span > 1e-9 { (threshold - t0) / span } else { 0.0 };
+    [p0[0] + (p1[0] - p0[0]) * f, p0[1] + (p1[1] - p0[1]) * f]
+}
+
+/// Build a downward-pointing cone (the nozzle): tip at `tip`, opening upward to
+/// a circle of `radius` at z = `tip.z + height`. Flat-shaded (one face normal
+/// per triangle). Every vertex carries `layer_z = -1e30` so the mesh shader's
+/// fragment z-clip never discards it. Returns exactly `NOZZLE_VERT_COUNT` verts.
+fn build_nozzle_verts(tip: [f32; 3], radius: f32, height: f32) -> Vec<MeshVertex> {
+    let n = NOZZLE_SEGMENTS;
+    let base_z = tip[2] + height;
+    let center_top = [tip[0], tip[1], base_z];
+
+    // i-th point on the base ring (the wide, upper end of the cone).
+    let ring = |i: u32| -> [f32; 3] {
+        let a = (((i % n) as f32) / (n as f32)) * std::f32::consts::TAU;
+        [tip[0] + radius * a.cos(), tip[1] + radius * a.sin(), base_z]
+    };
+
+    let mut verts: Vec<MeshVertex> = Vec::with_capacity(NOZZLE_VERT_COUNT as usize);
+    let mut push_tri = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3]| {
+        // Face normal from two edges (cull_mode is None, so winding is cosmetic).
+        let u = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        let v = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+        let mut nrm = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt().max(1e-6);
+        nrm = [nrm[0] / len, nrm[1] / len, nrm[2] / len];
+        for p in [p0, p1, p2] {
+            verts.push(MeshVertex { pos: p, normal: nrm, color: NOZZLE_COLOR, layer_z: -1e30 });
+        }
+    };
+
+    for i in 0..n {
+        let a = ring(i);
+        let b = ring(i + 1);
+        push_tri(tip, a, b); // cone side
+        push_tri(center_top, b, a); // top cap closes the wide end
+    }
+    verts
 }
 
 // ---------------------------------------------------------------------------
