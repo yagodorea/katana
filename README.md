@@ -24,7 +24,8 @@ This workspace contains 3 programs:
 - [X] GPU-rendered visualizer built on `eframe` and `glow`
 - [ ] :loading: Calculate travel moves and segment connections
     - [X] Fix issue where all layer travels start from 0,0
-- [ ] Horizontal slider
+- [X] Horizontal slider
+    - [X] Render scrubber nozzle
 - [ ] G-code export
 - [ ] Add more infill patterns
 - [ ] Add support for supports
