@@ -195,22 +195,39 @@ fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>, cfg: &SpeedConfig) 
         let perp_x = -dir_y;
         let perp_y = dir_x;
 
+        // Perpendicular coordinate ("row") of a scanline. Constant along the
+        // line since it runs parallel to `dir`, so start and end share it.
+        let row_of = |l: &InfillLine| -> f32 {
+            (l.start.x + l.end.x) * perp_x + (l.start.y + l.end.y) * perp_y
+        };
+
         // Sort lines by perpendicular projection (scanline order)
         let mut indices: Vec<usize> = (0..lines.len()).collect();
         indices.sort_unstable_by(|&a, &b| {
-            let la = &lines[a];
-            let lb = &lines[b];
-            let mid_a = (la.start.x + la.end.x) * perp_x + (la.start.y + la.end.y) * perp_y;
-            let mid_b = (lb.start.x + lb.end.x) * perp_x + (lb.start.y + lb.end.y) * perp_y;
-            mid_a.partial_cmp(&mid_b).unwrap_or(std::cmp::Ordering::Equal)
+            row_of(&lines[a]).partial_cmp(&row_of(&lines[b])).unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        // Recover scanline spacing as the smallest positive gap between
+        // adjacent rows. A single solid region steps one spacing per row; a
+        // jump to a disjoint island (now common with internal surfaces) spans
+        // a different/larger gap and must travel, not extrude, otherwise the
+        // zigzag draws filament straight across open voids.
+        let mut spacing = f32::INFINITY;
+        for w in indices.windows(2) {
+            let gap = (row_of(&lines[w[1]]) - row_of(&lines[w[0]])).abs();
+            if gap > 1e-4 {
+                spacing = spacing.min(gap);
+            }
+        }
+
         // Serpentine: alternate direction each scanline row, connecting
-        // consecutive lines with extrusion to form a continuous zigzag.
+        // consecutive lines with extrusion only when they are actually
+        // adjacent (one row up, short hop); jumps between islands travel.
         let mut forward = true;
-        let mut inside_surface = false;
+        let mut prev_row: Option<f32> = None;
         for &idx in &indices {
             let line = &lines[idx];
+            let row = row_of(line);
 
             // Project endpoints onto the line direction to determine ordering
             let proj_s = line.start.x * dir_x + line.start.y * dir_y;
@@ -222,15 +239,22 @@ fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>, cfg: &SpeedConfig) 
                 (line.end, line.start)
             };
 
-            // Connect to next scanline
+            // Connect to this scanline. Extrude only for a true serpentine step:
+            // exactly one row higher than the previous line and a short hop.
             if !points_equal(&current_pos, &start) {
-                if inside_surface {
-                    // Adjacent scanlines: connect with extrusion (distance ~nozzle_width)
-                    moves.push(Move::new(MoveKind::SurfaceInfill, vec![current_pos, start], cfg));
-                } else {
-                    // First line: travel to it
-                    moves.push(Move::new(MoveKind::Travel, vec![current_pos, start], cfg));
-                }
+                let adjacent = match prev_row {
+                    Some(pr) => {
+                        let perp_gap = (row - pr).abs();
+                        let hop = distance_squared(&current_pos, &start).sqrt();
+                        spacing.is_finite() &&
+                            perp_gap > 0.5 * spacing &&
+                            perp_gap <= 1.5 * spacing &&
+                            hop <= 2.5 * spacing
+                    }
+                    None => false,
+                };
+                let kind = if adjacent { MoveKind::SurfaceInfill } else { MoveKind::Travel };
+                moves.push(Move::new(kind, vec![current_pos, start], cfg));
             }
 
             // Add surface infill move
@@ -238,7 +262,7 @@ fn plan_layer(layer: &ToolpathLayer, start_pos: Point2<f32>, cfg: &SpeedConfig) 
 
             current_pos = end;
             forward = !forward;
-            inside_surface = true;
+            prev_row = Some(row);
         }
     }
 
@@ -490,6 +514,84 @@ mod tests {
         // because (10, 0) is closer to (5, 0) than any point on the top line
         assert_eq!(ordered[0].0, 0);
         assert!(!ordered[0].1); // Not flipped
+    }
+
+    /// Build a ToolpathLayer carrying only surface infill lines.
+    fn surface_layer(lines: Vec<InfillLine>) -> ToolpathLayer {
+        ToolpathLayer {
+            z: 0.0,
+            layer_index: 0,
+            perimeter_sets: Vec::new(),
+            infill_lines: Vec::new(),
+            surface_infill_lines: lines,
+        }
+    }
+
+    /// Horizontal scanline at height `y` from `x0` to `x1`.
+    fn hline(y: f32, x0: f32, x1: f32) -> InfillLine {
+        InfillLine { start: Point2::new(x0, y), end: Point2::new(x1, y) }
+    }
+
+    fn move_len(m: &Move) -> f32 {
+        (m.points[1] - m.points[0]).norm()
+    }
+
+    #[test]
+    fn surface_infill_does_not_extrude_across_disjoint_islands() {
+        // Two solid patches at the same rows but far apart along the scan
+        // direction, like two decks separated by an open cockpit. The
+        // serpentine must travel between them, never extrude across the void.
+        let s = 0.4;
+        let lines = vec![
+            hline(0.0, 0.0, 4.0),
+            hline(s, 0.0, 4.0),
+            hline(2.0 * s, 0.0, 4.0),
+            hline(0.0, 50.0, 54.0),
+            hline(s, 50.0, 54.0),
+            hline(2.0 * s, 50.0, 54.0)
+        ];
+        let planned = plan_layer(
+            &surface_layer(lines),
+            Point2::new(0.0, 0.0),
+            &SpeedConfig::default()
+        );
+
+        // No extruded surface move may span the ~50mm gap between islands.
+        let longest_extrusion = planned.moves
+            .iter()
+            .filter(|m| m.kind == MoveKind::SurfaceInfill)
+            .map(move_len)
+            .fold(0.0_f32, f32::max);
+        assert!(
+            longest_extrusion <= 5.0,
+            "surface infill extruded across a void: longest extrusion {longest_extrusion:.1}mm"
+        );
+    }
+
+    #[test]
+    fn surface_infill_serpentine_extrudes_within_one_island() {
+        // A single contiguous patch: adjacent rows must be joined by extruded
+        // connectors (a continuous zigzag), with only the initial approach as a
+        // travel.
+        let s = 0.4;
+        let lines = vec![hline(0.0, 0.0, 4.0), hline(s, 0.0, 4.0), hline(2.0 * s, 0.0, 4.0)];
+        let planned = plan_layer(
+            &surface_layer(lines),
+            Point2::new(100.0, 100.0),
+            &SpeedConfig::default()
+        );
+
+        let surface = planned.moves
+            .iter()
+            .filter(|m| m.kind == MoveKind::SurfaceInfill)
+            .count();
+        let travels = planned.moves
+            .iter()
+            .filter(|m| m.kind == MoveKind::Travel)
+            .count();
+        // 3 scanlines + 2 extruded connectors; a single travel to reach the start.
+        assert_eq!(surface, 5, "expected 3 scanlines + 2 extruded connectors");
+        assert_eq!(travels, 1, "expected only the initial approach travel");
     }
 
     #[test]

@@ -22,7 +22,7 @@ This workspace contains 3 programs:
 - [X] Parameterizes slicing and toolpathing powered by `nalgebra` and `i_overlay`
 - [X] Rectilinear infill
 - [X] GPU-rendered visualizer built on `eframe` and `glow`
-- [ ] :loading: Calculate travel moves and segment connections
+- [X] Calculate travel moves and segment connections
     - [X] Fix issue where all layer travels start from 0,0
 - [X] Horizontal slider
     - [X] Render scrubber nozzle
@@ -44,8 +44,8 @@ This workspace contains 3 programs:
 ### Bugs to fix
 - [ ] Fix origin point of exported G-code
 - [ ] Fix slicing artifacts
-    - [ ] Surfaces below max z don't get surface infill
-    - [ ] Holes in the top layer get covered by surface infill
+    - [X] Surfaces below max z don't get surface infill
+    - [X] Holes in the top layer get covered by surface infill
     - [ ] Liver slice artifact on layer 280
 
 ### Rendering performance improvements

@@ -1,7 +1,7 @@
 use nalgebra::Point2;
 
 use crate::simplify;
-use crate::slicer::{Contour, Layer, SliceResult};
+use crate::slicer::{ Contour, Layer, SliceResult };
 
 /// Max perpendicular deviation (mm) tolerated when simplifying perimeter loops.
 /// Kept well below nozzle resolution so it never affects print quality, only
@@ -130,8 +130,9 @@ fn point_in_polygon(point: &Point2<f32>, polygon: &[Point2<f32>]) -> bool {
     for i in 0..n {
         let pi = &polygon[i];
         let pj = &polygon[j];
-        if ((pi.y > point.y) != (pj.y > point.y))
-            && (point.x < (pj.x - pi.x) * (point.y - pi.y) / (pj.y - pi.y) + pi.x)
+        if
+            (pi.y > point.y) != (pj.y > point.y) &&
+            point.x < ((pj.x - pi.x) * (point.y - pi.y)) / (pj.y - pi.y) + pi.x
         {
             inside = !inside;
         }
@@ -191,8 +192,14 @@ fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
     let n = contours.len();
 
     // Precompute AABBs and signed areas for all contours
-    let aabbs: Vec<Aabb> = contours.iter().map(|c| Aabb::from_points(&c.points)).collect();
-    let areas: Vec<f32> = contours.iter().map(|c| signed_area(&c.points)).collect();
+    let aabbs: Vec<Aabb> = contours
+        .iter()
+        .map(|c| Aabb::from_points(&c.points))
+        .collect();
+    let areas: Vec<f32> = contours
+        .iter()
+        .map(|c| signed_area(&c.points))
+        .collect();
 
     // For each contour, count how many other contours contain its first point.
     // Even depth = outer boundary; odd depth = hole.
@@ -201,9 +208,10 @@ fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
     for i in 0..n {
         if let Some(test_pt) = contours[i].points.first() {
             for j in 0..n {
-                if i != j
-                    && aabbs[j].contains(test_pt)
-                    && point_in_polygon(test_pt, &contours[j].points)
+                if
+                    i != j &&
+                    aabbs[j].contains(test_pt) &&
+                    point_in_polygon(test_pt, &contours[j].points)
                 {
                     depth[i] += 1;
                 }
@@ -212,7 +220,7 @@ fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
     }
 
     let mut outers: Vec<(usize, f32)> = Vec::new(); // (index, abs_area)
-    let mut holes: Vec<(usize, f32)> = Vec::new();  // (index, signed_area)
+    let mut holes: Vec<(usize, f32)> = Vec::new(); // (index, signed_area)
 
     for i in 0..n {
         let area = areas[i];
@@ -248,9 +256,10 @@ fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
             let mut best_area = f32::INFINITY;
 
             for (shape_idx, &(outer_idx, outer_abs_area)) in outer_indices.iter().enumerate() {
-                if outer_abs_area < best_area
-                    && aabbs[outer_idx].contains(test_point)
-                    && point_in_polygon(test_point, &contours[outer_idx].points)
+                if
+                    outer_abs_area < best_area &&
+                    aabbs[outer_idx].contains(test_point) &&
+                    point_in_polygon(test_point, &contours[outer_idx].points)
                 {
                     best_outer = Some(shape_idx);
                     best_area = outer_abs_area;
@@ -284,7 +293,11 @@ fn classify_contours(contours: &[Contour]) -> Vec<OverlayShape> {
 /// At steep surface angles (near vertical) the layers stack tightly and no
 /// extra perimeters are needed. At shallow angles the horizontal gap between
 /// successive layer contours grows, requiring additional walls to cover it.
-pub fn extra_perimeters_for_angle(surface_angle: f32, layer_height: f32, nozzle_width: f32) -> usize {
+pub fn extra_perimeters_for_angle(
+    surface_angle: f32,
+    layer_height: f32,
+    nozzle_width: f32
+) -> usize {
     // Vertical or near-vertical surfaces need no extra perimeters.
     // Also guard against division by zero (tan(90°) = ∞ is fine, tan(0°) = 0).
     const MIN_ANGLE: f32 = 0.01; // ~0.6°
@@ -300,7 +313,7 @@ pub fn extra_perimeters_for_angle(surface_angle: f32, layer_height: f32, nozzle_
     }
 
     let horizontal_gap = layer_height / surface_angle.tan();
-    let total_walls_needed = (ALPHA * horizontal_gap / nozzle_width).ceil() as usize;
+    let total_walls_needed = ((ALPHA * horizontal_gap) / nozzle_width).ceil() as usize;
     // At least 1 wall is already covered by the base perimeter count, so
     // subtract 1 (but never go below 0).
     total_walls_needed.saturating_sub(1)
@@ -311,17 +324,55 @@ pub fn extra_perimeters_for_angle(surface_angle: f32, layer_height: f32, nozzle_
 // ---------------------------------------------------------------------------
 
 use i_overlay::mesh::outline::offset::OutlineOffset;
-use i_overlay::mesh::style::{LineJoin, OutlineStyle};
+use i_overlay::mesh::style::{ LineJoin, OutlineStyle };
+use i_overlay::core::fill_rule::FillRule;
+use i_overlay::core::overlay_rule::OverlayRule;
+use i_overlay::float::single::SingleFloatOverlay;
 
-/// Generate perimeter toolpaths and infill for a single layer.
-pub fn generate_perimeters(
+/// A planar region as a flat list of rings (outer boundaries and holes mixed).
+type Region = Vec<Vec<[f32; 2]>>;
+
+/// Boolean difference `subj − clip`.
+/// Degenerate cases: an empty subject yields nothing, and an empty clip leaves the subject untouched
+fn region_difference(subj: &Region, clip: &Region) -> Region {
+    if subj.is_empty() {
+        return Region::new();
+    }
+    if clip.is_empty() {
+        return subj.clone();
+    }
+    let shapes = subj.overlay(clip, OverlayRule::Difference, FillRule::EvenOdd);
+    shapes.into_iter().flatten().collect()
+}
+
+/// Boolean union `a union b`.
+fn region_union(a: &Region, b: &Region) -> Region {
+    if a.is_empty() {
+        return b.clone();
+    }
+    if b.is_empty() {
+        return a.clone();
+    }
+    let shapes = a.overlay(b, OverlayRule::Union, FillRule::EvenOdd);
+    shapes.into_iter().flatten().collect()
+}
+
+struct LayerPerimeters {
+    z: f32,
+    layer_index: usize,
+    perimeter_sets: Vec<PerimeterSet>,
+    /// Combined fillable region across all perimeter sets, for boolean ops.
+    region: Region,
+}
+
+/// Pass 1: generate perimeter walls and the fillable interior region for one
+/// layer, with no knowledge of neighbouring layers. The combined region is
+/// kept so pass 2 can compute top/bottom solid surfaces via boolean ops.
+fn build_layer_perimeters(
     layer: &Layer,
     layer_index: usize,
-    total_layers: usize,
-    perim_config: &PerimeterConfig,
-    infill_config: &InfillConfig,
-    surface_config: &SurfaceConfig,
-) -> ToolpathLayer {
+    perim_config: &PerimeterConfig
+) -> LayerPerimeters {
     let shapes = classify_contours(&layer.contours);
     let mut perimeter_sets = Vec::new();
 
@@ -329,7 +380,7 @@ pub fn generate_perimeters(
     let extra = extra_perimeters_for_angle(
         layer.min_surface_angle,
         perim_config.layer_height,
-        perim_config.nozzle_width,
+        perim_config.nozzle_width
     );
     let effective_perimeter_count = perim_config.perimeter_count + extra;
 
@@ -349,8 +400,7 @@ pub fn generate_perimeters(
             };
 
             // Negative offset = shrink inward
-            let style = OutlineStyle::new(-inset)
-                .line_join(LineJoin::Miter(2.0));
+            let style = OutlineStyle::new(-inset).line_join(LineJoin::Miter(2.0));
 
             let mut level_perimeters = Vec::new();
 
@@ -363,7 +413,7 @@ pub fn generate_perimeters(
                         // simplification pass to drop near-collinear points
                         let points = simplify::douglas_peucker(
                             &overlay_to_points(ring),
-                            PERIMETER_SIMPLIFY_TOLERANCE,
+                            PERIMETER_SIMPLIFY_TOLERANCE
                         );
                         if points.len() >= 3 {
                             level_perimeters.push(Perimeter { points });
@@ -383,16 +433,19 @@ pub fn generate_perimeters(
         // The last valid offset result is the centerline of the innermost
         // perimeter.  Shrink it by half a nozzle width so infill fills up to
         // the inner edge of that wall instead of overlapping its centerline.
-        let infill_offset_style = OutlineStyle::new(-perim_config.nozzle_width / 2.0)
-            .line_join(LineJoin::Miter(2.0));
+        let infill_offset_style = OutlineStyle::new(-perim_config.nozzle_width / 2.0).line_join(
+            LineJoin::Miter(2.0)
+        );
         let infill_shapes: Vec<OverlayShape> = current_shapes.outline(&infill_offset_style);
 
         let infill_boundary = infill_shapes
             .iter()
             .flat_map(|s| {
-                s.iter().filter(|ring| ring.len() >= 3).map(|ring| Contour {
-                    points: overlay_to_points(ring),
-                })
+                s.iter()
+                    .filter(|ring| ring.len() >= 3)
+                    .map(|ring| Contour {
+                        points: overlay_to_points(ring),
+                    })
             })
             .collect();
 
@@ -402,45 +455,104 @@ pub fn generate_perimeters(
         });
     }
 
-    // Determine if this is a top or bottom surface layer
-    let is_bottom_layer = layer_index < surface_config.bottom_layers;
-    let is_top_layer = layer_index >= total_layers.saturating_sub(surface_config.top_layers);
-    let is_surface_layer = is_bottom_layer || is_top_layer;
+    // Flatten every perimeter set's fillable boundary into one even-odd region.
+    // Separate sets are disjoint shapes, so concatenating their rings is safe.
+    let region: Region = perimeter_sets
+        .iter()
+        .flat_map(|ps| ps.infill_boundary.iter().map(contour_to_overlay))
+        .collect();
 
-    // Generate infill
-    let infill_lines = if is_surface_layer {
-        // Surface layers get monotonic solid infill instead of regular infill
-        Vec::new()
+    LayerPerimeters {
+        z: layer.z,
+        layer_index,
+        perimeter_sets,
+        region,
+    }
+}
+
+/// Pass 2: decide which parts of a layer are solid (top/bottom) surfaces versus
+/// sparse infill, using the regions of nearby layers.
+fn finish_layer(
+    prepared: &[LayerPerimeters],
+    i: usize,
+    perim_config: &PerimeterConfig,
+    infill_config: &InfillConfig,
+    surface_config: &SurfaceConfig
+) -> ToolpathLayer {
+    let lp = &prepared[i];
+    let region = &lp.region;
+
+    // Region `top_layers` above; missing index => open air => empty region.
+    let region_above = if surface_config.top_layers > 0 {
+        i.checked_add(surface_config.top_layers)
+            .and_then(|k| prepared.get(k))
+            .map(|l| l.region.clone())
+            .unwrap_or_default()
     } else {
-        generate_infill(&perimeter_sets, infill_config)
+        region.clone() // 0 top layers: nothing is exposed upward
     };
 
-    // Generate monotonic surface infill for top/bottom layers
-    let surface_infill_lines = if is_surface_layer {
+    // Region `bottom_layers` below; underflow => below build plate => empty.
+    let region_below = if surface_config.bottom_layers > 0 {
+        i.checked_sub(surface_config.bottom_layers)
+            .and_then(|k| prepared.get(k))
+            .map(|l| l.region.clone())
+            .unwrap_or_default()
+    } else {
+        region.clone() // 0 bottom layers: nothing is exposed downward
+    };
+
+    // Solid where the column is not backed by material the full shell depth away.
+    let top_solid = region_difference(region, &region_above);
+    let bottom_solid = region_difference(region, &region_below);
+    let solid = region_union(&top_solid, &bottom_solid);
+    let sparse = region_difference(region, &solid);
+
+    let infill_lines = generate_infill(&sparse, infill_config);
+
+    let surface_infill_lines = if solid.is_empty() {
+        Vec::new()
+    } else {
         // Alternate between 45° and 135° each layer for cross-hatched strength
-        let angle = if layer_index % 2 == 0 {
+        let angle = if i % 2 == 0 {
             std::f32::consts::FRAC_PI_4
         } else {
             std::f32::consts::FRAC_PI_4 + std::f32::consts::FRAC_PI_2
         };
-        generate_monotonic_surface_infill(&perimeter_sets, perim_config.nozzle_width, angle)
-    } else {
-        Vec::new()
+        generate_monotonic_surface_infill(&solid, perim_config.nozzle_width, angle)
     };
 
     ToolpathLayer {
-        z: layer.z,
-        layer_index,
-        perimeter_sets,
+        z: lp.z,
+        layer_index: lp.layer_index,
+        perimeter_sets: prepared[i].perimeter_sets.clone(),
         infill_lines,
         surface_infill_lines,
     }
 }
 
+/// Compatibility wrapper for single-layer perimeter+infill generation (tests).
+pub fn generate_perimeters(
+    layer: &Layer,
+    layer_index: usize,
+    _total_layers: usize,
+    perim_config: &PerimeterConfig,
+    infill_config: &InfillConfig,
+    surface_config: &SurfaceConfig
+) -> ToolpathLayer {
+    let prepared = vec![build_layer_perimeters(layer, layer_index, perim_config)];
+    finish_layer(&prepared, 0, perim_config, infill_config, surface_config)
+}
+
 /// Clip a horizontal scan line (at y = `y`) against polygon edges using
 /// even-odd ray intersection. Returns pairs of x-coordinates representing
 /// inside segments.
-fn clip_horizontal_line(y: f32, edges: &[([f32; 2], [f32; 2])], min_x: f32, max_x: f32) -> Vec<(f32, f32)> {
+fn clip_horizontal_line(
+    y: f32,
+    edges: &[([f32; 2], [f32; 2])],
+    min_x: f32,
+    max_x: f32
+) -> Vec<(f32, f32)> {
     let mut intersections = Vec::new();
 
     for &(p0, p1) in edges {
@@ -470,7 +582,12 @@ fn clip_horizontal_line(y: f32, edges: &[([f32; 2], [f32; 2])], min_x: f32, max_
 
 /// Clip a vertical scan line (at x = `x`) against polygon edges using
 /// even-odd ray intersection. Returns pairs of y-coordinates.
-fn clip_vertical_line(x: f32, edges: &[([f32; 2], [f32; 2])], min_y: f32, max_y: f32) -> Vec<(f32, f32)> {
+fn clip_vertical_line(
+    x: f32,
+    edges: &[([f32; 2], [f32; 2])],
+    min_y: f32,
+    max_y: f32
+) -> Vec<(f32, f32)> {
     let mut intersections = Vec::new();
 
     for &(p0, p1) in edges {
@@ -500,72 +617,66 @@ fn clip_vertical_line(x: f32, edges: &[([f32; 2], [f32; 2])], min_y: f32, max_y:
 /// Uses direct scanline-polygon intersection (even-odd rule) instead of
 /// i_overlay's full clip_by, which is orders of magnitude faster for
 /// axis-aligned lines.
-fn generate_infill(
-    perimeter_sets: &[PerimeterSet],
-    config: &InfillConfig,
-) -> Vec<InfillLine> {
+fn generate_infill(region: &Region, config: &InfillConfig) -> Vec<InfillLine> {
     if config.density <= 0.0 {
         return Vec::new();
     }
 
-    let spacing = 2.0 * config.nozzle_width / config.density.min(1.0);
+    let spacing = (2.0 * config.nozzle_width) / config.density.min(1.0);
+
+    // Build one edge list from every ring (outer + holes). The even-odd fill
+    // rule handles holes — and disjoint shapes — naturally.
+    let mut edges: Vec<([f32; 2], [f32; 2])> = Vec::new();
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    for ring in region {
+        let n = ring.len();
+        if n < 3 {
+            continue;
+        }
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let p0 = ring[i];
+            let p1 = ring[j];
+            edges.push((p0, p1));
+            min_x = min_x.min(p0[0]);
+            min_y = min_y.min(p0[1]);
+            max_x = max_x.max(p0[0]);
+            max_y = max_y.max(p0[1]);
+        }
+    }
+
+    if edges.is_empty() {
+        return Vec::new();
+    }
 
     let mut all_lines = Vec::new();
 
-    for pset in perimeter_sets {
-        if pset.infill_boundary.is_empty() {
-            continue;
+    // Horizontal scan lines at absolute grid positions (aligned to origin)
+    let mut y = (min_y / spacing).ceil() * spacing;
+    while y < max_y {
+        for (x0, x1) in clip_horizontal_line(y, &edges, min_x, max_x) {
+            all_lines.push(InfillLine {
+                start: Point2::new(x0, y),
+                end: Point2::new(x1, y),
+            });
         }
+        y += spacing;
+    }
 
-        // Build edge list from all boundary contours (outer + holes).
-        // Even-odd fill rule handles holes naturally.
-        let mut edges: Vec<([f32; 2], [f32; 2])> = Vec::new();
-        let mut min_x = f32::INFINITY;
-        let mut min_y = f32::INFINITY;
-        let mut max_x = f32::NEG_INFINITY;
-        let mut max_y = f32::NEG_INFINITY;
-
-        for contour in &pset.infill_boundary {
-            let pts = &contour.points;
-            let n = pts.len();
-            if n < 3 {
-                continue;
-            }
-            for i in 0..n {
-                let j = (i + 1) % n;
-                let p0 = [pts[i].x, pts[i].y];
-                let p1 = [pts[j].x, pts[j].y];
-                edges.push((p0, p1));
-                min_x = min_x.min(p0[0]);
-                min_y = min_y.min(p0[1]);
-                max_x = max_x.max(p0[0]);
-                max_y = max_y.max(p0[1]);
-            }
+    // Vertical scan lines at absolute grid positions (aligned to origin)
+    let mut x = (min_x / spacing).ceil() * spacing;
+    while x < max_x {
+        for (y0, y1) in clip_vertical_line(x, &edges, min_y, max_y) {
+            all_lines.push(InfillLine {
+                start: Point2::new(x, y0),
+                end: Point2::new(x, y1),
+            });
         }
-
-        // Horizontal scan lines at absolute grid positions (aligned to origin)
-        let mut y = (min_y / spacing).ceil() * spacing;
-        while y < max_y {
-            for (x0, x1) in clip_horizontal_line(y, &edges, min_x, max_x) {
-                all_lines.push(InfillLine {
-                    start: Point2::new(x0, y),
-                    end: Point2::new(x1, y),
-                });
-            }
-            y += spacing;
-        }
-
-        // Vertical scan lines at absolute grid positions (aligned to origin)
-        let mut x = (min_x / spacing).ceil() * spacing;
-        while x < max_x {
-            for (y0, y1) in clip_vertical_line(x, &edges, min_y, max_y) {
-                all_lines.push(InfillLine {
-                    start: Point2::new(x, y0),
-                    end: Point2::new(x, y1),
-                });
-            }
-            x += spacing;
-        }
+        x += spacing;
     }
 
     all_lines
@@ -575,67 +686,63 @@ fn generate_infill(
 /// arbitrary angle. Rotates the boundary into axis-aligned space, runs
 /// horizontal scan lines, then rotates results back.
 fn generate_monotonic_surface_infill(
-    perimeter_sets: &[PerimeterSet],
+    region: &Region,
     nozzle_width: f32,
-    angle: f32,
+    angle: f32
 ) -> Vec<InfillLine> {
     let cos = angle.cos();
     let sin = angle.sin();
 
     // Rotate a point by -angle (into scan-line space)
-    let rotate_fwd = |x: f32, y: f32| -> [f32; 2] {
-        [x * cos + y * sin, -x * sin + y * cos]
-    };
+    let rotate_fwd = |x: f32, y: f32| -> [f32; 2] { [x * cos + y * sin, -x * sin + y * cos] };
     // Rotate a point by +angle (back to world space)
     let rotate_inv = |u: f32, v: f32| -> Point2<f32> {
         Point2::new(u * cos - v * sin, u * sin + v * cos)
     };
 
     let spacing = nozzle_width;
-    let mut all_lines = Vec::new();
 
-    for pset in perimeter_sets {
-        if pset.infill_boundary.is_empty() {
+    // Build one rotated edge list and bounding box across every ring.
+    let mut edges: Vec<([f32; 2], [f32; 2])> = Vec::new();
+    let mut min_u = f32::INFINITY;
+    let mut min_v = f32::INFINITY;
+    let mut max_u = f32::NEG_INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+
+    for ring in region {
+        let n = ring.len();
+        if n < 3 {
             continue;
         }
-
-        // Build rotated edge list and bounding box
-        let mut edges: Vec<([f32; 2], [f32; 2])> = Vec::new();
-        let mut min_u = f32::INFINITY;
-        let mut min_v = f32::INFINITY;
-        let mut max_u = f32::NEG_INFINITY;
-        let mut max_v = f32::NEG_INFINITY;
-
-        for contour in &pset.infill_boundary {
-            let pts = &contour.points;
-            let n = pts.len();
-            if n < 3 {
-                continue;
-            }
-            for i in 0..n {
-                let j = (i + 1) % n;
-                let p0 = rotate_fwd(pts[i].x, pts[i].y);
-                let p1 = rotate_fwd(pts[j].x, pts[j].y);
-                edges.push((p0, p1));
-                min_u = min_u.min(p0[0]).min(p1[0]);
-                min_v = min_v.min(p0[1]).min(p1[1]);
-                max_u = max_u.max(p0[0]).max(p1[0]);
-                max_v = max_v.max(p0[1]).max(p1[1]);
-            }
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let p0 = rotate_fwd(ring[i][0], ring[i][1]);
+            let p1 = rotate_fwd(ring[j][0], ring[j][1]);
+            edges.push((p0, p1));
+            min_u = min_u.min(p0[0]).min(p1[0]);
+            min_v = min_v.min(p0[1]).min(p1[1]);
+            max_u = max_u.max(p0[0]).max(p1[0]);
+            max_v = max_v.max(p0[1]).max(p1[1]);
         }
+    }
 
-        // Horizontal scan lines in rotated space at absolute grid positions
-        let half = spacing / 2.0;
-        let mut v = ((min_v - half) / spacing).ceil() * spacing + half;
-        while v < max_v {
-            for (u0, u1) in clip_horizontal_line(v, &edges, min_u, max_u) {
-                all_lines.push(InfillLine {
-                    start: rotate_inv(u0, v),
-                    end: rotate_inv(u1, v),
-                });
-            }
-            v += spacing;
+    if edges.is_empty() {
+        return Vec::new();
+    }
+
+    let mut all_lines = Vec::new();
+
+    // Horizontal scan lines in rotated space at absolute grid positions
+    let half = spacing / 2.0;
+    let mut v = ((min_v - half) / spacing).ceil() * spacing + half;
+    while v < max_v {
+        for (u0, u1) in clip_horizontal_line(v, &edges, min_u, max_u) {
+            all_lines.push(InfillLine {
+                start: rotate_inv(u0, v),
+                end: rotate_inv(u1, v),
+            });
         }
+        v += spacing;
     }
 
     all_lines
@@ -646,17 +753,23 @@ pub fn generate_toolpaths(
     slice_result: &SliceResult,
     perim_config: &PerimeterConfig,
     infill_config: &InfillConfig,
-    surface_config: &SurfaceConfig,
+    surface_config: &SurfaceConfig
 ) -> ToolpathResult {
     use rayon::prelude::*;
 
-    let total_layers = slice_result.layers.len();
-    let layers = slice_result
-        .layers
+    // Pass 1: perimeter walls + fillable region for every layer, independently.
+    let prepared: Vec<LayerPerimeters> = slice_result.layers
         .par_iter()
         .enumerate()
-        .map(|(i, layer)| generate_perimeters(layer, i, total_layers, perim_config, infill_config, surface_config))
+        .map(|(i, layer)| build_layer_perimeters(layer, i, perim_config))
         .collect();
+
+    // Pass 2: classify solid vs sparse using neighbouring layers, then fill.
+    let layers = (0..prepared.len())
+        .into_par_iter()
+        .map(|i| finish_layer(&prepared, i, perim_config, infill_config, surface_config))
+        .collect();
+
     ToolpathResult { layers }
 }
 
@@ -667,9 +780,7 @@ mod tests {
     use std::path::Path;
 
     fn stl_path(name: &str) -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../stls")
-            .join(name)
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stls").join(name)
     }
 
     #[test]
@@ -679,7 +790,7 @@ mod tests {
             Point2::new(0.0, 0.0),
             Point2::new(1.0, 0.0),
             Point2::new(1.0, 1.0),
-            Point2::new(0.0, 1.0),
+            Point2::new(0.0, 1.0)
         ];
         assert!(signed_area(&pts) > 0.0);
     }
@@ -691,7 +802,7 @@ mod tests {
             Point2::new(0.0, 0.0),
             Point2::new(0.0, 1.0),
             Point2::new(1.0, 1.0),
-            Point2::new(1.0, 0.0),
+            Point2::new(1.0, 0.0)
         ];
         assert!(signed_area(&pts) < 0.0);
     }
@@ -702,7 +813,7 @@ mod tests {
             Point2::new(0.0, 0.0),
             Point2::new(1.0, 0.0),
             Point2::new(1.0, 1.0),
-            Point2::new(0.0, 1.0),
+            Point2::new(0.0, 1.0)
         ];
         assert!(point_in_polygon(&Point2::new(0.5, 0.5), &square));
         assert!(!point_in_polygon(&Point2::new(2.0, 2.0), &square));
@@ -711,14 +822,13 @@ mod tests {
     #[test]
     fn debug_outline_api() {
         // 100x100 square, try various offset approaches
-        let shape: Vec<Vec<[f32; 2]>> = vec![vec![
-            [0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0],
-        ]];
+        let shape: Vec<Vec<[f32; 2]>> = vec![
+            vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]
+        ];
         let shapes: Vec<Vec<Vec<[f32; 2]>>> = vec![shape];
 
         // Approach: negative offset to shrink
-        let style = OutlineStyle::new(-10.0)
-            .line_join(LineJoin::Miter(2.0));
+        let style = OutlineStyle::new(-10.0).line_join(LineJoin::Miter(2.0));
 
         let result: Vec<Vec<Vec<[f32; 2]>>> = shapes.outline(&style);
         println!("Negative offset result:");
@@ -760,15 +870,11 @@ mod tests {
             result.layers.len(),
             &config,
             &no_infill(),
-            &SurfaceConfig { bottom_layers: 0, top_layers: 0 },
+            &(SurfaceConfig { bottom_layers: 0, top_layers: 0 })
         );
 
         assert_eq!(toolpath.perimeter_sets.len(), 1, "Cube should produce 1 shape");
-        assert_eq!(
-            toolpath.perimeter_sets[0].perimeters.len(),
-            1,
-            "Should have 1 perimeter level"
-        );
+        assert_eq!(toolpath.perimeter_sets[0].perimeters.len(), 1, "Should have 1 perimeter level");
         assert!(
             !toolpath.perimeter_sets[0].perimeters[0].is_empty(),
             "Perimeter level should have at least 1 loop"
@@ -797,28 +903,30 @@ mod tests {
             result.layers.len(),
             &perim_config,
             &infill_config,
-            &SurfaceConfig { bottom_layers: 0, top_layers: 0 },
+            &(SurfaceConfig { bottom_layers: 0, top_layers: 0 })
         );
 
-        assert!(
-            !tp.infill_lines.is_empty(),
-            "Expected infill lines"
-        );
+        assert!(!tp.infill_lines.is_empty(), "Expected infill lines");
 
         // Grid should have both horizontal and vertical lines.
         // Use a tolerance relative to the boundary size since clipping
         // may introduce tiny floating-point deviations.
         let tol = 0.1;
-        let horizontal = tp.infill_lines.iter()
+        let horizontal = tp.infill_lines
+            .iter()
             .filter(|l| (l.start.y - l.end.y).abs() < tol)
             .count();
-        let vertical = tp.infill_lines.iter()
+        let vertical = tp.infill_lines
+            .iter()
             .filter(|l| (l.start.x - l.end.x).abs() < tol)
             .count();
 
         assert!(horizontal > 0, "Expected horizontal infill lines, got 0");
         assert!(vertical > 0, "Expected vertical infill lines, got 0");
-        println!("Infill: {horizontal} horizontal + {vertical} vertical = {} total", tp.infill_lines.len());
+        println!(
+            "Infill: {horizontal} horizontal + {vertical} vertical = {} total",
+            tp.infill_lines.len()
+        );
     }
 
     #[test]
@@ -845,7 +953,7 @@ mod tests {
             result.layers.len(),
             &perim_config,
             &infill_config,
-            &SurfaceConfig { bottom_layers: 0, top_layers: 0 },
+            &(SurfaceConfig { bottom_layers: 0, top_layers: 0 })
         );
         assert!(!tp.infill_lines.is_empty(), "Expected infill lines");
 
@@ -858,13 +966,16 @@ mod tests {
             assert!(
                 is_horizontal || is_vertical,
                 "Infill line {} is neither horizontal nor vertical: ({:.3},{:.3}) -> ({:.3},{:.3})",
-                i, line.start.x, line.start.y, line.end.x, line.end.y
+                i,
+                line.start.x,
+                line.start.y,
+                line.end.x,
+                line.end.y
             );
         }
 
         // Collect the infill boundary polygon(s)
-        let boundary_polys: Vec<&[Point2<f32>]> = tp
-            .perimeter_sets
+        let boundary_polys: Vec<&[Point2<f32>]> = tp.perimeter_sets
             .iter()
             .flat_map(|ps| ps.infill_boundary.iter().map(|c| c.points.as_slice()))
             .collect();
@@ -875,7 +986,10 @@ mod tests {
         // one infill boundary polygon (with a small tolerance for clipping).
         let margin = 0.5; // generous margin for clipping tolerance
         for (i, line) in tp.infill_lines.iter().enumerate() {
-            for (label, pt) in [("start", &line.start), ("end", &line.end)] {
+            for (label, pt) in [
+                ("start", &line.start),
+                ("end", &line.end),
+            ] {
                 let inside = boundary_polys.iter().any(|poly| {
                     // Check if point is within the bounding box + margin
                     let (mut bmin_x, mut bmin_y) = (f32::INFINITY, f32::INFINITY);
@@ -886,18 +1000,62 @@ mod tests {
                         bmax_x = bmax_x.max(p.x);
                         bmax_y = bmax_y.max(p.y);
                     }
-                    pt.x >= bmin_x - margin
-                        && pt.x <= bmax_x + margin
-                        && pt.y >= bmin_y - margin
-                        && pt.y <= bmax_y + margin
+                    pt.x >= bmin_x - margin &&
+                        pt.x <= bmax_x + margin &&
+                        pt.y >= bmin_y - margin &&
+                        pt.y <= bmax_y + margin
                 });
                 assert!(
                     inside,
                     "Infill line {} {} ({:.3},{:.3}) is outside all boundaries",
-                    i, label, pt.x, pt.y
+                    i,
+                    label,
+                    pt.x,
+                    pt.y
                 );
             }
         }
+    }
+
+    #[test]
+    fn interior_flat_surfaces_get_solid_infill() {
+        // Regression test for the "surfaces below max z don't get surface
+        // infill" bug. Benchy has flat tops partway up the model (cabin roof,
+        // decks). These sit at layer indices well inside the stack — not in the
+        // global top N layers — so the old index-based check left them filled
+        // with sparse infill exposed to open air. The neighbour-difference
+        // check must now mark them solid.
+        let data = std::fs::read(stl_path("benchy.stl")).unwrap();
+        let mesh = stl::load_stl(&data).unwrap();
+        let result = crate::slicer::slice_mesh(&mesh, 0.4);
+
+        let perim_config = PerimeterConfig {
+            nozzle_width: 0.4,
+            perimeter_count: 2,
+            layer_height: 0.4,
+        };
+        let infill_config = InfillConfig { density: 0.2, nozzle_width: 0.4 };
+        let surface_config = SurfaceConfig { bottom_layers: 4, top_layers: 4 };
+
+        let tp = generate_toolpaths(&result, &perim_config, &infill_config, &surface_config);
+        let total = tp.layers.len();
+        assert!(total > 20, "expected many layers, got {total}");
+
+        // Look strictly inside the global top/bottom bands. Any surface infill here can only come from a *local* flat surface
+        let interior_solid = tp.layers
+            .iter()
+            .filter(
+                |l|
+                    l.layer_index >= surface_config.bottom_layers &&
+                    l.layer_index < total - surface_config.top_layers
+            )
+            .any(|l| !l.surface_infill_lines.is_empty());
+
+        assert!(
+            interior_solid,
+            "expected at least one interior layer with solid surface infill \
+             (internal flat surface), found none"
+        );
     }
 
     #[test]
@@ -918,8 +1076,7 @@ mod tests {
         };
 
         // Test a mid-height layer (away from poles)
-        let (mid_layer_idx, mid_layer) = result
-            .layers
+        let (mid_layer_idx, mid_layer) = result.layers
             .iter()
             .enumerate()
             .find(|(_, l)| l.z > 20.0 && l.z < 30.0)
@@ -931,7 +1088,7 @@ mod tests {
             result.layers.len(),
             &perim_config,
             &infill_config,
-            &SurfaceConfig { bottom_layers: 0, top_layers: 0 },
+            &(SurfaceConfig { bottom_layers: 0, top_layers: 0 })
         );
         assert!(
             !tp.infill_lines.is_empty(),
@@ -947,7 +1104,10 @@ mod tests {
             assert!(
                 is_horizontal || is_vertical,
                 "Non-axis-aligned infill on sphere: ({:.3},{:.3}) -> ({:.3},{:.3})",
-                line.start.x, line.start.y, line.end.x, line.end.y
+                line.start.x,
+                line.start.y,
+                line.end.x,
+                line.end.y
             );
         }
     }
