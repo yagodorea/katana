@@ -1,6 +1,9 @@
+pub mod arc;
 pub mod mesh;
 pub mod offset;
 pub mod planner;
+pub mod simplify;
 pub mod slicer;
 pub mod stl;
 pub mod svg;
+pub mod gcode;
