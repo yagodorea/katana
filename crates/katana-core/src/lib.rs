@@ -4,3 +4,4 @@ pub mod planner;
 pub mod slicer;
 pub mod stl;
 pub mod svg;
+pub mod gcode;
