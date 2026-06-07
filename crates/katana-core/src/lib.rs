@@ -1,3 +1,4 @@
+pub mod arc;
 pub mod mesh;
 pub mod offset;
 pub mod planner;

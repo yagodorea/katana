@@ -16,7 +16,12 @@
 
 use std::{ f32::consts::PI, fmt::Write };
 
+use nalgebra::Point2;
+
+use crate::arc::{ self, PathPrimitive };
 use crate::planner::{ Move, MoveKind, PlannedResult };
+
+const ARC_FIT_TOLERANCE: f32 = 0.05;
 
 pub struct GcodeConfig {
     pub filament_diameter: f32,
@@ -53,41 +58,62 @@ impl Gcode {
             return;
         }
         let mut cmd = String::new();
-        let mut x1 = mv.points[1].x;
-        let mut y1 = mv.points[1].y;
         let spd = mv.speed * 60.0;
+
         if mv.kind == MoveKind::Travel {
-            writeln!(cmd, "G0 X{x1:.3} Y{y1:.3} F{spd:.0}").unwrap();
+            let to = mv.points[1];
+            writeln!(cmd, "G0 X{:.3} Y{:.3} F{spd:.0}", to.x, to.y).unwrap();
         } else {
-            let mut x0 = mv.points[0].x;
-            let mut y0 = mv.points[0].y;
-            for i in 1..mv.points.len() {
-                x1 = mv.points[i].x;
-                y1 = mv.points[i].y;
-
-                let dx = x1 - x0;
-                let dy = y1 - y0;
-                let seg_len = (dx * dx + dy * dy).sqrt();
-                let e = self.calc_extrusion(seg_len);
-                writeln!(cmd, "G1 X{x1:.3} Y{y1:.3} E{e:.5} F{spd:.0}").unwrap();
-
-                // Advance
-                x0 = mv.points[i].x;
-                y0 = mv.points[i].y;
+            // Fit arcs over the simplified polyline, then emit each primitive.
+            // The nozzle already sits at points[0] (a travel preceded this).
+            let mut from = mv.points[0];
+            for prim in arc::fit_arcs(&mv.points, ARC_FIT_TOLERANCE) {
+                from = self.emit_primitive(&mut cmd, from, prim, spd);
             }
             if mv.kind == MoveKind::Perimeter {
-                // Closing movement is implicit, need to emit
-                x1 = mv.points[0].x;
-                y1 = mv.points[0].y;
-
-                let dx = x1 - x0;
-                let dy = y1 - y0;
-                let seg_len = (dx * dx + dy * dy).sqrt();
-                let e = self.calc_extrusion(seg_len);
-                writeln!(cmd, "G1 X{x1:.3} Y{y1:.3} E{e:.5} F{spd:.0}").unwrap();
+                // Close the loop back to its start with a straight move.
+                let to = mv.points[0];
+                let e = self.calc_extrusion((to - from).norm());
+                writeln!(cmd, "G1 X{:.3} Y{:.3} E{e:.5} F{spd:.0}", to.x, to.y).unwrap();
             }
         }
         write!(self.out, "{cmd}").unwrap();
+    }
+
+    /// Emit one fitted primitive, returning the nozzle's new position.
+    fn emit_primitive(
+        &mut self,
+        cmd: &mut String,
+        from: Point2<f32>,
+        prim: PathPrimitive,
+        spd: f32
+    ) -> Point2<f32> {
+        match prim {
+            PathPrimitive::Line { to } => {
+                let e = self.calc_extrusion((to - from).norm());
+                writeln!(cmd, "G1 X{:.3} Y{:.3} E{e:.5} F{spd:.0}", to.x, to.y).unwrap();
+                to
+            }
+            PathPrimitive::Arc { to, center, cw } => {
+                // Extrusion follows the *arc length* (r * sweep), not the chord —
+                // using the chord here would under-extrude every curve.
+                let radius = (from - center).norm();
+                let sweep = sweep_angle(from, to, center, cw);
+                let e = self.calc_extrusion(radius * sweep);
+                // I/J are the center offset relative to the start point. Emit them
+                // with extra precision so the firmware's radius check agrees.
+                let i = center.x - from.x;
+                let j = center.y - from.y;
+                let g = if cw { "G2" } else { "G3" };
+                writeln!(
+                    cmd,
+                    "{g} X{:.3} Y{:.3} I{i:.4} J{j:.4} E{e:.5} F{spd:.0}",
+                    to.x,
+                    to.y
+                ).unwrap();
+                to
+            }
+        }
     }
 
     fn calc_extrusion(&mut self, seg_len: f32) -> f32 {
@@ -124,4 +150,20 @@ impl Gcode {
         writeln!(self.out, "M84 ; disable steppers").unwrap();
         writeln!(self.out, "; --- Finish ending sequence").unwrap();
     }
+}
+
+/// Angle swept (radians, always positive) going from `from` to `to` around
+/// `center` in the given direction. Used to turn an arc into its true length.
+fn sweep_angle(from: Point2<f32>, to: Point2<f32>, center: Point2<f32>, cw: bool) -> f32 {
+    use std::f32::consts::TAU;
+    let a0 = (from.y - center.y).atan2(from.x - center.x);
+    let a1 = (to.y - center.y).atan2(to.x - center.x);
+    let mut sweep = if cw { a0 - a1 } else { a1 - a0 };
+    while sweep < 0.0 {
+        sweep += TAU;
+    }
+    while sweep >= TAU {
+        sweep -= TAU;
+    }
+    sweep
 }
