@@ -146,21 +146,22 @@ fn main() -> eframe::Result {
         "katana viewer",
         options,
         Box::new(move |cc| {
-            let render_state = cc.wgpu_render_state.as_ref()
-                .expect("eframe wgpu backend required");
-            let device = render_state.device.clone();   // Arc<wgpu::Device>
-            let queue  = render_state.queue.clone();    // Arc<wgpu::Queue>
+            let render_state = cc.wgpu_render_state.as_ref().expect("eframe wgpu backend required");
+            let device = render_state.device.clone(); // Arc<wgpu::Device>
+            let queue = render_state.queue.clone(); // Arc<wgpu::Queue>
             let target_format = render_state.target_format;
 
             // Initial size is a placeholder; first frame's resize() fixes it.
-            let mut gpu = renderer_wgpu_port::Renderer::new(
-                device, queue, target_format, 1, 1,
-            );
+            let mut gpu = renderer_wgpu_port::Renderer::new(device, queue, target_format, 1, 1);
 
             gpu.upload_mesh(&triangles);
             gpu.upload_all_slices(&layers, 1);
             gpu.upload_current_slice(&layers);
-            gpu.upload_planned_toolpath(&planned_result.layers, args.nozzle_width, args.layer_height);
+            gpu.upload_planned_toolpath(
+                &planned_result.layers,
+                args.nozzle_width,
+                args.layer_height
+            );
 
             // Start showing all layers
             let last_layer = num_layers.saturating_sub(1);
@@ -194,7 +195,7 @@ fn main() -> eframe::Result {
                         offset_ms,
                         plan_ms,
                     },
-                    show_travel_moves: true,
+                    show_travel_moves: false,
                     show_filaments: true,
                     scrub: 1.0,
                     fps: 0.0,
@@ -261,7 +262,7 @@ impl eframe::App for ViewerApp {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update);
         if elapsed >= Duration::from_secs(1) {
-            self.fps = self.frame_count as f32 / elapsed.as_secs_f32();
+            self.fps = (self.frame_count as f32) / elapsed.as_secs_f32();
             self.frame_time = if self.fps > 0.0 { 1000.0 / self.fps } else { 0.0 };
             self.last_update = now;
             self.frame_count = 0;
@@ -275,27 +276,18 @@ impl eframe::App for ViewerApp {
                     return;
                 }
                 let height = self.layers[self.num_layers.saturating_sub(1)].z;
-                ui.label(format!(
-                    "{} layers. Height {:.3} mm",
-                    self.num_layers,
-                    height,
-                ));
+                ui.label(format!("{} layers. Height {:.3} mm", self.num_layers, height));
                 let top_z = &self.layers[self.max_layer].z;
-                ui.label(format!(
-                    "Top layer {} | z = {:.3} mm",
-                    self.max_layer,
-                    top_z,
-                ));
+                ui.label(format!("Top layer {} | z = {:.3} mm", self.max_layer, top_z));
                 let bottom_z = &self.layers[self.min_layer].z;
-                ui.label(format!(
-                    "Bottom layer {} | z = {:.3} mm",
-                    self.min_layer,
-                    bottom_z,
-                ));
+                ui.label(format!("Bottom layer {} | z = {:.3} mm", self.min_layer, bottom_z));
                 if ui.button("◀ Prev").clicked() && self.max_layer > 0 {
                     self.max_layer -= 1;
                 }
-                if ui.button("Next ▶").clicked() && self.max_layer < self.num_layers.saturating_sub(1) {
+                if
+                    ui.button("Next ▶").clicked() &&
+                    self.max_layer < self.num_layers.saturating_sub(1)
+                {
                     self.max_layer += 1;
                 }
                 ui.separator();
@@ -311,21 +303,24 @@ impl eframe::App for ViewerApp {
                 ui.checkbox(&mut self.show_filaments, "3D filaments");
                 ui.checkbox(&mut self.show_travel_moves, "Travel moves");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!(
-                        "{} tris | load: {:.0}ms, slice: {:.0}ms, offset: {:.0}ms, plan: {:.0}ms",
-                        self.stats.triangles,
-                        self.stats.load_ms,
-                        self.stats.slice_ms,
-                        self.stats.offset_ms,
-                        self.stats.plan_ms,
-                    ));
+                    ui.label(
+                        format!(
+                            "{} tris | load: {:.0}ms, slice: {:.0}ms, offset: {:.0}ms, plan: {:.0}ms",
+                            self.stats.triangles,
+                            self.stats.load_ms,
+                            self.stats.slice_ms,
+                            self.stats.offset_ms,
+                            self.stats.plan_ms
+                        )
+                    );
                 });
             });
         });
 
         // Left panel: top layer slider (TODO: merge into a single slider with two knobs)
         // Top layer
-        egui::SidePanel::left("slider_top")
+        egui::SidePanel
+            ::left("slider_top")
             .resizable(false)
             .exact_width(32.0)
             .show(ctx, |ui| {
@@ -335,13 +330,15 @@ impl eframe::App for ViewerApp {
                 let max = self.num_layers.saturating_sub(1);
                 ui.spacing_mut().slider_width = ui.available_height() - 16.0;
                 ui.add(
-                    egui::Slider::new(&mut self.max_layer, 0..=max)
+                    egui::Slider
+                        ::new(&mut self.max_layer, 0..=max)
                         .vertical()
-                        .show_value(false),
+                        .show_value(false)
                 );
             });
         // Bottom layer
-        egui::SidePanel::left("slider_bottom")
+        egui::SidePanel
+            ::left("slider_bottom")
             .resizable(false)
             .exact_width(32.0)
             .show(ctx, |ui| {
@@ -351,14 +348,16 @@ impl eframe::App for ViewerApp {
                 let max = self.num_layers.saturating_sub(1);
                 ui.spacing_mut().slider_width = ui.available_height() - 16.0;
                 ui.add(
-                    egui::Slider::new(&mut self.min_layer, 0..=max)
+                    egui::Slider
+                        ::new(&mut self.min_layer, 0..=max)
                         .vertical()
-                        .show_value(false),
+                        .show_value(false)
                 );
             });
 
         // Bottom panel: horizontal scrubber for the top layer
-        egui::TopBottomPanel::bottom("scrubber")
+        egui::TopBottomPanel
+            ::bottom("scrubber")
             .resizable(false)
             .show(ctx, |ui| {
                 if self.num_layers == 0 {
@@ -368,23 +367,27 @@ impl eframe::App for ViewerApp {
                     ui.label("Layer progress");
                     ui.spacing_mut().slider_width = (ui.available_width() - 80.0).max(64.0);
                     ui.add(
-                        egui::Slider::new(&mut self.scrub, 0.0..=1.0)
-                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                        egui::Slider
+                            ::new(&mut self.scrub, 0.0..=1.0)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
                     );
                 });
             });
 
         // Central panel
-        egui::CentralPanel::default()
+        egui::CentralPanel
+            ::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(26, 26, 46)))
             .show(ctx, |ui| {
-                let (response, painter) =
-                    ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+                let (response, painter) = ui.allocate_painter(
+                    ui.available_size(),
+                    egui::Sense::click_and_drag()
+                );
 
                 if response.dragged_by(egui::PointerButton::Primary) {
                     let delta = response.drag_delta();
                     // Check if Command (Mac) or Ctrl (Windows/Linux) is pressed for panning
-                    let command_pressed = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+                    let command_pressed = ui.input(|i| (i.modifiers.command || i.modifiers.ctrl));
                     if command_pressed {
                         // Command+drag: pan the camera in world space
                         // Transform screen-space delta to world space based on camera orientation
@@ -403,20 +406,24 @@ impl eframe::App for ViewerApp {
                         let up_y = ca * se;
                         let up_z = ce;
                         // Combine deltas (note: dragging UP on screen means looking DOWN in world)
-                        self.center[0] += (delta.x * right_x - delta.y * up_x) * pan_world_scale * 0.001;
-                        self.center[1] += (delta.x * right_y - delta.y * up_y) * pan_world_scale * 0.001;
-                        self.center[2] += (delta.x * right_z - delta.y * up_z) * pan_world_scale * 0.001;
+                        self.center[0] +=
+                            (delta.x * right_x - delta.y * up_x) * pan_world_scale * 0.001;
+                        self.center[1] +=
+                            (delta.x * right_y - delta.y * up_y) * pan_world_scale * 0.001;
+                        self.center[2] +=
+                            (delta.x * right_z - delta.y * up_z) * pan_world_scale * 0.001;
                     } else {
                         // Regular drag: rotate the camera
                         self.azimuth -= delta.x * 0.005;
                         self.elevation = (self.elevation + delta.y * 0.005).clamp(
                             -std::f32::consts::FRAC_PI_2 + 0.01,
-                            std::f32::consts::FRAC_PI_2 - 0.01,
+                            std::f32::consts::FRAC_PI_2 - 0.01
                         );
                     }
                 }
-                if response.dragged_by(egui::PointerButton::Middle)
-                    || response.dragged_by(egui::PointerButton::Secondary)
+                if
+                    response.dragged_by(egui::PointerButton::Middle) ||
+                    response.dragged_by(egui::PointerButton::Secondary)
                 {
                     let delta = response.drag_delta();
                     // Middle/right drag: also pan in world space
@@ -431,9 +438,12 @@ impl eframe::App for ViewerApp {
                     let up_x = -sa * se;
                     let up_y = ca * se;
                     let up_z = ce;
-                    self.center[0] += (delta.x * right_x - delta.y * up_x) * pan_world_scale * 0.001;
-                    self.center[1] += (delta.x * right_y - delta.y * up_y) * pan_world_scale * 0.001;
-                    self.center[2] += (delta.x * right_z - delta.y * up_z) * pan_world_scale * 0.001;
+                    self.center[0] +=
+                        (delta.x * right_x - delta.y * up_x) * pan_world_scale * 0.001;
+                    self.center[1] +=
+                        (delta.x * right_y - delta.y * up_y) * pan_world_scale * 0.001;
+                    self.center[2] +=
+                        (delta.x * right_z - delta.y * up_z) * pan_world_scale * 0.001;
                 }
 
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -492,7 +502,7 @@ impl eframe::App for ViewerApp {
                     self.zoom,
                     self.extent,
                     aspect,
-                    (self.pan.x, self.pan.y),
+                    (self.pan.x, self.pan.y)
                 );
 
                 let bg_mode = self.bg_mode;
@@ -502,27 +512,27 @@ impl eframe::App for ViewerApp {
                 let vw = (rect.width() * ppp).max(1.0) as u32;
                 let vh = (rect.height() * ppp).max(1.0) as u32;
 
-                let callback = egui_wgpu::Callback::new_paint_callback(
-                    rect,
-                    ViewerCallback {
-                        renderer,
-                        mvp,
-                        light_dir,
-                        bg_mode,
-                        width: vw,
-                        height: vh,
-                    },
-                );
+                let callback = egui_wgpu::Callback::new_paint_callback(rect, ViewerCallback {
+                    renderer,
+                    mvp,
+                    light_dir,
+                    bg_mode,
+                    width: vw,
+                    height: vh,
+                });
                 painter.add(callback);
-        });
-
-        // FPS counter (bottom-right corner)
-        egui::Area::new(egui::Id::new("fps_counter"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, [10.0, 10.0])
-            .show(ctx, |ui| {
-                ui.colored_label(egui::Color32::YELLOW, format!("{:.1} FPS ({:.1} ms)", self.fps, self.frame_time));
             });
 
+        // FPS counter (bottom-right corner)
+        egui::Area
+            ::new(egui::Id::new("fps_counter"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, [10.0, 10.0])
+            .show(ctx, |ui| {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!("{:.1} FPS ({:.1} ms)", self.fps, self.frame_time)
+                );
+            });
     }
 
     // No on_exit needed: wgpu resources clean up via Drop.
@@ -549,13 +559,21 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
         queue: &eframe::wgpu::Queue,
         _screen_descriptor: &egui_wgpu::ScreenDescriptor,
         encoder: &mut eframe::wgpu::CommandEncoder,
-        _callback_resources: &mut egui_wgpu::CallbackResources,
+        _callback_resources: &mut egui_wgpu::CallbackResources
     ) -> Vec<eframe::wgpu::CommandBuffer> {
-        self.renderer.lock().unwrap().prepare(
-            device, queue, encoder,
-            &self.mvp, &self.light_dir, self.bg_mode,
-            self.width, self.height,
-        );
+        self.renderer
+            .lock()
+            .unwrap()
+            .prepare(
+                device,
+                queue,
+                encoder,
+                &self.mvp,
+                &self.light_dir,
+                self.bg_mode,
+                self.width,
+                self.height
+            );
         Vec::new()
     }
 
@@ -563,7 +581,7 @@ impl egui_wgpu::CallbackTrait for ViewerCallback {
         &self,
         _info: egui::PaintCallbackInfo,
         render_pass: &mut eframe::wgpu::RenderPass<'static>,
-        _callback_resources: &egui_wgpu::CallbackResources,
+        _callback_resources: &egui_wgpu::CallbackResources
     ) {
         self.renderer.lock().unwrap().paint(render_pass);
     }
