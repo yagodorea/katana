@@ -183,6 +183,12 @@ fn quantize_point(p: &Point2<f32>) -> (i64, i64) {
 /// Uses a HashMap keyed by quantized endpoint coordinates for O(1) neighbor
 /// lookup instead of O(s) linear scans. Checks a 3×3 neighborhood of cells
 /// to handle points that straddle quantization bucket boundaries.
+///
+/// Where the cross-section pinches to a point (a self-touching vertex, common
+/// near concave notches), a single greedy walk can only consume one in/out
+/// edge pair per visit and dead-ends, fragmenting the loop. Such fragments are
+/// collected as open chains and re-stitched in `stitch_open_chains` so the
+/// downstream offset stage never sees a loop closed by a spurious long chord.
 fn assemble_contours(segments: Vec<Segment>) -> Vec<Contour> {
     use std::collections::HashMap;
 
@@ -200,7 +206,8 @@ fn assemble_contours(segments: Vec<Segment>) -> Vec<Contour> {
     }
 
     let mut used = vec![false; n];
-    let mut contours = Vec::new();
+    let mut closed_loops: Vec<Vec<Point2<f32>>> = Vec::new();
+    let mut open_chains: Vec<Vec<Point2<f32>>> = Vec::new();
 
     for start_idx in 0..n {
         if used[start_idx] {
@@ -211,9 +218,11 @@ fn assemble_contours(segments: Vec<Segment>) -> Vec<Contour> {
         let mut contour_points = vec![segments[start_idx].a];
         let mut current_end = segments[start_idx].b;
         let chain_start = segments[start_idx].a;
+        let mut did_close = false;
 
         loop {
             if points_close(current_end, chain_start) {
+                did_close = true;
                 break;
             }
 
@@ -253,12 +262,91 @@ fn assemble_contours(segments: Vec<Segment>) -> Vec<Contour> {
             }
         }
 
-        contours.push(Contour {
-            points: contour_points,
-        });
+        if did_close {
+            closed_loops.push(contour_points);
+        } else {
+            // Include the dangling tail so the chain's endpoint is represented.
+            contour_points.push(current_end);
+            open_chains.push(contour_points);
+        }
     }
 
-    contours
+    // Heal fragments of pinched loops by joining nearest dangling endpoints.
+    stitch_open_chains(&mut closed_loops, open_chains);
+
+    closed_loops
+        .into_iter()
+        .filter(|points| points.len() >= 3)
+        .map(|points| Contour { points })
+        .collect()
+}
+
+/// Squared distance between two points.
+fn dist_squared(a: &Point2<f32>, b: &Point2<f32>) -> f32 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    dx * dx + dy * dy
+}
+
+/// Re-stitch open chains (fragments left by the greedy walk at self-touching
+/// vertices) into closed loops.
+///
+/// Each chain's tail is extended by whichever remaining chain endpoint lies
+/// nearest — fragments of one true loop share near-coincident endpoints, so
+/// nearest-neighbour joining reassembles them. When the tail's nearest option
+/// is its own head (or the pool is empty), the loop is closed and emitted.
+/// Genuinely separate contours stay apart because their endpoints are far,
+/// so self-closing always wins for them.
+fn stitch_open_chains(
+    closed: &mut Vec<Vec<Point2<f32>>>,
+    mut pool: Vec<Vec<Point2<f32>>>,
+) {
+    while let Some(mut chain) = pool.pop() {
+        loop {
+            let head = *chain.first().unwrap();
+            let tail = *chain.last().unwrap();
+
+            if chain.len() >= 3 && points_close(head, tail) {
+                break;
+            }
+
+            // Find the nearest endpoint among remaining chains to our tail,
+            // recording whether that chain must be flipped to append head-first.
+            let mut best = f32::INFINITY;
+            let mut best_idx: Option<usize> = None;
+            let mut flip = false;
+            for (i, other) in pool.iter().enumerate() {
+                let start = *other.first().unwrap();
+                let end = *other.last().unwrap();
+                let ds = dist_squared(&tail, &start);
+                if ds < best {
+                    best = ds;
+                    best_idx = Some(i);
+                    flip = false;
+                }
+                let de = dist_squared(&tail, &end);
+                if de < best {
+                    best = de;
+                    best_idx = Some(i);
+                    flip = true;
+                }
+            }
+
+            // Close onto our own head if that is at least as good as any join.
+            match best_idx {
+                Some(idx) if best < dist_squared(&tail, &head) => {
+                    let mut next = pool.remove(idx);
+                    if flip {
+                        next.reverse();
+                    }
+                    chain.extend(next);
+                }
+                _ => break,
+            }
+        }
+
+        closed.push(chain);
+    }
 }
 
 /// Check if two points are close enough to be considered the same.

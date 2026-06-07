@@ -43,10 +43,10 @@ This workspace contains 3 programs:
 
 ### Bugs to fix
 - [ ] Fix origin point of exported G-code
-- [ ] Fix slicing artifacts
+- [X] Fix slicing artifacts
     - [X] Surfaces below max z don't get surface infill
     - [X] Holes in the top layer get covered by surface infill
-    - [ ] Liver slice artifact on layer 280
+    - [X] Liver slice artifact on layer 280
 
 ### Rendering performance improvements
 - [X] ~Implement instanced rendering to avoid loading 20gb of triangle meshes into memory~
