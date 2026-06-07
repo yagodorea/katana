@@ -27,6 +27,11 @@ This workspace contains 3 programs:
 - [X] Horizontal slider
     - [X] Render scrubber nozzle
 - [X] G-code export
+    - [ ] Add BambuSlicer compatibility
+- [ ] UI overhaul
+    - [ ] Select file to slice
+    - [ ] Add "slice" button (default open just mesh)
+    - [ ] Add controls in UI for slicing params
 - [ ] Add more infill patterns
 - [ ] Add support for supports
 - [ ] Retraction
@@ -34,6 +39,13 @@ This workspace contains 3 programs:
 - [ ] Skirts
 - [ ] Brims
 - [ ] Prime tower
+
+### Bugs to fix
+- [ ] Fix origin point of exported G-code
+- [ ] Fix slicing artifacts
+    - [ ] Surfaces below max z don't get surface infill
+    - [ ] Holes in the top layer get covered by surface infill
+    - [ ] Liver slice artifact on layer 280
 
 ### Rendering performance improvements
 - [X] ~Implement instanced rendering to avoid loading 20gb of triangle meshes into memory~
