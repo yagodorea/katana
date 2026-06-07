@@ -1,10 +1,11 @@
+use std::fs;
 use std::sync::{ Arc, Mutex };
 use std::time::{ Duration, Instant };
 
 use clap::Parser;
 use eframe::egui;
 use eframe::egui_wgpu;
-use katana_core::{ offset, planner, slicer, stl };
+use katana_core::{ gcode::{ Gcode, GcodeConfig }, offset, planner, slicer, stl };
 
 mod renderer_wgpu_port;
 
@@ -175,6 +176,10 @@ fn main() -> eframe::Result {
             Ok(
                 Box::new(ViewerApp {
                     renderer,
+                    planned_result,
+                    nozzle_width: args.nozzle_width,
+                    layer_height: args.layer_height,
+                    source_file: args.file,
                     layers,
                     num_layers,
                     max_layer: last_layer,
@@ -231,6 +236,12 @@ struct Stats {
 
 struct ViewerApp {
     renderer: Arc<Mutex<renderer_wgpu_port::Renderer>>,
+    /// Kept alive so we can re-export G-code on demand from the UI.
+    planned_result: planner::PlannedResult,
+    nozzle_width: f32,
+    layer_height: f32,
+    /// Source STL path, used to suggest a default G-code filename.
+    source_file: String,
     layers: Vec<slicer::Layer>,
     num_layers: usize,
     max_layer: usize,
@@ -253,6 +264,43 @@ struct ViewerApp {
     frame_time: f32,
     last_update: Instant,
     frame_count: u32,
+}
+
+impl ViewerApp {
+    /// Open a native save dialog and write the planned toolpath as G-code.
+    fn export_gcode(&self) {
+        // Suggest "<model>.gcode" derived from the source STL's stem.
+        let default_name = std::path::Path
+            ::new(&self.source_file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| format!("{s}.gcode"))
+            .unwrap_or_else(|| "output.gcode".to_string());
+
+        // Blocking rfd file dialog, talks to OS filesystem
+        let Some(path) = rfd::FileDialog
+            ::new()
+            .set_file_name(default_name)
+            .add_filter("G-code", &["gcode"])
+            .save_file() else {
+            return; // user cancelled the dialog
+        };
+
+        let mut exporter = Gcode {
+            config: GcodeConfig {
+                filament_diameter: 1.75,
+                nozzle_width: self.nozzle_width,
+                layer_height: self.layer_height,
+            },
+            // TODO: remove these guys from the constructor
+            e: 0.0,
+            out: String::new(),
+        };
+        let out = exporter.export(&self.planned_result);
+        if let Err(e) = fs::write(path, out) {
+            eprintln!("Error writing to file! {}", e.to_string());
+        }
+    }
 }
 
 impl eframe::App for ViewerApp {
@@ -302,6 +350,10 @@ impl eframe::App for ViewerApp {
                 ui.separator();
                 ui.checkbox(&mut self.show_filaments, "3D filaments");
                 ui.checkbox(&mut self.show_travel_moves, "Travel moves");
+                ui.separator();
+                if ui.button("💾 Export G-code").clicked() {
+                    self.export_gcode();
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         format!(

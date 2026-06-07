@@ -9,3 +9,4 @@ eframe = { version = "0.31", default-features = false, features = ["accesskit", 
 bytemuck = { version = "1", features = ["derive"] }
 wgpu = "24"
 clap = { version = "4", features = ["derive"] }
+rfd = "0.15"

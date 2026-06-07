@@ -32,7 +32,6 @@ pub struct Gcode {
 
 impl Gcode {
     pub fn export(&mut self, plan: &PlannedResult) -> String {
-        // TODO: implement
         self.out = String::new();
         self.emit_start();
         for layer in &plan.layers {
