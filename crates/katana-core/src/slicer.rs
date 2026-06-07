@@ -47,8 +47,7 @@ pub fn slice_mesh(mesh: &Mesh, layer_height: f32) -> SliceResult {
     let z_max = max.z - EPSILON;
 
     // Build z-range index sorted by z_min for sweep-line acceleration
-    let mut z_index: Vec<TriZRange> = mesh
-        .triangles
+    let mut z_index: Vec<TriZRange> = mesh.triangles
         .iter()
         .enumerate()
         .map(|(i, tri)| {
@@ -116,8 +115,14 @@ fn intersect_plane_indexed(mesh: &Mesh, z: f32, z_index: &[TriZRange]) -> (Vec<S
         let v = &tri.vertices;
         let d = [v[0].z - z, v[1].z - z, v[2].z - z];
 
-        let above = d.iter().filter(|&&d| d > 0.0).count();
-        let below = d.iter().filter(|&&d| d < 0.0).count();
+        let above = d
+            .iter()
+            .filter(|&&d| d > 0.0)
+            .count();
+        let below = d
+            .iter()
+            .filter(|&&d| d < 0.0)
+            .count();
 
         if above == 0 || below == 0 {
             continue;
@@ -134,8 +139,7 @@ fn intersect_plane_indexed(mesh: &Mesh, z: f32, z_index: &[TriZRange]) -> (Vec<S
             min_angle = angle;
         }
 
-        let (lone, pair0, pair1) = if (d[0] > 0.0) != (d[1] > 0.0) && (d[0] > 0.0) != (d[2] > 0.0)
-        {
+        let (lone, pair0, pair1) = if (d[0] > 0.0) != (d[1] > 0.0) && (d[0] > 0.0) != (d[2] > 0.0) {
             (0, 1, 2)
         } else if (d[1] > 0.0) != (d[0] > 0.0) && (d[1] > 0.0) != (d[2] > 0.0) {
             (1, 2, 0)
@@ -154,11 +158,7 @@ fn intersect_plane_indexed(mesh: &Mesh, z: f32, z_index: &[TriZRange]) -> (Vec<S
 
 /// Linearly interpolate along an edge to find where it crosses height `z`.
 /// Returns the 2D (x, y) intersection point.
-fn edge_intersect_z(
-    a: &nalgebra::Point3<f32>,
-    b: &nalgebra::Point3<f32>,
-    z: f32,
-) -> Point2<f32> {
+fn edge_intersect_z(a: &nalgebra::Point3<f32>, b: &nalgebra::Point3<f32>, z: f32) -> Point2<f32> {
     // what fraction of the way from a.z to b.z do I need to go from a to z?
     let t = (z - a.z) / (b.z - a.z);
     Point2::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y))
@@ -195,12 +195,8 @@ fn assemble_contours(segments: Vec<Segment>) -> Vec<Contour> {
     // Build adjacency map: quantized point → list of (segment_index, is_endpoint_a)
     let mut map: HashMap<(i64, i64), Vec<(usize, bool)>> = HashMap::with_capacity(n * 2);
     for (i, seg) in segments.iter().enumerate() {
-        map.entry(quantize_point(&seg.a))
-            .or_default()
-            .push((i, true));
-        map.entry(quantize_point(&seg.b))
-            .or_default()
-            .push((i, false));
+        map.entry(quantize_point(&seg.a)).or_default().push((i, true));
+        map.entry(quantize_point(&seg.b)).or_default().push((i, false));
     }
 
     let mut used = vec![false; n];
@@ -284,9 +280,7 @@ mod tests {
     use std::path::Path;
 
     fn stl_path(name: &str) -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../stls")
-            .join(name)
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stls").join(name)
     }
 
     #[test]
@@ -337,8 +331,7 @@ mod tests {
         assert!(!result.layers.is_empty(), "Expected some layers");
 
         // Check the middle layers (away from poles where tessellation is coarse)
-        let mid_layers: Vec<_> = result
-            .layers
+        let mid_layers: Vec<_> = result.layers
             .iter()
             .filter(|l| l.z > 15.0 && l.z < 35.0)
             .collect();
