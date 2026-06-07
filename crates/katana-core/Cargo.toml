@@ -9,3 +9,6 @@ byteorder = "1"
 thiserror = "2"
 i_overlay = "4.4"
 rayon = "1"
+
+[dev-dependencies]
+nalgebra = "0.33"
