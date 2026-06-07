@@ -26,7 +26,7 @@ This workspace contains 3 programs:
     - [X] Fix issue where all layer travels start from 0,0
 - [X] Horizontal slider
     - [X] Render scrubber nozzle
-- [ ] G-code export
+- [X] G-code export
 - [ ] Add more infill patterns
 - [ ] Add support for supports
 - [ ] Retraction
