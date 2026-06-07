@@ -1,6 +1,12 @@
 use nalgebra::Point2;
 
+use crate::simplify;
 use crate::slicer::{Contour, Layer, SliceResult};
+
+/// Max perpendicular deviation (mm) tolerated when simplifying perimeter loops.
+/// Kept well below nozzle resolution so it never affects print quality, only
+/// the number of emitted segments.
+const PERIMETER_SIMPLIFY_TOLERANCE: f32 = 0.01;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -354,9 +360,14 @@ pub fn generate_perimeters(
             for offset_shape in &offset_result {
                 for ring in offset_shape {
                     if ring.len() >= 3 {
-                        level_perimeters.push(Perimeter {
-                            points: overlay_to_points(ring),
-                        });
+                        // simplification pass to drop near-collinear points
+                        let points = simplify::douglas_peucker(
+                            &overlay_to_points(ring),
+                            PERIMETER_SIMPLIFY_TOLERANCE,
+                        );
+                        if points.len() >= 3 {
+                            level_perimeters.push(Perimeter { points });
+                        }
                     }
                 }
             }
@@ -497,7 +508,7 @@ fn generate_infill(
         return Vec::new();
     }
 
-    let spacing = config.nozzle_width / config.density.min(1.0);
+    let spacing = 2.0 * config.nozzle_width / config.density.min(1.0);
 
     let mut all_lines = Vec::new();
 
