@@ -38,24 +38,41 @@ pub struct Gcode {
 impl Gcode {
     pub fn export(&mut self, plan: &PlannedResult) -> String {
         self.out = String::new();
+        self.emit_header(plan);
+        // For Bambu compatibility
+        writeln!(self.out, "; EXECUTABLE_BLOCK_START").unwrap();
         self.emit_start();
+        let mut current_feature: Option<&'static str> = None;
         for layer in &plan.layers {
             let idx = layer.layer_index;
             let z = layer.z;
-            writeln!(self.out, "; LAYER {idx}").unwrap();
+            // For Bambu compatibility
+            writeln!(self.out, "; CHANGE_LAYER").unwrap();
+            writeln!(self.out, "; Z_HEIGHT: {z:.3}").unwrap();
+            writeln!(self.out, "; LAYER_HEIGHT: {:.3}", self.config.layer_height).unwrap();
             writeln!(self.out, "G1 Z{z:.3} F60").unwrap();
+            // Re-announce the feature after each layer change, matching Bambu.
+            current_feature = None;
             for mv in &layer.moves {
-                self.emit_move(mv, idx);
+                self.emit_move(mv, idx, &mut current_feature);
             }
         }
         self.emit_end();
+        writeln!(self.out, "; EXECUTABLE_BLOCK_END").unwrap();
         std::mem::take(&mut self.out)
     }
 
-    fn emit_move(&mut self, mv: &Move, idx: usize) {
+    fn emit_move(&mut self, mv: &Move, idx: usize, current_feature: &mut Option<&'static str>) {
         if mv.points.len() < 2 {
             println!("Empty move on layer {idx}!");
             return;
+        }
+        // Announce the feature only when it actually changes
+        if let Some(label) = feature_label(mv.kind) {
+            if *current_feature != Some(label) {
+                writeln!(self.out, "; FEATURE: {label}").unwrap();
+                *current_feature = Some(label);
+            }
         }
         let mut cmd = String::new();
         let spd = mv.speed * 60.0;
@@ -124,6 +141,15 @@ impl Gcode {
         self.e
     }
 
+    fn emit_header(&mut self, plan: &PlannedResult) {
+        writeln!(self.out, "; HEADER_BLOCK_START").unwrap();
+        writeln!(self.out, "; G-code generated with Katana slicer").unwrap();
+        writeln!(self.out, "; Check out https://github.com/yagodorea/katana").unwrap();
+        writeln!(self.out, "; total layer number: {}", plan.layers.len()).unwrap();
+        writeln!(self.out, "; HEADER_BLOCK_END").unwrap();
+        writeln!(self.out).unwrap();
+    }
+
     fn emit_start(&mut self) {
         // TODO: drill filename into here to print metadata in comments
         writeln!(self.out, "; G-code generated with Katana slicer").unwrap();
@@ -149,6 +175,18 @@ impl Gcode {
         writeln!(self.out, "G28 ; home").unwrap();
         writeln!(self.out, "M84 ; disable steppers").unwrap();
         writeln!(self.out, "; --- Finish ending sequence").unwrap();
+    }
+}
+
+/// Map an internal [`MoveKind`] to the Bambu Studio "FEATURE" label that the
+/// slicer and printer firmware use to classify each extrusion run for the
+/// Line-Type preview. Returns `None` for moves that should *not* start a new feature block
+fn feature_label(kind: MoveKind) -> Option<&'static str> {
+    match kind {
+        MoveKind::Infill => Some("Internal solid infill"),
+        MoveKind::Perimeter => Some("Outer wall"),
+        MoveKind::SurfaceInfill => Some("Top surface"),
+        MoveKind::Travel => None,
     }
 }
 

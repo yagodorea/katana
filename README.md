@@ -27,7 +27,7 @@ This workspace contains 3 programs:
 - [X] Horizontal slider
     - [X] Render scrubber nozzle
 - [X] G-code export
-    - [ ] Add BambuSlicer compatibility
+    - [X] Add BambuSlicer compatibility
 - [ ] UI overhaul
     - [ ] Select file to slice
     - [ ] Add "slice" button (default open just mesh)

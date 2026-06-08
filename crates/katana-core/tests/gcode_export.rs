@@ -106,7 +106,7 @@ fn one_z_move_per_layer_and_z_strictly_increases() {
 
     let layer_markers = body
         .lines()
-        .filter(|l| l.starts_with("; LAYER"))
+        .filter(|l| l.starts_with("; CHANGE_LAYER"))
         .count();
     let z_moves: Vec<f32> = body
         .lines()
