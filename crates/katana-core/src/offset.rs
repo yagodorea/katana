@@ -737,6 +737,10 @@ fn generate_monotonic_surface_infill(
     let mut v = ((min_v - half) / spacing).ceil() * spacing + half;
     while v < max_v {
         for (u0, u1) in clip_horizontal_line(v, &edges, min_u, max_u) {
+            // Drop clipped spans too short to lay down a real bead.
+            if u1 - u0 < spacing {
+                continue;
+            }
             all_lines.push(InfillLine {
                 start: rotate_inv(u0, v),
                 end: rotate_inv(u1, v),

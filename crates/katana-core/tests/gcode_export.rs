@@ -40,6 +40,8 @@ fn export(plan: &PlannedResult) -> String {
             nozzle_width: NOZZLE,
             layer_height: LAYER_H,
         },
+        // Zero offset keeps emitted coordinates in model space for assertions.
+        offset: nalgebra::Vector2::zeros(),
         out: String::new(),
     };
     g.export(plan)

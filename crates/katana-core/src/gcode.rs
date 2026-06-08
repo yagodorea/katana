@@ -16,7 +16,7 @@
 
 use std::{ f32::consts::PI, fmt::Write };
 
-use nalgebra::Point2;
+use nalgebra::{ Point2, Vector2 };
 
 use crate::arc::{ self, PathPrimitive };
 use crate::planner::{ Move, MoveKind, PlannedResult };
@@ -29,10 +29,29 @@ pub struct GcodeConfig {
     pub layer_height: f32,
 }
 
+/// Build-plate dimensions in mm (origin at the front-left corner)
+#[derive(Clone, Copy)]
+pub struct BedConfig {
+    pub width: f32, // X
+    pub depth: f32, // Y
+}
+
 pub struct Gcode {
     pub config: GcodeConfig,
+    /// Translation added to every absolute XY coordinate before it is emitted.
+    pub offset: Vector2<f32>,
     pub e: f32, // cumulative absolute-E total
     pub out: String,
+}
+
+/// Compute the XY translation that places a model onto the bed
+pub fn bed_offset(bed: BedConfig, model_min: Point2<f32>, model_max: Point2<f32>) -> Vector2<f32> {
+    let model_mid = Point2::new(
+        (model_max.x + model_min.x) / 2.0,
+        (model_max.y + model_min.y) / 2.0
+    );
+    let bed_mid = Point2::new(bed.width / 2.0, bed.depth / 2.0);
+    Vector2::new(bed_mid.x - model_mid.x, bed_mid.y - model_mid.y)
 }
 
 impl Gcode {
@@ -42,7 +61,6 @@ impl Gcode {
         // For Bambu compatibility
         writeln!(self.out, "; EXECUTABLE_BLOCK_START").unwrap();
         self.emit_start();
-        let mut current_feature: Option<&'static str> = None;
         for layer in &plan.layers {
             let idx = layer.layer_index;
             let z = layer.z;
@@ -51,8 +69,9 @@ impl Gcode {
             writeln!(self.out, "; Z_HEIGHT: {z:.3}").unwrap();
             writeln!(self.out, "; LAYER_HEIGHT: {:.3}", self.config.layer_height).unwrap();
             writeln!(self.out, "G1 Z{z:.3} F60").unwrap();
-            // Re-announce the feature after each layer change, matching Bambu.
-            current_feature = None;
+            // Each layer re-announces its first feature after the CHANGE_LAYER
+            // marker, matching Bambu; tracked fresh per layer.
+            let mut current_feature: Option<&'static str> = None;
             for mv in &layer.moves {
                 self.emit_move(mv, idx, &mut current_feature);
             }
@@ -78,7 +97,7 @@ impl Gcode {
         let spd = mv.speed * 60.0;
 
         if mv.kind == MoveKind::Travel {
-            let to = mv.points[1];
+            let to = mv.points[1] + self.offset;
             writeln!(cmd, "G0 X{:.3} Y{:.3} F{spd:.0}", to.x, to.y).unwrap();
         } else {
             // Fit arcs over the simplified polyline, then emit each primitive.
@@ -90,7 +109,10 @@ impl Gcode {
             if mv.kind == MoveKind::Perimeter {
                 // Close the loop back to its start with a straight move.
                 let to = mv.points[0];
+                // Extrusion length is computed in model space; only the emitted
+                // coordinate is shifted onto the bed.
                 let e = self.calc_extrusion((to - from).norm());
+                let to = to + self.offset;
                 writeln!(cmd, "G1 X{:.3} Y{:.3} E{e:.5} F{spd:.0}", to.x, to.y).unwrap();
             }
         }
@@ -108,7 +130,8 @@ impl Gcode {
         match prim {
             PathPrimitive::Line { to } => {
                 let e = self.calc_extrusion((to - from).norm());
-                writeln!(cmd, "G1 X{:.3} Y{:.3} E{e:.5} F{spd:.0}", to.x, to.y).unwrap();
+                let at = to + self.offset;
+                writeln!(cmd, "G1 X{:.3} Y{:.3} E{e:.5} F{spd:.0}", at.x, at.y).unwrap();
                 to
             }
             PathPrimitive::Arc { to, center, cw } => {
@@ -119,14 +142,17 @@ impl Gcode {
                 let e = self.calc_extrusion(radius * sweep);
                 // I/J are the center offset relative to the start point. Emit them
                 // with extra precision so the firmware's radius check agrees.
+                // I/J are relative to the start point, so the bed offset
+                // cancels out and they need no shifting.
                 let i = center.x - from.x;
                 let j = center.y - from.y;
                 let g = if cw { "G2" } else { "G3" };
+                let at = to + self.offset;
                 writeln!(
                     cmd,
                     "{g} X{:.3} Y{:.3} I{i:.4} J{j:.4} E{e:.5} F{spd:.0}",
-                    to.x,
-                    to.y
+                    at.x,
+                    at.y
                 ).unwrap();
                 to
             }

@@ -2030,6 +2030,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "katana-core",
+ "nalgebra",
  "rayon",
 ]
 
@@ -2052,6 +2053,7 @@ dependencies = [
  "clap",
  "eframe",
  "katana-core",
+ "nalgebra",
  "rfd",
  "wgpu",
 ]

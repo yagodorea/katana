@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 katana-core = { path = "../katana-core" }
+nalgebra = "0.33"
 eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "x11"] }
 bytemuck = { version = "1", features = ["derive"] }
 wgpu = "24"

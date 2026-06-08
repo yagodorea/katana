@@ -5,7 +5,8 @@ use std::time::{ Duration, Instant };
 use clap::Parser;
 use eframe::egui;
 use eframe::egui_wgpu;
-use katana_core::{ gcode::{ Gcode, GcodeConfig }, offset, planner, slicer, stl };
+use katana_core::{ gcode::{ self, Gcode, GcodeConfig }, offset, planner, slicer, stl };
+use nalgebra::{ Point2, Vector2 };
 
 mod renderer_wgpu_port;
 
@@ -59,6 +60,16 @@ fn main() -> eframe::Result {
 
     let (mesh_min, mesh_max) = mesh.bounding_box();
     let num_triangles = mesh.triangles.len();
+
+    let bed = gcode::BedConfig {
+        width: 256.0,
+        depth: 256.0,
+    };
+    let gcode_offset = gcode::bed_offset(
+        bed,
+        Point2::new(mesh_min.x, mesh_min.y),
+        Point2::new(mesh_max.x, mesh_max.y)
+    );
 
     let t_slice = Instant::now();
     let result = slicer::slice_mesh(&mesh, args.layer_height);
@@ -180,6 +191,7 @@ fn main() -> eframe::Result {
                     nozzle_width: args.nozzle_width,
                     layer_height: args.layer_height,
                     source_file: args.file,
+                    gcode_offset,
                     layers,
                     num_layers,
                     max_layer: last_layer,
@@ -242,6 +254,7 @@ struct ViewerApp {
     layer_height: f32,
     /// Source STL path, used to suggest a default G-code filename.
     source_file: String,
+    gcode_offset: Vector2<f32>,
     layers: Vec<slicer::Layer>,
     num_layers: usize,
     max_layer: usize,
@@ -292,6 +305,7 @@ impl ViewerApp {
                 nozzle_width: self.nozzle_width,
                 layer_height: self.layer_height,
             },
+            offset: self.gcode_offset,
             // TODO: remove these guys from the constructor
             e: 0.0,
             out: String::new(),

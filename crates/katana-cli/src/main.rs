@@ -168,6 +168,15 @@ fn cmd_slice(
     println!("  Planned result generated in {:.1}ms", plan_ms);
 
     let t_gcode = Instant::now();
+    let bed = gcode::BedConfig {
+        width: 256.0,
+        depth: 256.0,
+    };
+    let offset = gcode::bed_offset(
+        bed,
+        nalgebra::Point2::new(min.x, min.y),
+        nalgebra::Point2::new(max.x, max.y)
+    );
     let mut exporter = gcode::Gcode {
         e: 0.0,
         config: GcodeConfig {
@@ -175,6 +184,7 @@ fn cmd_slice(
             nozzle_width,
             layer_height,
         },
+        offset,
         out: String::new(),
     };
     let out = exporter.export(&planned_result);
