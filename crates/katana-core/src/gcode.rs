@@ -78,7 +78,41 @@ impl Gcode {
         }
         self.emit_end();
         writeln!(self.out, "; EXECUTABLE_BLOCK_END").unwrap();
+        self.emit_summary(plan);
+        self.emit_config();
         std::mem::take(&mut self.out)
+    }
+
+    /// Print statistics Bambu/Orca parse to populate the print summary.
+    /// `self.e` is the cumulative absolute extruder position, i.e. the total
+    /// length of filament consumed in mm.
+    fn emit_summary(&mut self, plan: &PlannedResult) {
+        writeln!(self.out).unwrap();
+        writeln!(self.out, "; filament used [mm] = {:.2}", self.e).unwrap();
+        writeln!(self.out, "; total layers count = {}", plan.layers.len()).unwrap();
+    }
+
+    /// Serialized slicer config that Bambu/Orca re-parse on import. Without a
+    /// filament declaration here, Bambu reports "Not all filaments used in
+    /// slicing are mapped to the printer" because it sees extrusion but no
+    /// filament to map it to.
+    fn emit_config(&mut self) {
+        writeln!(self.out).unwrap();
+        writeln!(self.out, "; CONFIG_BLOCK_START").unwrap();
+        writeln!(self.out, "; nozzle_diameter = {:.1}", self.config.nozzle_width).unwrap();
+        writeln!(self.out, "; filament_diameter = {:.2}", self.config.filament_diameter).unwrap();
+        // hardcoded for now
+        writeln!(self.out, "; filament_type = PETG").unwrap();
+        writeln!(self.out, "; filament_vendor = Generic").unwrap();
+        writeln!(self.out, "; filament_settings_id = \"Generic PETG @BBL A1\"").unwrap();
+        writeln!(self.out, "; filament_colour = #FFFFFF").unwrap();
+        writeln!(self.out, "; filament_map = 1").unwrap();
+        writeln!(self.out, "; filament_ids = GFG99").unwrap();
+        writeln!(self.out, "; filament_map_2 = 0").unwrap();
+        writeln!(self.out, "; filament_self_index = 1").unwrap();
+        writeln!(self.out, "; filament_volume_map = 0").unwrap();
+        writeln!(self.out, "; filament_nozzle_map = 0").unwrap();
+        writeln!(self.out, "; CONFIG_BLOCK_END").unwrap();
     }
 
     fn emit_move(&mut self, mv: &Move, idx: usize, current_feature: &mut Option<&'static str>) {
@@ -183,10 +217,13 @@ impl Gcode {
         writeln!(self.out, ";").unwrap();
         writeln!(self.out, "; --- Starting sequence").unwrap();
         writeln!(self.out, "G28 ; home").unwrap();
-        writeln!(self.out, "M104 S210 ; set nozzle temp (hardcoded to 210 for now)").unwrap();
-        writeln!(self.out, "M140 S60 ; set bed temp (hardcoded to 60 for now)").unwrap();
-        writeln!(self.out, "M109 S210 ; wait for nozzle temp").unwrap();
-        writeln!(self.out, "M190 S60 ; wait for bed temp").unwrap();
+        writeln!(
+            self.out,
+            "M104 S230 ; set nozzle temp (hardcoded to 230 for now for PETG)"
+        ).unwrap();
+        writeln!(self.out, "M140 S80 ; set bed temp (hardcoded to 80 for now)").unwrap();
+        writeln!(self.out, "M109 S230 ; wait for nozzle temp").unwrap();
+        writeln!(self.out, "M190 S80 ; wait for bed temp").unwrap();
         writeln!(self.out, "G92 E0 ; set absolute extruder offset to zero").unwrap();
         writeln!(self.out, "; --- Finish starting sequence").unwrap();
         writeln!(self.out).unwrap();
