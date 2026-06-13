@@ -29,9 +29,10 @@ This workspace contains 3 programs:
 - [X] G-code export
     - [X] Add BambuSlicer compatibility
 - [ ] UI overhaul
-    - [ ] Select file to slice
-    - [ ] Add "slice" button (default open just mesh)
+    - [X] Select file to slice
+    - [X] Add "slice" button (default open just mesh)
     - [ ] Add controls in UI for slicing params
+    - [ ] Split status info in a separate collapsible box
 - [ ] Add head bed rendering and model translation + rotation before slicing
 - [ ] Add more infill patterns
 - [ ] Add support for supports

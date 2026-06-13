@@ -11,11 +11,11 @@ mod buffers;
 mod camera;
 mod pipelines;
 
-pub use camera::{ build_mvp, headlight_dir };
+pub use camera::{build_mvp, headlight_dir};
 
 use katana_core::planner::MoveKind;
-use wgpu::*;
 use wgpu::util::DeviceExt;
+use wgpu::*;
 
 // ---------------------------------------------------------------------------
 // Offscreen render targets
@@ -82,7 +82,7 @@ fn create_color_texture(device: &Device, format: TextureFormat, w: u32, h: u32) 
             format,
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        })
+        }),
     )
 }
 
@@ -101,7 +101,7 @@ fn create_depth_texture(device: &Device, w: u32, h: u32) -> Texture {
             format: pipelines::DEPTH_FORMAT,
             usage: TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
-        })
+        }),
     )
 }
 
@@ -111,7 +111,7 @@ fn create_depth_texture(device: &Device, w: u32, h: u32) -> Texture {
 
 use std::mem::size_of;
 
-use buffers::{ FrameUniforms, GpuBuffer, InstancedBatch, LineBatch };
+use buffers::{FrameUniforms, GpuBuffer, InstancedBatch, LineBatch};
 
 // ---------------------------------------------------------------------------
 // Rhombus vertex table — compile-time constant, 144 bytes, written once.
@@ -160,7 +160,7 @@ const VERTEX_TABLE: [u32; 36] = [
     pack(R, 1, N_POS), pack(B, 1, N_POS), pack(L, 1, N_POS),
 ];
 
-use crate::renderer_wgpu_port::buffers::{ LineVertex, MeshVertex, RhombusInstance };
+use crate::renderer_wgpu_port::buffers::{LineVertex, MeshVertex, RhombusInstance};
 
 /// Brightness multiplier applied to layers *below* the one being scrubbed
 const SCRUB_DIM: f32 = 0.25;
@@ -260,7 +260,7 @@ impl Renderer {
         _queue: Queue,
         color_format: TextureFormat,
         width: u32,
-        height: u32
+        height: u32,
     ) -> Self {
         let frame_bgl = pipelines::build_frame_bgl(&device);
         let rhombus_bgl = pipelines::build_rhombus_bgl(&device);
@@ -273,7 +273,7 @@ impl Renderer {
                     size: size_of::<FrameUniforms>() as BufferAddress,
                     usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
                     mapped_at_creation: false,
-                })
+                }),
             )
         };
         let make_bind_group = |label: &str, buf: &Buffer| -> BindGroup {
@@ -281,8 +281,11 @@ impl Renderer {
                 &(BindGroupDescriptor {
                     label: Some(label),
                     layout: &frame_bgl,
-                    entries: &[BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
-                })
+                    entries: &[BindGroupEntry {
+                        binding: 0,
+                        resource: buf.as_entire_binding(),
+                    }],
+                }),
             )
         };
         let frame_uniform_buffer_bg = make_uniform_buffer("frame_uniform_buffer_bg");
@@ -297,17 +300,19 @@ impl Renderer {
                 label: Some("vertex_table"),
                 contents: table_bytes,
                 usage: BufferUsages::UNIFORM,
-            })
+            }),
         );
 
         // Upload the static color palette (binding 2); never rewritten.
-        let palette_uniforms = buffers::PaletteUniforms { colors: buffers::COLOR_PALETTE };
+        let palette_uniforms = buffers::PaletteUniforms {
+            colors: buffers::COLOR_PALETTE,
+        };
         let palette_buffer = device.create_buffer_init(
             &(wgpu::util::BufferInitDescriptor {
                 label: Some("palette_buffer"),
                 contents: bytemuck::bytes_of(&palette_uniforms),
                 usage: BufferUsages::UNIFORM,
-            })
+            }),
         );
 
         let make_rhombus_bind_group = |label: &str, frame_buf: &Buffer| -> BindGroup {
@@ -316,55 +321,39 @@ impl Renderer {
                     label: Some(label),
                     layout: &rhombus_bgl,
                     entries: &[
-                        BindGroupEntry { binding: 0, resource: frame_buf.as_entire_binding() },
+                        BindGroupEntry {
+                            binding: 0,
+                            resource: frame_buf.as_entire_binding(),
+                        },
                         BindGroupEntry {
                             binding: 1,
                             resource: vertex_table_buffer.as_entire_binding(),
                         },
-                        BindGroupEntry { binding: 2, resource: palette_buffer.as_entire_binding() },
+                        BindGroupEntry {
+                            binding: 2,
+                            resource: palette_buffer.as_entire_binding(),
+                        },
                     ],
-                })
+                }),
             )
         };
-        let rhombus_bind_group_bg = make_rhombus_bind_group(
-            "rhombus_bind_group_bg",
-            &frame_uniform_buffer_bg
-        );
-        let rhombus_bind_group_fg = make_rhombus_bind_group(
-            "rhombus_bind_group_fg",
-            &frame_uniform_buffer_fg
-        );
+        let rhombus_bind_group_bg =
+            make_rhombus_bind_group("rhombus_bind_group_bg", &frame_uniform_buffer_bg);
+        let rhombus_bind_group_fg =
+            make_rhombus_bind_group("rhombus_bind_group_fg", &frame_uniform_buffer_fg);
 
-        let line_opaque_pipeline = pipelines::build_line_opaque_pipeline(
-            &device,
-            &frame_bgl,
-            color_format
-        );
-        let line_transparent_pipeline = pipelines::build_line_transparent_pipeline(
-            &device,
-            &frame_bgl,
-            color_format
-        );
-        let mesh_opaque_pipeline = pipelines::build_mesh_opaque_pipeline(
-            &device,
-            &frame_bgl,
-            color_format
-        );
-        let mesh_transparent_pipeline = pipelines::build_mesh_transparent_pipeline(
-            &device,
-            &frame_bgl,
-            color_format
-        );
-        let rhombus_opaque_pipeline = pipelines::build_rhombus_opaque_pipeline(
-            &device,
-            &rhombus_bgl,
-            color_format
-        );
-        let rhombus_transparent_pipeline = pipelines::build_rhombus_transparent_pipeline(
-            &device,
-            &rhombus_bgl,
-            color_format
-        );
+        let line_opaque_pipeline =
+            pipelines::build_line_opaque_pipeline(&device, &frame_bgl, color_format);
+        let line_transparent_pipeline =
+            pipelines::build_line_transparent_pipeline(&device, &frame_bgl, color_format);
+        let mesh_opaque_pipeline =
+            pipelines::build_mesh_opaque_pipeline(&device, &frame_bgl, color_format);
+        let mesh_transparent_pipeline =
+            pipelines::build_mesh_transparent_pipeline(&device, &frame_bgl, color_format);
+        let rhombus_opaque_pipeline =
+            pipelines::build_rhombus_opaque_pipeline(&device, &rhombus_bgl, color_format);
+        let rhombus_transparent_pipeline =
+            pipelines::build_rhombus_transparent_pipeline(&device, &rhombus_bgl, color_format);
 
         let blit_bgl = pipelines::build_blit_bgl(&device);
         let blit_pipeline = pipelines::build_blit_pipeline(&device, &blit_bgl, color_format);
@@ -375,16 +364,12 @@ impl Renderer {
                 min_filter: FilterMode::Nearest,
                 mipmap_filter: FilterMode::Nearest,
                 ..Default::default()
-            })
+            }),
         );
 
         let offscreen = OffscreenTargets::new(&device, color_format, width, height);
-        let blit_bind_group = build_blit_bind_group(
-            &device,
-            &blit_bgl,
-            &offscreen.color_view,
-            &blit_sampler
-        );
+        let blit_bind_group =
+            build_blit_bind_group(&device, &blit_bgl, &offscreen.color_view, &blit_sampler);
 
         let nozzle_buffer = GpuBuffer {
             buffer: device.create_buffer(
@@ -393,7 +378,7 @@ impl Renderer {
                     size: (NOZZLE_VERT_COUNT as u64) * (size_of::<MeshVertex>() as u64),
                     usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
                     mapped_at_creation: false,
-                })
+                }),
             ),
             vertex_count: NOZZLE_VERT_COUNT,
         };
@@ -481,8 +466,14 @@ impl Renderer {
                 for p in 0..pts.len() {
                     let point = &contour.points[p];
                     let next = &contour.points[(p + 1) % pts.len()];
-                    verts.push(LineVertex { pos: [point.x, point.y, layer.z], color });
-                    verts.push(LineVertex { pos: [next.x, next.y, layer.z], color });
+                    verts.push(LineVertex {
+                        pos: [point.x, point.y, layer.z],
+                        color,
+                    });
+                    verts.push(LineVertex {
+                        pos: [next.x, next.y, layer.z],
+                        color,
+                    });
                 }
             }
         }
@@ -506,8 +497,14 @@ impl Renderer {
                 for p in 0..pts.len() {
                     let point = &contour.points[p];
                     let next = &contour.points[(p + 1) % pts.len()];
-                    verts.push(LineVertex { pos: [point.x, point.y, layer.z], color });
-                    verts.push(LineVertex { pos: [next.x, next.y, layer.z], color });
+                    verts.push(LineVertex {
+                        pos: [point.x, point.y, layer.z],
+                        color,
+                    });
+                    verts.push(LineVertex {
+                        pos: [next.x, next.y, layer.z],
+                        color,
+                    });
                 }
             }
         }
@@ -518,7 +515,7 @@ impl Renderer {
         &mut self,
         planned_layers: &[katana_core::planner::PlannedLayer],
         nozzle_width: f32,
-        layer_height: f32
+        layer_height: f32,
     ) {
         self.half_height = layer_height * 0.5;
         self.half_width = nozzle_width * 0.5;
@@ -596,13 +593,25 @@ impl Renderer {
                     track.points.push([b.x, b.y]);
 
                     if mv.kind == MoveKind::Travel {
-                        travel_verts.push(LineVertex { pos: [a.x, a.y, pl.z], color: line_color });
-                        travel_verts.push(LineVertex { pos: [b.x, b.y, pl.z], color: line_color });
+                        travel_verts.push(LineVertex {
+                            pos: [a.x, a.y, pl.z],
+                            color: line_color,
+                        });
+                        travel_verts.push(LineVertex {
+                            pos: [b.x, b.y, pl.z],
+                            color: line_color,
+                        });
                         travel_seg_times.push(elapsed_s);
                     } else {
                         // Extrusion: emit both the flat path line and the 3D rhombus.
-                        path_verts.push(LineVertex { pos: [a.x, a.y, pl.z], color: line_color });
-                        path_verts.push(LineVertex { pos: [b.x, b.y, pl.z], color: line_color });
+                        path_verts.push(LineVertex {
+                            pos: [a.x, a.y, pl.z],
+                            color: line_color,
+                        });
+                        path_verts.push(LineVertex {
+                            pos: [b.x, b.y, pl.z],
+                            color: line_color,
+                        });
                         path_seg_times.push(elapsed_s);
 
                         rhombus_instances.push(RhombusInstance {
@@ -654,21 +663,26 @@ impl Renderer {
         }
 
         // Upload
-        self.toolpath_lines_buffer = (!travel_verts.is_empty()).then(||
-            buffers::make_line_batch(&self.device, &travel_verts, travel_entries, travel_seg_times)
-        );
-        self.toolpath_path_lines_buffer = (!path_verts.is_empty()).then(||
+        self.toolpath_lines_buffer = (!travel_verts.is_empty()).then(|| {
+            buffers::make_line_batch(
+                &self.device,
+                &travel_verts,
+                travel_entries,
+                travel_seg_times,
+            )
+        });
+        self.toolpath_path_lines_buffer = (!path_verts.is_empty()).then(|| {
             buffers::make_line_batch(&self.device, &path_verts, path_entries, path_seg_times)
-        );
-        self.toolpath_rhombuses = (!rhombus_instances.is_empty()).then(||
+        });
+        self.toolpath_rhombuses = (!rhombus_instances.is_empty()).then(|| {
             buffers::make_instanced_batch(
                 &self.device,
                 &rhombus_instances,
                 rhombus_entries,
                 rhombus_times,
-                rhombus_start_times
+                rhombus_start_times,
             )
-        );
+        });
         self.head_tracks = head_tracks;
     }
 
@@ -684,7 +698,7 @@ impl Renderer {
         light_dir: &[f32; 3],
         bg_mode: super::BgMode,
         viewport_w: u32,
-        viewport_h: u32
+        viewport_h: u32,
     ) {
         // resize offscreen to match the viewport size.
         let resized = self.offscreen.resize(device, viewport_w, viewport_h);
@@ -693,7 +707,7 @@ impl Renderer {
                 device,
                 &self.blit_bgl,
                 &self.offscreen.color_view,
-                &self.blit_sampler
+                &self.blit_sampler,
             );
         }
 
@@ -744,25 +758,36 @@ impl Renderer {
             scrub_partial_index: partial_index,
             scrub_partial_frac: partial_frac,
         };
-        queue.write_buffer(&self.frame_uniform_buffer_bg, 0, bytemuck::bytes_of(&bg_uniforms));
-        queue.write_buffer(&self.frame_uniform_buffer_fg, 0, bytemuck::bytes_of(&fg_uniforms));
+        queue.write_buffer(
+            &self.frame_uniform_buffer_bg,
+            0,
+            bytemuck::bytes_of(&bg_uniforms),
+        );
+        queue.write_buffer(
+            &self.frame_uniform_buffer_fg,
+            0,
+            bytemuck::bytes_of(&fg_uniforms),
+        );
 
         // background pass
         {
             let mut pass = encoder.begin_render_pass(
                 &(RenderPassDescriptor {
                     label: Some("bg_pass"),
-                    color_attachments: &[
-                        Some(RenderPassColorAttachment {
-                            view: &self.offscreen.color_view,
-                            resolve_target: None,
-                            ops: Operations {
-                                // TODO: move this color to a const/config, etc
-                                load: LoadOp::Clear(Color { r: 0.102, g: 0.102, b: 0.18, a: 1.0 }),
-                                store: StoreOp::Store,
-                            },
-                        }),
-                    ],
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &self.offscreen.color_view,
+                        resolve_target: None,
+                        ops: Operations {
+                            // TODO: move this color to a const/config, etc
+                            load: LoadOp::Clear(Color {
+                                r: 0.102,
+                                g: 0.102,
+                                b: 0.18,
+                                a: 1.0,
+                            }),
+                            store: StoreOp::Store,
+                        },
+                    })],
                     depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                         view: &self.offscreen.depth_view,
                         depth_ops: Some(Operations {
@@ -773,7 +798,7 @@ impl Renderer {
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
-                })
+                }),
             );
             pass.set_bind_group(0, &self.frame_bind_group_bg, &[]);
 
@@ -796,7 +821,11 @@ impl Renderer {
         }
 
         // While scrubbing, place the nozzle over the current print-head position
-        let head = if self.is_scrubbing { self.nozzle_head_position() } else { None };
+        let head = if self.is_scrubbing {
+            self.nozzle_head_position()
+        } else {
+            None
+        };
         let draw_nozzle = head.is_some();
         if let Some([hx, hy]) = head {
             let tip = [hx, hy, self.scrub_top_z + self.half_height];
@@ -811,13 +840,14 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(
                 &(RenderPassDescriptor {
                     label: Some("fg_pass"),
-                    color_attachments: &[
-                        Some(RenderPassColorAttachment {
-                            view: &self.offscreen.color_view,
-                            resolve_target: None,
-                            ops: Operations { load: LoadOp::Load, store: StoreOp::Store },
-                        }),
-                    ],
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &self.offscreen.color_view,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Load,
+                            store: StoreOp::Store,
+                        },
+                    })],
                     depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                         view: &self.offscreen.depth_view,
                         depth_ops: Some(Operations {
@@ -828,7 +858,7 @@ impl Renderer {
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
-                })
+                }),
             );
             pass.set_bind_group(0, &self.frame_bind_group_fg, &[]);
 
@@ -853,7 +883,7 @@ impl Renderer {
                             mvp,
                             self.half_height,
                             self.scrub_fraction,
-                            partial_index
+                            partial_index,
                         );
                     }
                 } else {
@@ -865,7 +895,7 @@ impl Renderer {
                             plb,
                             self.clip_z_min,
                             self.clip_z_max,
-                            self.scrub_fraction
+                            self.scrub_fraction,
                         );
                     }
                 }
@@ -884,7 +914,7 @@ impl Renderer {
                             lb,
                             self.clip_z_min,
                             self.clip_z_max,
-                            self.scrub_fraction
+                            self.scrub_fraction,
                         );
                     }
                 }
@@ -941,7 +971,7 @@ impl Renderer {
         min_z: f32,
         max_x: f32,
         max_y: f32,
-        max_z: f32
+        max_z: f32,
     ) -> bool {
         for p in planes {
             // P-vertex: AABB corner most aligned with the plane normal
@@ -957,7 +987,9 @@ impl Renderer {
 
     /// XY of the print head at the current scrub instant on the top visible layer, or `None` when there's no toolpath to follow.
     fn nozzle_head_position(&self) -> Option<[f32; 2]> {
-        let idx = self.head_tracks.partition_point(|t| t.layer_z <= self.clip_z_max);
+        let idx = self
+            .head_tracks
+            .partition_point(|t| t.layer_z <= self.clip_z_max);
         let track = self.head_tracks.get(idx.checked_sub(1)?)?;
         let total = *track.times.last()?;
         let threshold = self.scrub_fraction * total;
@@ -970,7 +1002,8 @@ impl Renderer {
             return None;
         }
         let batch = self.toolpath_rhombuses.as_ref()?;
-        let scrubbed_layer = batch.layer_entries
+        let scrubbed_layer = batch
+            .layer_entries
             .partition_point(|e| e.layer_z <= self.clip_z_max)
             .checked_sub(1)?;
         let entry = batch.layer_entries.get(scrubbed_layer)?;
@@ -982,9 +1015,8 @@ impl Renderer {
 
         let threshold = self.scrub_fraction * entry.time_total;
         // Whole segments completed by `threshold`
-        let draw_count = batch.instance_times[
-            instances_below..instances_below + instance_count
-        ].partition_point(|&t| t <= threshold);
+        let draw_count = batch.instance_times[instances_below..instances_below + instance_count]
+            .partition_point(|&t| t <= threshold);
         if draw_count >= instance_count {
             return None; // layer fully printed; no segment in progress
         }
@@ -997,7 +1029,11 @@ impl Renderer {
         }
         let span = end_t - start_t;
         // instance fraction
-        let frac = if span > 1e-9 { (threshold - start_t) / span } else { 1.0 };
+        let frac = if span > 1e-9 {
+            (threshold - start_t) / span
+        } else {
+            1.0
+        };
         Some((gidx as u32, frac.clamp(0.0, 1.0)))
     }
 }
@@ -1017,7 +1053,11 @@ fn head_position_at(track: &LayerHeadTrack, threshold: f32) -> [f32; 2] {
     let (p0, p1) = (track.points[reached - 1], track.points[reached]);
     let (t0, t1) = (track.times[reached - 1], track.times[reached]);
     let span = t1 - t0;
-    let f = if span > 1e-9 { (threshold - t0) / span } else { 0.0 };
+    let f = if span > 1e-9 {
+        (threshold - t0) / span
+    } else {
+        0.0
+    };
     [p0[0] + (p1[0] - p0[0]) * f, p0[1] + (p1[1] - p0[1]) * f]
 }
 
@@ -1047,10 +1087,17 @@ fn build_nozzle_verts(tip: [f32; 3], radius: f32, height: f32, clip_z: f32) -> V
             u[2] * v[0] - u[0] * v[2],
             u[0] * v[1] - u[1] * v[0],
         ];
-        let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt().max(1e-6);
+        let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2])
+            .sqrt()
+            .max(1e-6);
         nrm = [nrm[0] / len, nrm[1] / len, nrm[2] / len];
         for p in [p0, p1, p2] {
-            verts.push(MeshVertex { pos: p, normal: nrm, color: NOZZLE_COLOR, layer_z: clip_z });
+            verts.push(MeshVertex {
+                pos: p,
+                normal: nrm,
+                color: NOZZLE_COLOR,
+                layer_z: clip_z,
+            });
         }
     };
 
@@ -1082,11 +1129,15 @@ fn draw_rhombus_batch(
     mvp: &[f32; 16],
     half_height: f32,
     scrub_fraction: f32,
-    partial_index: u32
+    partial_index: u32,
 ) {
     // Binary-search the visible layer range. layer_entries is sorted ascending.
-    let start_idx = batch.layer_entries.partition_point(|e| e.layer_z < clip_z_min);
-    let end_idx = batch.layer_entries.partition_point(|e| e.layer_z <= clip_z_max);
+    let start_idx = batch
+        .layer_entries
+        .partition_point(|e| e.layer_z < clip_z_min);
+    let end_idx = batch
+        .layer_entries
+        .partition_point(|e| e.layer_z <= clip_z_max);
     if start_idx >= end_idx {
         return;
     }
@@ -1136,7 +1187,7 @@ fn draw_rhombus_batch(
             entry.layer_z - half_height,
             entry.aabb_max_x,
             entry.aabb_max_y,
-            entry.layer_z + half_height
+            entry.layer_z + half_height,
         );
         if outside || draw_count == 0 {
             // Flush the in-progress run, if any. (A zero-count top layer also
@@ -1173,11 +1224,15 @@ fn draw_line_batch(
     batch: &LineBatch,
     clip_z_min: f32,
     clip_z_max: f32,
-    scrub_fraction: f32
+    scrub_fraction: f32,
 ) {
     // Binary search the visible layers
-    let start_idx = batch.layer_entries.partition_point(|e| e.layer_z < clip_z_min);
-    let end_idx = batch.layer_entries.partition_point(|e| e.layer_z <= clip_z_max);
+    let start_idx = batch
+        .layer_entries
+        .partition_point(|e| e.layer_z < clip_z_min);
+    let end_idx = batch
+        .layer_entries
+        .partition_point(|e| e.layer_z <= clip_z_max);
     if start_idx >= end_idx {
         return;
     }
@@ -1215,16 +1270,22 @@ fn build_blit_bind_group(
     device: &Device,
     layout: &BindGroupLayout,
     color_view: &TextureView,
-    sampler: &Sampler
+    sampler: &Sampler,
 ) -> BindGroup {
     device.create_bind_group(
         &(BindGroupDescriptor {
             label: Some("blit_bind_group"),
             layout,
             entries: &[
-                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(color_view) },
-                BindGroupEntry { binding: 1, resource: BindingResource::Sampler(sampler) },
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(color_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Sampler(sampler),
+                },
             ],
-        })
+        }),
     )
 }

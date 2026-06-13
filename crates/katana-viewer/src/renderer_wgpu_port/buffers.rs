@@ -5,7 +5,7 @@
 //! byte-for-byte, `bytemuck::cast_slice` reinterprets the raw memory.
 
 use bytemuck::{ Pod, Zeroable };
-use wgpu::{ BufferUsages, Device, util::DeviceExt };
+use wgpu::{ util::DeviceExt, BufferUsages, Device };
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -128,7 +128,10 @@ pub fn upload_lines(device: &Device, verts: &[LineVertex]) -> GpuBuffer {
         })
     );
     let vertex_count = verts.len() as u32;
-    GpuBuffer { buffer, vertex_count }
+    GpuBuffer {
+        buffer,
+        vertex_count,
+    }
 }
 
 pub fn upload_lines_batched(device: &Device, verts: &[LineVertex]) -> LineBatch {
@@ -141,7 +144,11 @@ pub fn upload_lines_batched(device: &Device, verts: &[LineVertex]) -> LineBatch 
     );
     let mut layer_entries: Vec<LineLayerEntry> = Vec::new();
     if verts.is_empty() {
-        return LineBatch { buffer, layer_entries, segment_times: Vec::new() };
+        return LineBatch {
+            buffer,
+            layer_entries,
+            segment_times: Vec::new(),
+        };
     }
     let mut current_z = verts[0].pos[2];
     let mut layer_start = 0usize;
@@ -161,7 +168,11 @@ pub fn upload_lines_batched(device: &Device, verts: &[LineVertex]) -> LineBatch 
             }
         }
     }
-    LineBatch { buffer, layer_entries, segment_times: Vec::new() }
+    LineBatch {
+        buffer,
+        layer_entries,
+        segment_times: Vec::new(),
+    }
 }
 
 /// Wrap pre-built line geometry + per-layer entries + per-segment cumulative times into a `LineBatch`
@@ -178,7 +189,11 @@ pub fn make_line_batch(
             usage: BufferUsages::VERTEX,
         })
     );
-    LineBatch { buffer, layer_entries, segment_times }
+    LineBatch {
+        buffer,
+        layer_entries,
+        segment_times,
+    }
 }
 
 /// Wrap pre-built rhombus instances + per-layer entries + per-instance cumulative times into an `InstancedBatch`
@@ -196,7 +211,12 @@ pub fn make_instanced_batch(
             usage: BufferUsages::VERTEX,
         })
     );
-    InstancedBatch { buffer, layer_entries, instance_times, instance_start_times }
+    InstancedBatch {
+        buffer,
+        layer_entries,
+        instance_times,
+        instance_start_times,
+    }
 }
 
 pub fn upload_mesh(device: &Device, verts: &[MeshVertex]) -> GpuBuffer {
@@ -208,7 +228,10 @@ pub fn upload_mesh(device: &Device, verts: &[MeshVertex]) -> GpuBuffer {
         })
     );
     let vertex_count = verts.len() as u32;
-    GpuBuffer { buffer, vertex_count }
+    GpuBuffer {
+        buffer,
+        vertex_count,
+    }
 }
 
 /// Conservative XY bounding box of a layer's rhombus instances. Public so the
