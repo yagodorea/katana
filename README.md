@@ -34,6 +34,7 @@ This workspace contains 3 programs:
     - [ ] Add controls in UI for slicing params
     - [ ] Split status info in a separate collapsible box
 - [ ] Add head bed rendering and model translation + rotation before slicing
+- [ ] Port to browser-compatible
 - [ ] Add more infill patterns
 - [ ] Add support for supports
 - [ ] Retraction
