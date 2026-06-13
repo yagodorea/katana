@@ -586,19 +586,13 @@ impl ViewerApp {
 
     /// Phase 3: Full viewer with layer controls, scrubber, and export.
     fn update_sliced(&mut self, ctx: &egui::Context) {
-        // Top panel
+        // Top panel: navigation + export
         egui::TopBottomPanel::top("info").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.num_layers == 0 {
                     ui.label("No layers");
                     return;
                 }
-                let height = self.layers[self.num_layers.saturating_sub(1)].z;
-                ui.label(format!("{} layers. Height {:.3} mm", self.num_layers, height));
-                let top_z = &self.layers[self.max_layer].z;
-                ui.label(format!("Top layer {} | z = {:.3} mm", self.max_layer, top_z));
-                let bottom_z = &self.layers[self.min_layer].z;
-                ui.label(format!("Bottom layer {} | z = {:.3} mm", self.min_layer, bottom_z));
                 if ui.button("◀ Prev").clicked() && self.max_layer > 0 {
                     self.max_layer -= 1;
                 }
@@ -609,25 +603,61 @@ impl ViewerApp {
                     self.max_layer += 1;
                 }
                 ui.separator();
-                ui.label("BG:");
-                ui.selectable_value(&mut self.bg_mode, BgMode::Mesh, "Mesh");
-                ui.selectable_value(&mut self.bg_mode, BgMode::Layers, "Layers");
-                ui.selectable_value(&mut self.bg_mode, BgMode::None, "None");
-                ui.separator();
-                ui.label("View:");
-                ui.selectable_value(&mut self.slice_view, SliceView::Contours, "Contours");
-                ui.selectable_value(&mut self.slice_view, SliceView::Toolpaths, "Toolpaths");
-                ui.separator();
-                ui.checkbox(&mut self.show_filaments, "3D filaments");
-                ui.checkbox(&mut self.show_travel_moves, "Travel moves");
-                ui.separator();
                 if ui.button("💾 Export G-code").clicked() {
                     self.export_gcode();
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            });
+        });
+
+        // Left sidebar: rendering options (collapsible, collapsed by default)
+        egui::SidePanel
+            ::left("rendering_options")
+            .resizable(false)
+            .exact_width(160.0)
+            .show(ctx, |ui| {
+                if self.num_layers == 0 {
+                    return;
+                }
+                ui.collapsing("🎨 Rendering options", |ui| {
+                    ui.label("BG:");
+                    ui.selectable_value(&mut self.bg_mode, BgMode::Mesh, "Mesh");
+                    ui.selectable_value(&mut self.bg_mode, BgMode::Layers, "Layers");
+                    ui.selectable_value(&mut self.bg_mode, BgMode::None, "None");
+                    ui.separator();
+                    ui.label("View:");
+                    ui.selectable_value(&mut self.slice_view, SliceView::Contours, "Contours");
+                    ui.selectable_value(&mut self.slice_view, SliceView::Toolpaths, "Toolpaths");
+                    ui.separator();
+                    ui.checkbox(&mut self.show_filaments, "3D filaments");
+                    ui.checkbox(&mut self.show_travel_moves, "Travel moves");
+                });
+            });
+
+        // Collapsible translucent stats window (top-right)
+        if self.num_layers > 0 {
+            let height = self.layers[self.num_layers.saturating_sub(1)].z;
+            let top_z = self.layers[self.max_layer].z;
+            let bottom_z = self.layers[self.min_layer].z;
+            egui::Window::new("📊 Stats")
+                .id(egui::Id::new("stats_window"))
+                .collapsible(true)
+                .default_open(false)
+                .anchor(egui::Align2::RIGHT_TOP, [-8.0, 8.0])
+                .resizable(false)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgba_premultiplied(20, 20, 30, 200))
+                        .corner_radius(6.0)
+                        .inner_margin(8.0)
+                )
+                .show(ctx, |ui| {
+                    ui.label(format!("{} layers · {:.3} mm", self.num_layers, height));
+                    ui.label(format!("Top    layer {} · z {:.3} mm", self.max_layer, top_z));
+                    ui.label(format!("Bottom layer {} · z {:.3} mm", self.min_layer, bottom_z));
+                    ui.separator();
                     ui.label(
                         format!(
-                            "{} tris | load: {:.0}ms, slice: {:.0}ms, offset: {:.0}ms, plan: {:.0}ms",
+                            "{} tris · load {:.0}ms · slice {:.0}ms · offset {:.0}ms · plan {:.0}ms",
                             self.stats.triangles,
                             self.stats.load_ms,
                             self.stats.slice_ms,
@@ -636,8 +666,7 @@ impl ViewerApp {
                         )
                     );
                 });
-            });
-        });
+        }
 
         // Left panel: top layer slider
         egui::SidePanel
