@@ -15,8 +15,8 @@ set -euo pipefail
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly}"
 export CARGO_UNSTABLE_BUILD_STD="panic_abort,std"
 
-cd "$(dirname "$0")/.."
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 TARGET_DIR="$(cd ../.. && pwd)/target/wasm32-unknown-unknown/release"
 WASM_RAW="$TARGET_DIR/katana_viewer.wasm"
 WASM_PATCHED="$TARGET_DIR/katana_viewer_patched.wasm"
