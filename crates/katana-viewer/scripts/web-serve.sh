@@ -52,6 +52,7 @@ PY
 if command -v wasm-opt &>/dev/null; then
     echo "==> wasm-opt"
     wasm-opt -Oz --enable-threads --enable-bulk-memory --enable-mutable-globals \
+        --enable-reference-types \
         "$OUT_DIR/${OUT_NAME}_bg.wasm" -o "$OUT_DIR/${OUT_NAME}_bg.wasm"
 fi
 
