@@ -1,15 +1,10 @@
-# WASM threads require atomics + shared memory in the compiled module.
-# Scoped to the wasm target ONLY — native builds are unaffected and stay on stable.
-# The matching `-Z build-std` (needed so std is rebuilt with these features) is
-# passed via env in scripts/web-serve.sh, NOT here, so it never leaks to native.
+# wasm threads: shared memory + atomics. Scoped to the wasm target so native
+# builds stay on stable. Pairs with `-Z build-std` from scripts/web-serve.sh.
 [target.wasm32-unknown-unknown]
 rustflags = [
     "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
-    # Atomics enables the opcodes; these two actually make the memory SHARED.
-    # wasm-ld only promotes memory to shared when given an explicit maximum.
     "-C", "link-arg=--shared-memory",
     "-C", "link-arg=--import-memory",
-    "-C", "link-arg=--max-memory=4294967296", # 4 GiB, the wasm32 ceiling
-    # wasm-bindgen needs __heap_base to inject per-thread ids for rayon workers.
+    "-C", "link-arg=--max-memory=4294967296",
     "-C", "link-arg=--export=__heap_base",
 ]

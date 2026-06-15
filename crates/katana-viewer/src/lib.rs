@@ -10,7 +10,7 @@ use wasm_bindgen::prelude::*;
 
 // Re-exporting this generates the `wbg_rayon_start_worker` export that each
 // spawned Web Worker boots into. Required by wasm-bindgen-rayon — do not remove.
-#[cfg(all(target_arch = "wasm32", feature = "parallel"))]
+#[cfg(target_arch = "wasm32")]
 pub use wasm_bindgen_rayon::init_thread_pool;
 
 pub mod renderer_wgpu_port;
@@ -805,17 +805,13 @@ pub fn start_web() {
 
     wasm_bindgen_futures::spawn_local(async move {
         // Spin up the rayon thread pool (one Web Worker per hardware thread)
-        // before any slicing runs. par_iter() in katana-core uses this global
-        // pool; without it, rayon falls back to running serially on this thread.
-        #[cfg(feature = "parallel")]
-        {
-            let threads = web_sys
-                ::window()
-                .map(|w| w.navigator().hardware_concurrency() as usize)
-                .unwrap_or(1)
-                .max(1);
-            let _ = wasm_bindgen_futures::JsFuture::from(init_thread_pool(threads)).await;
-        }
+        // before any slicing runs. par_iter() in katana-core uses this global pool.
+        let threads = web_sys
+            ::window()
+            .map(|w| w.navigator().hardware_concurrency() as usize)
+            .unwrap_or(1)
+            .max(1);
+        let _ = wasm_bindgen_futures::JsFuture::from(init_thread_pool(threads)).await;
 
         let web_options = eframe::WebOptions::default();
 

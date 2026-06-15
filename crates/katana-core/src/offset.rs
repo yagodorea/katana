@@ -752,50 +752,29 @@ fn generate_monotonic_surface_infill(
     all_lines
 }
 
-/// Generate toolpaths for all layers (parallelized across cores when the
-/// `parallel` feature is enabled, sequential otherwise).
+/// Generate toolpaths for all layers, parallelized across cores.
 pub fn generate_toolpaths(
     slice_result: &SliceResult,
     perim_config: &PerimeterConfig,
     infill_config: &InfillConfig,
     surface_config: &SurfaceConfig
 ) -> ToolpathResult {
-    #[cfg(feature = "parallel")]
-    {
-        use rayon::prelude::*;
+    use rayon::prelude::*;
 
-        // Pass 1: perimeter walls + fillable region for every layer, independently.
-        let prepared: Vec<LayerPerimeters> = slice_result.layers
-            .par_iter()
-            .enumerate()
-            .map(|(i, layer)| build_layer_perimeters(layer, i, perim_config))
-            .collect();
+    // Pass 1: perimeter walls + fillable region for every layer, independently.
+    let prepared: Vec<LayerPerimeters> = slice_result.layers
+        .par_iter()
+        .enumerate()
+        .map(|(i, layer)| build_layer_perimeters(layer, i, perim_config))
+        .collect();
 
-        // Pass 2: classify solid vs sparse using neighbouring layers, then fill.
-        let layers = (0..prepared.len())
-            .into_par_iter()
-            .map(|i| finish_layer(&prepared, i, perim_config, infill_config, surface_config))
-            .collect();
+    // Pass 2: classify solid vs sparse using neighbouring layers, then fill.
+    let layers = (0..prepared.len())
+        .into_par_iter()
+        .map(|i| finish_layer(&prepared, i, perim_config, infill_config, surface_config))
+        .collect();
 
-        ToolpathResult { layers }
-    }
-
-    #[cfg(not(feature = "parallel"))]
-    {
-        // Pass 1: perimeter walls + fillable region for every layer, independently.
-        let prepared: Vec<LayerPerimeters> = slice_result.layers
-            .iter()
-            .enumerate()
-            .map(|(i, layer)| build_layer_perimeters(layer, i, perim_config))
-            .collect();
-
-        // Pass 2: classify solid vs sparse using neighbouring layers, then fill.
-        let layers = (0..prepared.len())
-            .map(|i| finish_layer(&prepared, i, perim_config, infill_config, surface_config))
-            .collect();
-
-        ToolpathResult { layers }
-    }
+    ToolpathResult { layers }
 }
 
 #[cfg(test)]
