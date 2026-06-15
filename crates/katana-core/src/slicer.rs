@@ -40,8 +40,6 @@ pub struct SliceResult {
 /// `layer_height` is the distance between slicing planes (e.g. 0.2 mm).
 /// Returns one `Layer` per Z height, each containing closed contour polygons.
 pub fn slice_mesh(mesh: &Mesh, layer_height: f32) -> SliceResult {
-    use rayon::prelude::*;
-
     let (min, max) = mesh.bounding_box();
     let z_min = min.z + EPSILON;
     let z_max = max.z - EPSILON;
@@ -69,14 +67,22 @@ pub fn slice_mesh(mesh: &Mesh, layer_height: f32) -> SliceResult {
         z += layer_height;
     }
 
-    let layers: Vec<Layer> = z_heights
-        .par_iter()
-        .map(|&z| {
+    #[cfg(feature = "parallel")]
+    let layers: Vec<Layer> = {
+        use rayon::prelude::*;
+        z_heights.par_iter().map(|&z| {
             let (segments, min_surface_angle) = intersect_plane_indexed(mesh, z, &z_index);
             let contours = assemble_contours(segments);
             Layer { z, contours, min_surface_angle }
-        })
-        .collect();
+        }).collect()
+    };
+
+    #[cfg(not(feature = "parallel"))]
+    let layers: Vec<Layer> = z_heights.iter().map(|&z| {
+        let (segments, min_surface_angle) = intersect_plane_indexed(mesh, z, &z_index);
+        let contours = assemble_contours(segments);
+        Layer { z, contours, min_surface_angle }
+    }).collect();
 
     SliceResult { layers }
 }

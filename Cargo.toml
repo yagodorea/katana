@@ -1,3 +1,4 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["crates/katana-viewer/scripts/wasm-patcher"]
 resolver = "2"

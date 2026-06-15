@@ -7,4 +7,3 @@ edition = "2021"
 katana-core = { path = "../katana-core" }
 nalgebra = "0.33"
 clap = { version = "4", features = ["derive"] }
-rayon = "1"

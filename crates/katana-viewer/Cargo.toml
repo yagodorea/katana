@@ -3,11 +3,42 @@ name = "katana-viewer"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "katana_viewer"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon", "katana-core/parallel"]
+
 [dependencies]
-katana-core = { path = "../katana-core" }
+katana-core = { path = "../katana-core", default-features = false }
 nalgebra = "0.33"
-eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "x11"] }
 bytemuck = { version = "1", features = ["derive"] }
 wgpu = "24"
+eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
+rayon = { version = "1", optional = true }
+
+# Native-only dependencies
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap = { version = "4", features = ["derive"] }
 rfd = "0.15"
+
+# WASM-only dependencies
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Window", "Document", "HtmlCanvasElement",
+    "Url", "Blob", "BlobPropertyBag",
+    "HtmlAnchorElement", "Node",
+] }
+web-time = "1"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+log = "0.4"
+# Real threads on the web: backs rayon's pool with Web Workers + SharedArrayBuffer.
+# `no-bundler`: we serve raw `--target web` output without webpack/rollup, so the
+# worker must resolve the main module via `import.meta.url` (mainJS()) rather than
+# the bundler-only `import('../../..')` path convention.
+wasm-bindgen-rayon = { version = "1.3", features = ["no-bundler"] }
