@@ -55,6 +55,11 @@ if command -v wasm-opt &>/dev/null; then
         "$OUT_DIR/${OUT_NAME}_bg.wasm" -o "$OUT_DIR/${OUT_NAME}_bg.wasm"
 fi
 
+# coi-serviceworker re-adds COOP/COEP client-side so SharedArrayBuffer works on
+# hosts that can't set headers (e.g. GitHub Pages). Harmless when headers exist.
+cp "$SCRIPT_DIR/../web/coi-serviceworker.min.js" "$OUT_DIR/"
+
+# Relative paths so it works both at the server root and under a Pages subpath.
 cat > "$OUT_DIR/index.html" <<'HTML'
 <!DOCTYPE html>
 <html lang="en">
@@ -62,6 +67,7 @@ cat > "$OUT_DIR/index.html" <<'HTML'
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Katana (web version!)</title>
+    <script src="./coi-serviceworker.min.js"></script>
     <style>
         html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
         canvas { display: block; width: 100%; height: 100%; }
@@ -70,8 +76,8 @@ cat > "$OUT_DIR/index.html" <<'HTML'
 <body>
     <canvas id="katana_canvas"></canvas>
     <script type="module">
-        import init from '/katana-viewer.js';
-        await init({ module_or_path: '/katana-viewer_bg.wasm' });
+        import init from './katana-viewer.js';
+        await init({ module_or_path: './katana-viewer_bg.wasm' });
     </script>
 </body>
 </html>
