@@ -2,6 +2,8 @@
 
 [_Work in progress_]
 
+**🌐 Try it in your browser: [yagodorea.github.io/katana](https://yagodorea.github.io/katana/)**
+
 This workspace contains 3 programs:
 1. `katana-core` - Application that processes STLs and slices them
 2. `katana-cli` - CLI interface for katana-core
@@ -33,8 +35,8 @@ This workspace contains 3 programs:
     - [X] Add "slice" button (default open just mesh)
     - [ ] Add controls in UI for slicing params
     - [ ] Split status info in a separate collapsible box
-- [ ] Add head bed rendering and model translation + rotation before slicing
-- [ ] Port to browser-compatible
+- [ ] Add heat bed rendering and model translation + rotation before slicing
+- [X] Port to browser-compatible
 - [ ] Add more infill patterns
 - [ ] Add support for supports
 - [ ] Retraction
@@ -44,7 +46,7 @@ This workspace contains 3 programs:
 - [ ] Prime tower
 
 ### Bugs to fix
-- [ ] Fix origin point of exported G-code
+- [X] Fix origin point of exported G-code
 - [X] Fix slicing artifacts
     - [X] Surfaces below max z don't get surface infill
     - [X] Holes in the top layer get covered by surface infill
