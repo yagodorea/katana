@@ -10,7 +10,7 @@ pub fn build_mvp(
     zoom: f32,
     extent: f32,
     aspect: f32,
-    _pan: (f32, f32),
+    pan: (f32, f32),
 ) -> [f32; 16] {
     let s = 2.0 * zoom / extent;
     let sx = if aspect > 1.0 { s / aspect } else { s };
@@ -36,8 +36,8 @@ pub fn build_mvp(
     let r21 = -sz * ce * ca;
     let r22 = -sz * se;
 
-    let t0 = -(r00 * tx + r01 * ty + r02 * tz);
-    let t1 = -(r10 * tx + r11 * ty + r12 * tz);
+    let t0 = -(r00 * tx + r01 * ty + r02 * tz) + sx * pan.0;
+    let t1 = -(r10 * tx + r11 * ty + r12 * tz) + sy * pan.1;
     let t2 = -(r20 * tx + r21 * ty + r22 * tz);
 
     [

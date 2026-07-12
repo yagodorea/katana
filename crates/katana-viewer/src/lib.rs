@@ -46,6 +46,7 @@ pub enum SliceView {
 pub enum Phase {
     Import,
     Model,
+    Processing,
     Sliced,
 }
 
@@ -107,6 +108,11 @@ pub struct ViewerApp {
     pub perimeter_speed: f32,
     pub infill_speed: f32,
     pub surface_speed: f32,
+
+    // Slicing state (for async processing)
+    pub slicing_progress: f32,
+    pub slicing_status: String,
+    pub slicing_cancelled: bool,
 }
 
 impl ViewerApp {
@@ -158,6 +164,9 @@ impl ViewerApp {
             perimeter_speed: 30.0,
             infill_speed: 60.0,
             surface_speed: 40.0,
+            slicing_progress: 0.0,
+            slicing_status: String::new(),
+            slicing_cancelled: false,
         }
     }
 
@@ -216,6 +225,7 @@ impl ViewerApp {
         self.source_file = source_name.to_string();
         self.gcode_offset = gcode_offset;
         self.center = [center_x, center_y, center_z];
+        self.pan = egui::Vec2::ZERO;
         self.extent = extent;
         self.stats = Stats {
             triangles: num_triangles,
@@ -224,6 +234,9 @@ impl ViewerApp {
             offset_ms: 0.0,
             plan_ms: 0.0,
         };
+        self.slicing_progress = 0.0;
+        self.slicing_status.clear();
+        self.slicing_cancelled = false;
         self.phase = Phase::Model;
     }
 
@@ -243,20 +256,92 @@ impl ViewerApp {
         Some(exporter.export(planned))
     }
 
+    /// Reset to import screen (clear everything)
+    pub fn reset_to_import(&mut self) {
+        self.phase = Phase::Import;
+        self.mesh_triangles = None;
+        self.layers.clear();
+        self.planned_result = None;
+        self.slicing_progress = 0.0;
+        self.slicing_status.clear();
+        self.slicing_cancelled = false;
+        
+        // Clear renderer buffers (set to None instead of empty - avoids wgpu panic on slice)
+        let mut r = self.renderer.lock().unwrap();
+        r.mesh_buffer = None;
+        r.slices_buffer = None;
+        r.current_slice_buffer = None;
+        r.toolpath_lines_buffer = None;
+        r.toolpath_path_lines_buffer = None;
+        r.toolpath_rhombuses = None;
+    }
+
+    /// Clear slice results and return to model view
+    pub fn clear_slice(&mut self) {
+        self.phase = Phase::Model;
+        self.layers.clear();
+        self.planned_result = None;
+        self.num_layers = 0;
+        self.max_layer = 0;
+        self.prev_max_layer = 0;
+        self.min_layer = 0;
+        self.scrub = 1.0;
+        self.slicing_progress = 0.0;
+        self.slicing_status.clear();
+        self.slicing_cancelled = false;
+        
+        // Clear renderer buffers
+        let mut r = self.renderer.lock().unwrap();
+        r.slices_buffer = None;
+        r.current_slice_buffer = None;
+        r.toolpath_lines_buffer = None;
+        r.toolpath_path_lines_buffer = None;
+        r.toolpath_rhombuses = None;
+    }
+
+    /// Cancel ongoing slicing operation
+    pub fn cancel_slicing(&mut self) {
+        self.slicing_cancelled = true;
+    }
+
+    /// Check if slicing is currently in progress
+    pub fn is_slicing(&self) -> bool {
+        self.phase == Phase::Processing
+    }
+
     /// Run the full slicing pipeline and upload results to GPU.
     pub fn run_slice(&mut self) {
         let Some(ref triangles) = self.mesh_triangles else {
             return;
         };
+        
+        // Enter processing phase
+        self.phase = Phase::Processing;
+        self.slicing_progress = 0.0;
+        self.slicing_status = "Slicing mesh...".to_string();
+        self.slicing_cancelled = false;
+        
         let mesh = katana_core::mesh::Mesh {
             triangles: triangles.clone(),
             source: katana_core::mesh::MeshSource::StlBinary,
         };
 
+        // Step 1: Slice
+        self.slicing_progress = 0.15;
         let t_slice = Instant::now();
         let result = slicer::slice_mesh(&mesh, self.layer_height);
         let slice_ms = t_slice.elapsed().as_secs_f64() * 1000.0;
 
+        if self.slicing_cancelled {
+            self.slicing_status = "Cancelled".to_string();
+            self.phase = Phase::Model;
+            return;
+        }
+
+        // Step 2: Generate toolpaths
+        self.slicing_progress = 0.40;
+        self.slicing_status = "Generating toolpaths...".to_string();
+        
         let perim_config = offset::PerimeterConfig {
             nozzle_width: self.nozzle_width,
             perimeter_count: self.perimeters,
@@ -280,6 +365,16 @@ impl ViewerApp {
         );
         let offset_ms = t_offset.elapsed().as_secs_f64() * 1000.0;
 
+        if self.slicing_cancelled {
+            self.slicing_status = "Cancelled".to_string();
+            self.phase = Phase::Model;
+            return;
+        }
+
+        // Step 3: Plan
+        self.slicing_progress = 0.65;
+        self.slicing_status = "Planning moves...".to_string();
+        
         let speed_config = planner::SpeedConfig {
             travel: self.travel_speed,
             perimeter: self.perimeter_speed,
@@ -291,6 +386,16 @@ impl ViewerApp {
         let planned_result = planner::plan_toolpaths(&toolpath_result, &speed_config);
         let plan_ms = t_plan.elapsed().as_secs_f64() * 1000.0;
 
+        if self.slicing_cancelled {
+            self.slicing_status = "Cancelled".to_string();
+            self.phase = Phase::Model;
+            return;
+        }
+
+        // Step 4: Upload to GPU
+        self.slicing_progress = 0.85;
+        self.slicing_status = "Uploading to GPU...".to_string();
+        
         let layers = result.layers;
         let num_layers = layers.len();
         let last_layer = num_layers.saturating_sub(1);
@@ -310,6 +415,16 @@ impl ViewerApp {
             }
         }
 
+        if self.slicing_cancelled {
+            self.slicing_status = "Cancelled".to_string();
+            self.phase = Phase::Model;
+            self.layers.clear();
+            self.planned_result = None;
+            return;
+        }
+
+        // Done
+        self.slicing_progress = 1.0;
         self.layers = layers;
         self.num_layers = num_layers;
         self.max_layer = last_layer;
@@ -322,6 +437,7 @@ impl ViewerApp {
         self.stats.offset_ms = offset_ms;
         self.stats.plan_ms = plan_ms;
         self.phase = Phase::Sliced;
+        self.slicing_status.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -422,6 +538,10 @@ impl eframe::App for ViewerApp {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if let Some(file) = dropped.first() {
             if let Some(bytes) = &file.bytes {
+                // Reset slicing state when loading a new file
+                self.slicing_progress = 0.0;
+                self.slicing_status.clear();
+                self.slicing_cancelled = false;
                 self.load_stl_from_bytes(bytes, &file.name);
             }
         }
@@ -429,6 +549,7 @@ impl eframe::App for ViewerApp {
         match self.phase {
             Phase::Import => self.update_import(ctx),
             Phase::Model => self.update_model(ctx),
+            Phase::Processing => self.update_processing(ctx),
             Phase::Sliced => self.update_sliced(ctx),
         }
 
@@ -479,6 +600,10 @@ impl ViewerApp {
     fn update_model(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("model_info").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                if ui.button("← Back").clicked() {
+                    self.reset_to_import();
+                }
+                ui.separator();
                 ui.label(format!("{} triangles", self.stats.triangles));
                 ui.label(format!("Load: {:.0}ms", self.stats.load_ms));
                 ui.separator();
@@ -506,10 +631,16 @@ impl ViewerApp {
     fn update_sliced(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("info").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                if ui.button("← Back").clicked() {
+                    self.clear_slice();
+                }
+                ui.separator();
+                
                 if self.num_layers == 0 {
                     ui.label("No layers");
                     return;
                 }
+                
                 if ui.button("◀ Prev").clicked() && self.max_layer > 0 {
                     self.max_layer -= 1;
                 }
@@ -520,9 +651,17 @@ impl ViewerApp {
                     self.max_layer += 1;
                 }
                 ui.separator();
-                if ui.button("💾 Export G-code").clicked() {
-                    self.export_gcode();
+                
+                if ui.button("🔄 Reslice").clicked() {
+                    self.clear_slice();
+                    self.run_slice();
                 }
+                
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("💾 Export G-code").clicked() {
+                        self.export_gcode();
+                    }
+                });
             });
         });
 
@@ -640,6 +779,63 @@ impl ViewerApp {
         self.update_viewport(ctx);
     }
 
+    fn update_processing(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel
+            ::default()
+            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(26, 26, 46)))
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() / 4.0);
+                    
+                    ui.heading(
+                        egui::RichText
+                            ::new("Processing...")
+                            .size(32.0)
+                            .color(egui::Color32::from_rgb(200, 200, 220))
+                    );
+                    
+                    ui.add_space(24.0);
+                    
+                    if !self.slicing_status.is_empty() {
+                        ui.label(
+                            egui::RichText
+                                ::new(&self.slicing_status)
+                                .size(16.0)
+                                .color(egui::Color32::from_rgb(180, 180, 200))
+                        );
+                    }
+                    
+                    ui.add_space(16.0);
+                    
+                    ui.add_sized(
+                        [300.0, 24.0],
+                        egui::ProgressBar::new(self.slicing_progress).animate(true).text("")
+                    );
+                    
+                    ui.add_space(32.0);
+                    
+                    let cancel_btn = ui.add_sized(
+                        [160.0, 40.0],
+                        egui::Button
+                            ::new(egui::RichText::new("Cancel").size(16.0))
+                            .fill(egui::Color32::from_rgb(120, 50, 50))
+                    );
+                    if cancel_btn.clicked() {
+                        self.cancel_slicing();
+                    }
+                });
+            });
+    }
+
+    fn pan_camera(&mut self, delta: egui::Vec2, viewport: egui::Vec2) {
+        // build_mvp scales the world by 2·zoom/extent across the smaller viewport
+        // dimension, so this is exactly one screen point in world units.
+        let scale = self.extent / (self.zoom * viewport.min_elem().max(1.0));
+        // Screen y is positive downward; view-space y is up.
+        self.pan.x += delta.x * scale;
+        self.pan.y -= delta.y * scale;
+    }
+
     fn update_viewport(&mut self, ctx: &egui::Context) {
         egui::CentralPanel
             ::default()
@@ -654,16 +850,7 @@ impl ViewerApp {
                     let delta = response.drag_delta();
                     let command_pressed = ui.input(|i| (i.modifiers.command || i.modifiers.ctrl));
                     if command_pressed {
-                        let ca = self.azimuth.cos();
-                        let sa = self.azimuth.sin();
-                        let ce = self.elevation.cos();
-                        let se = self.elevation.sin();
-                        let pan_world_scale = self.extent / (2.0 * self.zoom);
-                        self.center[0] +=
-                            (delta.x * ca - delta.y * (-sa * se)) * pan_world_scale * 0.001;
-                        self.center[1] +=
-                            (delta.x * -sa - delta.y * (ca * se)) * pan_world_scale * 0.001;
-                        self.center[2] += (delta.x * 0.0 - delta.y * ce) * pan_world_scale * 0.001;
+                        self.pan_camera(delta, response.rect.size());
                     } else {
                         self.azimuth -= delta.x * 0.005;
                         self.elevation = (self.elevation + delta.y * 0.005).clamp(
@@ -676,17 +863,7 @@ impl ViewerApp {
                     response.dragged_by(egui::PointerButton::Middle) ||
                     response.dragged_by(egui::PointerButton::Secondary)
                 {
-                    let delta = response.drag_delta();
-                    let ca = self.azimuth.cos();
-                    let sa = self.azimuth.sin();
-                    let ce = self.elevation.cos();
-                    let se = self.elevation.sin();
-                    let pan_world_scale = self.extent / (2.0 * self.zoom);
-                    self.center[0] +=
-                        (delta.x * ca - delta.y * (-sa * se)) * pan_world_scale * 0.001;
-                    self.center[1] +=
-                        (delta.x * -sa - delta.y * (ca * se)) * pan_world_scale * 0.001;
-                    self.center[2] += (delta.x * 0.0 - delta.y * ce) * pan_world_scale * 0.001;
+                    self.pan_camera(response.drag_delta(), response.rect.size());
                 }
 
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
