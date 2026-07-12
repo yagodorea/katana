@@ -38,3 +38,4 @@ log = "0.4"
 # worker must resolve the main module via `import.meta.url` (mainJS()) rather than
 # the bundler-only `import('../../..')` path convention.
 wasm-bindgen-rayon = { version = "1.3", features = ["no-bundler"] }
+rfd = "0.15"

@@ -113,6 +113,11 @@ pub struct ViewerApp {
     pub slicing_progress: f32,
     pub slicing_status: String,
     pub slicing_cancelled: bool,
+
+    // Web file picking: the async file dialog stashes (name, bytes) here for
+    // the update loop to pick up (the dialog future can't touch `self` directly).
+    #[cfg(target_arch = "wasm32")]
+    pub pending_file: std::rc::Rc<std::cell::RefCell<Option<(String, Vec<u8>)>>>,
 }
 
 impl ViewerApp {
@@ -167,6 +172,8 @@ impl ViewerApp {
             slicing_progress: 0.0,
             slicing_status: String::new(),
             slicing_cancelled: false,
+            #[cfg(target_arch = "wasm32")]
+            pending_file: std::rc::Rc::new(std::cell::RefCell::new(None)),
         }
     }
 
@@ -543,6 +550,20 @@ impl eframe::App for ViewerApp {
                 self.slicing_status.clear();
                 self.slicing_cancelled = false;
                 self.load_stl_from_bytes(bytes, &file.name);
+            }
+        }
+
+        // Check for a file picked via the web "Import STL" dialog (async).
+        // Take out of the RefCell in its own statement so the borrow is released
+        // before we call the `&mut self` loader below.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let picked = self.pending_file.borrow_mut().take();
+            if let Some((name, bytes)) = picked {
+                self.slicing_progress = 0.0;
+                self.slicing_status.clear();
+                self.slicing_cancelled = false;
+                self.load_stl_from_bytes(&bytes, &name);
             }
         }
 
@@ -959,13 +980,26 @@ impl ViewerApp {
         }
     }
 
-    /// On web, the file dialog is async — this is a no-op.
-    /// The web entry point handles file picking via drag-and-drop or a separate async mechanism.
+    /// On web, the file dialog is async. Spawn a task that opens the browser
+    /// file picker, reads the bytes, and stashes them in `pending_file` for the
+    /// update loop to consume (the future can't borrow `self`).
     #[cfg(target_arch = "wasm32")]
-    fn open_file_dialog(&mut self, _ctx: &egui::Context) {
-        // Web file dialog is handled asynchronously by the web entry point.
-        // This is a no-op — the web module will call load_stl_from_bytes when
-        // the user picks a file via drag-and-drop or the async file dialog.
+    fn open_file_dialog(&mut self, ctx: &egui::Context) {
+        let pending = self.pending_file.clone();
+        let ctx = ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if
+                let Some(handle) = rfd::AsyncFileDialog
+                    ::new()
+                    .add_filter("STL", &["stl"])
+                    .pick_file().await
+            {
+                let name = handle.file_name();
+                let bytes = handle.read().await;
+                *pending.borrow_mut() = Some((name, bytes));
+                ctx.request_repaint();
+            }
+        });
     }
 }
 
