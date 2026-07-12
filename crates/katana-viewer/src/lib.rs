@@ -874,10 +874,7 @@ impl ViewerApp {
                         self.pan_camera(delta, response.rect.size());
                     } else {
                         self.azimuth -= delta.x * 0.005;
-                        self.elevation = (self.elevation + delta.y * 0.005).clamp(
-                            -std::f32::consts::FRAC_PI_2 + 0.01,
-                            std::f32::consts::FRAC_PI_2 - 0.01
-                        );
+                        self.elevation += delta.y * 0.005;
                     }
                 }
                 if
