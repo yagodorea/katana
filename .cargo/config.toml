@@ -1,0 +1,10 @@
+# wasm threads: shared memory + atomics. Scoped to the wasm target so native
+# builds stay on stable. Pairs with `-Z build-std` from scripts/web-serve.sh.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+    "-C", "link-arg=--shared-memory",
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--max-memory=4294967296",
+    "-C", "link-arg=--export=__heap_base",
+]

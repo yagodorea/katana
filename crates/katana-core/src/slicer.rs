@@ -40,8 +40,6 @@ pub struct SliceResult {
 /// `layer_height` is the distance between slicing planes (e.g. 0.2 mm).
 /// Returns one `Layer` per Z height, each containing closed contour polygons.
 pub fn slice_mesh(mesh: &Mesh, layer_height: f32) -> SliceResult {
-    use rayon::prelude::*;
-
     let (min, max) = mesh.bounding_box();
     let z_min = min.z + EPSILON;
     let z_max = max.z - EPSILON;
@@ -69,6 +67,7 @@ pub fn slice_mesh(mesh: &Mesh, layer_height: f32) -> SliceResult {
         z += layer_height;
     }
 
+    use rayon::prelude::*;
     let layers: Vec<Layer> = z_heights
         .par_iter()
         .map(|&z| {
@@ -297,10 +296,7 @@ fn dist_squared(a: &Point2<f32>, b: &Point2<f32>) -> f32 {
 /// is its own head (or the pool is empty), the loop is closed and emitted.
 /// Genuinely separate contours stay apart because their endpoints are far,
 /// so self-closing always wins for them.
-fn stitch_open_chains(
-    closed: &mut Vec<Vec<Point2<f32>>>,
-    mut pool: Vec<Vec<Point2<f32>>>,
-) {
+fn stitch_open_chains(closed: &mut Vec<Vec<Point2<f32>>>, mut pool: Vec<Vec<Point2<f32>>>) {
     while let Some(mut chain) = pool.pop() {
         loop {
             let head = *chain.first().unwrap();
@@ -341,7 +337,9 @@ fn stitch_open_chains(
                     }
                     chain.extend(next);
                 }
-                _ => break,
+                _ => {
+                    break;
+                }
             }
         }
 

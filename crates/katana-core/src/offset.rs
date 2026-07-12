@@ -752,7 +752,7 @@ fn generate_monotonic_surface_infill(
     all_lines
 }
 
-/// Generate toolpaths for all layers (parallelized across cores).
+/// Generate toolpaths for all layers, parallelized across cores.
 pub fn generate_toolpaths(
     slice_result: &SliceResult,
     perim_config: &PerimeterConfig,

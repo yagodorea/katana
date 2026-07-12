@@ -1,0 +1,54 @@
+name: Deploy web
+
+on:
+    push:
+        branches: [main, feat/web-assembly-build]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+    pages: write
+    id-token: write
+
+concurrency:
+    group: pages
+    cancel-in-progress: true
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@nightly
+              with:
+                  components: rust-src
+                  targets: wasm32-unknown-unknown
+            - uses: Swatinem/rust-cache@v2
+            - name: Cache wasm-bindgen-cli
+              uses: actions/cache@v4
+              with:
+                  path: ~/.cargo/bin/wasm-bindgen
+                  key: wasm-bindgen-cli-0.2.125
+            - name: Install tools
+              run: |
+                  command -v wasm-bindgen || cargo install wasm-bindgen-cli --version 0.2.125 --locked
+                  # Pinned binaryen: apt's version is too old to preserve the growable
+                  # externref table under reference-types, capping it and breaking init.
+                  curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_116/binaryen-version_116-x86_64-linux.tar.gz | tar xz
+                  echo "$PWD/binaryen-version_116/bin" >> "$GITHUB_PATH"
+            - name: Build
+              run: bash crates/katana-viewer/scripts/web-serve.sh build
+            - uses: actions/configure-pages@v5
+            - uses: actions/upload-pages-artifact@v3
+              with:
+                  path: crates/katana-viewer/dist
+
+    deploy:
+        needs: build
+        runs-on: ubuntu-latest
+        environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+        steps:
+            - id: deployment
+              uses: actions/deploy-pages@v4
