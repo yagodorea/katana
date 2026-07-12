@@ -88,10 +88,6 @@ pub struct GpuBuffer {
 pub struct LayerEntry {
     pub layer_z: f32,
     pub instance_count: i32,
-    pub aabb_min_x: f32,
-    pub aabb_min_y: f32,
-    pub aabb_max_x: f32,
-    pub aabb_max_y: f32,
     /// Full print time of this layer
     pub time_total: f32,
 }
@@ -234,23 +230,4 @@ pub fn upload_mesh(device: &Device, verts: &[MeshVertex]) -> GpuBuffer {
     }
 }
 
-/// Conservative XY bounding box of a layer's rhombus instances. Public so the
-/// renderer can build `LayerEntry`s while assigning per-instance times.
-pub fn compute_layer_aabb(slice: &[RhombusInstance]) -> (f32, f32, f32, f32) {
-    let (mut mn_x, mut mn_y) = (f32::MAX, f32::MAX);
-    let (mut mx_x, mut mx_y) = (f32::MIN, f32::MIN);
-    for inst in slice {
-        let [ax, ay, _] = inst.start;
-        let dx = inst.dir[0];
-        let dy = inst.dir[1];
-        let len = inst.length;
-        let half_w = 0.0_f32; // half_width is in FrameUniforms; conservative AABB is fine
-        let bx = ax + dx * len;
-        let by = ay + dy * len;
-        mn_x = mn_x.min(ax.min(bx) - half_w);
-        mn_y = mn_y.min(ay.min(by) - half_w);
-        mx_x = mx_x.max(ax.max(bx) + half_w);
-        mx_y = mx_y.max(ay.max(by) + half_w);
-    }
-    (mn_x, mn_y, mx_x, mx_y)
-}
+

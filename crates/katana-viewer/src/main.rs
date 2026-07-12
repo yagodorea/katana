@@ -740,7 +740,7 @@ impl ViewerApp {
 
                 if response.dragged_by(egui::PointerButton::Primary) {
                     let delta = response.drag_delta();
-                    let command_pressed = ui.input(|i| (i.modifiers.command || i.modifiers.ctrl));
+                    let command_pressed = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
                     if command_pressed {
                         let ca = self.azimuth.cos();
                         let sa = self.azimuth.sin();

@@ -649,14 +649,9 @@ impl Renderer {
                 });
             }
             if rhombus_instances.len() > rho0 {
-                let aabb = buffers::compute_layer_aabb(&rhombus_instances[rho0..]);
                 rhombus_entries.push(buffers::LayerEntry {
                     layer_z: pl.z,
                     instance_count: (rhombus_instances.len() - rho0) as i32,
-                    aabb_min_x: aabb.0,
-                    aabb_min_y: aabb.1,
-                    aabb_max_x: aabb.2,
-                    aabb_max_y: aabb.3,
                     time_total: layer_total,
                 });
             }
@@ -880,8 +875,6 @@ impl Renderer {
                             rhombuses,
                             self.clip_z_max,
                             self.clip_z_min,
-                            mvp,
-                            self.half_height,
                             self.scrub_fraction,
                             partial_index,
                         );
@@ -940,50 +933,7 @@ impl Renderer {
         render_pass.draw(0..3, 0..1); // 3 verts, 1 instance
     }
 
-    /// Extract 6 frustum planes from MVP matrix using Gribb-Hartmann derivation
-    fn extract_frustum_planes(m: &[f32; 16]) -> [[f32; 4]; 6] {
-        // m is column-major
-        let get_row = |i: usize| -> [f32; 4] { [m[i], m[4 + i], m[8 + i], m[12 + i]] };
-        let rows = [get_row(0), get_row(1), get_row(2), get_row(3)];
 
-        let add = |a: [f32; 4], b: [f32; 4]| -> [f32; 4] {
-            [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
-        };
-        let sub = |a: [f32; 4], b: [f32; 4]| -> [f32; 4] {
-            [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]]
-        };
-
-        [
-            add(rows[3], rows[0]), // left
-            sub(rows[3], rows[0]), // right
-            add(rows[3], rows[1]), // bottom
-            sub(rows[3], rows[1]), // top
-            add(rows[3], rows[2]), // near
-            sub(rows[3], rows[2]), // far
-        ]
-    }
-
-    /// Returns true if the AABB is entirely outside at least one frustum plane (safe to cull).
-    fn aabb_outside_frustum(
-        planes: &[[f32; 4]; 6],
-        min_x: f32,
-        min_y: f32,
-        min_z: f32,
-        max_x: f32,
-        max_y: f32,
-        max_z: f32,
-    ) -> bool {
-        for p in planes {
-            // P-vertex: AABB corner most aligned with the plane normal
-            let px = if p[0] >= 0.0 { max_x } else { min_x };
-            let py = if p[1] >= 0.0 { max_y } else { min_y };
-            let pz = if p[2] >= 0.0 { max_z } else { min_z };
-            if p[0] * px + p[1] * py + p[2] * pz + p[3] < 0.0 {
-                return true; // most positive corner is behind this plane → fully outside
-            }
-        }
-        false
-    }
 
     /// XY of the print head at the current scrub instant on the top visible layer, or `None` when there's no toolpath to follow.
     fn nozzle_head_position(&self) -> Option<[f32; 2]> {
@@ -1111,12 +1061,11 @@ fn build_nozzle_verts(tip: [f32; 3], radius: f32, height: f32, clip_z: f32) -> V
 }
 
 // ---------------------------------------------------------------------------
-// Rhombus batch draw with CPU-side frustum culling + run merging.
+// Rhombus batch draw with run merging.
 // ---------------------------------------------------------------------------
 //
 // All instances live in one buffer, sorted by layer_z. We draw the visible
-// layers in [clip_z_min, clip_z_max], skipping layers whose AABB is outside
-// the view frustum, and merging contiguous non-culled layers into a single
+// layers in [clip_z_min, clip_z_max], merging contiguous layers into a single
 // `pass.draw(0..36, first_instance..first_instance + total)` — the wgpu
 // equivalent of glDrawArraysInstancedBaseInstance with no per-layer VAOs.
 fn draw_rhombus_batch(
@@ -1126,8 +1075,6 @@ fn draw_rhombus_batch(
     batch: &InstancedBatch,
     clip_z_max: f32,
     clip_z_min: f32,
-    mvp: &[f32; 16],
-    half_height: f32,
     scrub_fraction: f32,
     partial_index: u32,
 ) {
@@ -1141,8 +1088,6 @@ fn draw_rhombus_batch(
     if start_idx >= end_idx {
         return;
     }
-
-    let planes = Renderer::extract_frustum_planes(mvp);
 
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
@@ -1180,16 +1125,7 @@ fn draw_rhombus_batch(
             draw_count += 1;
         }
 
-        let outside = Renderer::aabb_outside_frustum(
-            &planes,
-            entry.aabb_min_x,
-            entry.aabb_min_y,
-            entry.layer_z - half_height,
-            entry.aabb_max_x,
-            entry.aabb_max_y,
-            entry.layer_z + half_height,
-        );
-        if outside || draw_count == 0 {
+        if draw_count == 0 {
             // Flush the in-progress run, if any. (A zero-count top layer also
             // breaks the run — there's nothing after it to merge with anyway.)
             if let Some(rf) = run_first.take() {
