@@ -58,6 +58,10 @@ pub struct Stats {
     pub plan_ms: f64,
 }
 
+const EPSILON: f32 = 1e-2;
+const BED_SIZE_MM: f32 = 256.0;
+
+
 // ---------------------------------------------------------------------------
 // ViewerApp
 // ---------------------------------------------------------------------------
@@ -217,6 +221,7 @@ impl ViewerApp {
         {
             let mut r = self.renderer.lock().unwrap();
             r.upload_mesh(&mesh.triangles);
+            r.upload_bed(bed.width, bed.depth, center_x, center_y, mesh_min.z - EPSILON);
             r.slices_buffer = None;
             r.current_slice_buffer = None;
             r.toolpath_lines_buffer = None;
@@ -439,7 +444,7 @@ impl ViewerApp {
         self.min_layer = 0;
         self.planned_result = Some(planned_result);
         self.slice_view = SliceView::Toolpaths;
-        self.bg_mode = BgMode::Mesh;
+        self.bg_mode = BgMode::Layers;
         self.stats.slice_ms = slice_ms;
         self.stats.offset_ms = offset_ms;
         self.stats.plan_ms = plan_ms;
@@ -849,9 +854,9 @@ impl ViewerApp {
     }
 
     fn pan_camera(&mut self, delta: egui::Vec2, viewport: egui::Vec2) {
-        // build_mvp scales the world by 2·zoom/extent across the smaller viewport
-        // dimension, so this is exactly one screen point in world units.
-        let scale = self.extent / (self.zoom * viewport.min_elem().max(1.0));
+        // build_mvp scales the world by 2·zoom/BED_SIZE_MM across the smaller
+        // viewport dimension, so this is exactly one screen point in world units.
+        let scale = BED_SIZE_MM / (self.zoom * viewport.min_elem().max(1.0));
         // Screen y is positive downward; view-space y is up.
         self.pan.x += delta.x * scale;
         self.pan.y -= delta.y * scale;
@@ -942,7 +947,7 @@ impl ViewerApp {
                     self.azimuth,
                     self.elevation,
                     self.zoom,
-                    self.extent,
+                    BED_SIZE_MM,
                     aspect,
                     (self.pan.x, self.pan.y)
                 );

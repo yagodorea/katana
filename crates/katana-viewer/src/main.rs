@@ -3,6 +3,7 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
+    const EPSILON: f32 = 1e-2;
     use std::sync::{ Arc, Mutex };
     use std::time::Instant;
 
@@ -153,6 +154,13 @@ mod native {
 
                 if let Some(ref tris) = start_triangles {
                     gpu.upload_mesh(tris);
+                    gpu.upload_bed(
+                        256.0,
+                        256.0,
+                        initial_center[0],
+                        initial_center[1],
+                        initial_mesh_min.z - EPSILON,
+                    );
                 }
 
                 let renderer = Arc::new(Mutex::new(gpu));
@@ -177,7 +185,7 @@ mod native {
                         extent: initial_extent,
                         azimuth: std::f32::consts::FRAC_PI_4 + std::f32::consts::PI,
                         elevation: std::f32::consts::FRAC_PI_6,
-                        zoom: 1.0,
+                        zoom: 1.3,
                         pan: egui::Vec2::ZERO,
                         bg_mode: BgMode::Mesh,
                         stats: initial_stats,

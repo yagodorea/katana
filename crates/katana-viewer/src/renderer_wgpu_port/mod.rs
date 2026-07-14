@@ -172,6 +172,18 @@ const NOZZLE_VERT_COUNT: u32 = NOZZLE_SEGMENTS * 3 * 2;
 /// Metallic grey, opaque
 const NOZZLE_COLOR: [f32; 4] = [0.75, 0.76, 0.8, 1.0];
 
+// ---------------------------------------------------------------------------
+// Heatbed (build plate) appearance
+// ---------------------------------------------------------------------------
+/// Filled plate surface
+const BED_PLATE_COLOR: [f32; 4] = [0.14, 0.14, 0.20, 1.0];
+/// Interior grid lines
+const BED_GRID_COLOR: [f32; 4] = [0.28, 0.28, 0.38, 1.0];
+/// Outer border of the plate
+const BED_BORDER_COLOR: [f32; 4] = [0.45, 0.45, 0.60, 1.0];
+/// Grid spacing in mm.
+const BED_GRID_SPACING: f32 = 10.0;
+
 /// Print-head positions over time for a single layer, in print order with travel and extrusion merged.
 struct LayerHeadTrack {
     layer_z: f32,
@@ -252,6 +264,12 @@ pub struct Renderer {
     // Per-layer print-head timelines, ascending by layer_z.
     head_tracks: Vec<LayerHeadTrack>,
     nozzle_buffer: GpuBuffer,
+
+    // Heatbed (build plate): a filled quad + grid/border lines, rebuilt via
+    // `upload_bed` whenever a model is (re)loaded so the plate sits under it.
+    // Drawn unconditionally in the background pass on every frame.
+    bed_plate_buffer: Option<GpuBuffer>,
+    bed_grid_buffer: Option<GpuBuffer>,
 }
 
 impl Renderer {
@@ -423,7 +441,64 @@ impl Renderer {
             scrub_top_z: 0.0,
             head_tracks: Vec::new(),
             nozzle_buffer,
+            bed_plate_buffer: None,
+            bed_grid_buffer: None,
         }
+    }
+
+    /// Build the heatbed geometry: a filled plate quad plus a grid and border,
+    /// centered at (`cx`, `cy`) on the `z` plane. Call whenever a model is
+    /// (re)loaded so the plate sits directly under the current model.
+    pub fn upload_bed(&mut self, width: f32, depth: f32, cx: f32, cy: f32, z: f32) {
+        let (hw, hd) = (width * 0.5, depth * 0.5);
+        let (x0, x1) = (cx - hw, cx + hw);
+        let (y0, y1) = (cy - hd, cy + hd);
+
+        // Filled plate: two triangles on the z plane, normal pointing up. The
+        // `layer_z` clip key is set to the plate's own z; the background pass
+        // uses an unbounded clip range so it always survives the FS z-clip.
+        let n = [0.0, 0.0, 1.0];
+        let quad = |x: f32, y: f32| MeshVertex {
+            pos: [x, y, z],
+            normal: n,
+            color: BED_PLATE_COLOR,
+            layer_z: z,
+        };
+        let plate_verts = vec![
+            quad(x0, y0), quad(x1, y0), quad(x1, y1),
+            quad(x0, y0), quad(x1, y1), quad(x0, y1),
+        ];
+        self.bed_plate_buffer = Some(buffers::upload_mesh(&self.device, &plate_verts));
+
+        // Grid + border, lifted a hair above the plate to avoid z-fighting.
+        let gz = z + 0.01;
+        let mut lines: Vec<LineVertex> = Vec::new();
+        let mut push = |ax: f32, ay: f32, bx: f32, by: f32, c: [f32; 4]| {
+            lines.push(LineVertex { pos: [ax, ay, gz], color: c });
+            lines.push(LineVertex { pos: [bx, by, gz], color: c });
+        };
+        // Interior grid lines at multiples of the spacing from the center.
+        let steps_x = (hw / BED_GRID_SPACING) as i32;
+        for i in -steps_x..=steps_x {
+            let x = cx + (i as f32) * BED_GRID_SPACING;
+            if x > x0 && x < x1 {
+                push(x, y0, x, y1, BED_GRID_COLOR);
+            }
+        }
+        let steps_y = (hd / BED_GRID_SPACING) as i32;
+        for i in -steps_y..=steps_y {
+            let y = cy + (i as f32) * BED_GRID_SPACING;
+            if y > y0 && y < y1 {
+                push(x0, y, x1, y, BED_GRID_COLOR);
+            }
+        }
+        // Border loop.
+        push(x0, y0, x1, y0, BED_BORDER_COLOR);
+        push(x1, y0, x1, y1, BED_BORDER_COLOR);
+        push(x1, y1, x0, y1, BED_BORDER_COLOR);
+        push(x0, y1, x0, y0, BED_BORDER_COLOR);
+
+        self.bed_grid_buffer = Some(buffers::upload_lines(&self.device, &lines));
     }
 
     pub fn upload_mesh(&mut self, triangles: &[katana_core::mesh::Triangle]) {
@@ -796,6 +871,19 @@ impl Renderer {
                 }),
             );
             pass.set_bind_group(0, &self.frame_bind_group_bg, &[]);
+
+            // Heatbed: drawn first (as the ground plane) on every frame,
+            // independent of bg_mode, using the no-clip background uniforms.
+            if let Some(plate) = &self.bed_plate_buffer {
+                pass.set_pipeline(&self.mesh_opaque_pipeline);
+                pass.set_vertex_buffer(0, plate.buffer.slice(..));
+                pass.draw(0..plate.vertex_count, 0..1);
+            }
+            if let Some(grid) = &self.bed_grid_buffer {
+                pass.set_pipeline(&self.line_opaque_pipeline);
+                pass.set_vertex_buffer(0, grid.buffer.slice(..));
+                pass.draw(0..grid.vertex_count, 0..1);
+            }
 
             match bg_mode {
                 super::BgMode::Mesh => {

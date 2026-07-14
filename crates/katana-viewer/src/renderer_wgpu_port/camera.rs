@@ -15,7 +15,7 @@ pub fn build_mvp(
     let s = 2.0 * zoom / extent;
     let sx = if aspect > 1.0 { s / aspect } else { s };
     let sy = if aspect > 1.0 { s } else { s * aspect };
-    let sz = 1.0 / (extent * 0.87);
+    let sz = 1.0 / (extent * 0.87).max(256.0);
 
     let ca = azimuth.cos();
     let sa = azimuth.sin();
