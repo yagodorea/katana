@@ -447,9 +447,18 @@ impl Renderer {
     }
 
     /// Build the heatbed geometry: a filled plate quad plus a grid and border,
-    /// centered at (`cx`, `cy`) on the `z` plane. Call whenever a model is
-    /// (re)loaded so the plate sits directly under the current model.
-    pub fn upload_bed(&mut self, width: f32, depth: f32, cx: f32, cy: f32, z: f32) {
+    /// centered at (`cx`, `cy`) on the `z` plane. `border_color` overrides the
+    /// default border (e.g. red while the model spills off the plate).
+    pub fn upload_bed(
+        &mut self,
+        width: f32,
+        depth: f32,
+        cx: f32,
+        cy: f32,
+        z: f32,
+        border_color: Option<[f32; 4]>,
+    ) {
+        let border_color = border_color.unwrap_or(BED_BORDER_COLOR);
         let (hw, hd) = (width * 0.5, depth * 0.5);
         let (x0, x1) = (cx - hw, cx + hw);
         let (y0, y1) = (cy - hd, cy + hd);
@@ -493,10 +502,10 @@ impl Renderer {
             }
         }
         // Border loop.
-        push(x0, y0, x1, y0, BED_BORDER_COLOR);
-        push(x1, y0, x1, y1, BED_BORDER_COLOR);
-        push(x1, y1, x0, y1, BED_BORDER_COLOR);
-        push(x0, y1, x0, y0, BED_BORDER_COLOR);
+        push(x0, y0, x1, y0, border_color);
+        push(x1, y0, x1, y1, border_color);
+        push(x1, y1, x0, y1, border_color);
+        push(x0, y1, x0, y0, border_color);
 
         self.bed_grid_buffer = Some(buffers::upload_lines(&self.device, &lines));
     }

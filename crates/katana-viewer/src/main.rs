@@ -3,15 +3,11 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    const EPSILON: f32 = 1e-2;
     use std::sync::{ Arc, Mutex };
-    use std::time::Instant;
 
     use clap::Parser;
     use eframe::egui;
-    use katana_core::gcode;
-    use katana_viewer::{ renderer_wgpu_port, BgMode, Phase, SliceView, Stats, ViewerApp };
-    use nalgebra::{ Point2, Vector2 };
+    use katana_viewer::{ renderer_wgpu_port, Phase, ViewerApp };
 
     #[derive(Parser)]
     #[command(name = "katana-viewer", about = "2D layer viewer for sliced meshes")]
@@ -50,69 +46,6 @@ mod native {
     pub fn run() -> eframe::Result {
         let args = Args::parse();
 
-        let initial_phase;
-        let mut initial_triangles: Option<Vec<katana_core::mesh::Triangle>> = None;
-        let mut initial_source = String::new();
-        let mut initial_gcode_offset = Vector2::zeros();
-        let mut initial_mesh_min = nalgebra::Point3::origin();
-        let mut initial_mesh_max = nalgebra::Point3::origin();
-        let mut initial_center = [0.0f32, 0.0, 128.0];
-        let mut initial_extent = 256.0f32;
-        let mut initial_stats = Stats {
-            triangles: 0,
-            load_ms: 0.0,
-            slice_ms: 0.0,
-            offset_ms: 0.0,
-            plan_ms: 0.0,
-        };
-
-        if let Some(ref file) = args.file {
-            let t_load = Instant::now();
-            let data = std::fs::read(file).unwrap_or_else(|e| {
-                eprintln!("Failed to read {file}: {e}");
-                std::process::exit(1);
-            });
-            let mesh = katana_core::stl::load_stl(&data).unwrap_or_else(|e| {
-                eprintln!("Failed to parse STL: {e}");
-                std::process::exit(1);
-            });
-            let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
-
-            let (mesh_min, mesh_max) = mesh.bounding_box();
-            let num_triangles = mesh.triangles.len();
-
-            let center_x = (mesh_min.x + mesh_max.x) / 2.0;
-            let center_y = (mesh_min.y + mesh_max.y) / 2.0;
-            let center_z = (mesh_min.z + mesh_max.z) / 2.0;
-            let extent = (mesh_max.x - mesh_min.x)
-                .max(mesh_max.y - mesh_min.y)
-                .max(mesh_max.z - mesh_min.z);
-
-            println!("Loaded {file} ({num_triangles} triangles) in {load_ms:.1}ms");
-
-            initial_phase = Phase::Model;
-            initial_triangles = Some(mesh.triangles);
-            initial_source = file.clone();
-            initial_gcode_offset = gcode::bed_offset(
-                gcode::BedConfig { width: 256.0, depth: 256.0 },
-                Point2::new(mesh_min.x, mesh_min.y),
-                Point2::new(mesh_max.x, mesh_max.y)
-            );
-            initial_mesh_min = mesh_min;
-            initial_mesh_max = mesh_max;
-            initial_center = [center_x, center_y, center_z];
-            initial_extent = extent;
-            initial_stats = Stats {
-                triangles: num_triangles,
-                load_ms,
-                slice_ms: 0.0,
-                offset_ms: 0.0,
-                plan_ms: 0.0,
-            };
-        } else {
-            initial_phase = Phase::Import;
-        }
-
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
             renderer: eframe::Renderer::Wgpu,
@@ -137,8 +70,6 @@ mod native {
             ..Default::default()
         };
 
-        let start_triangles = initial_triangles;
-
         eframe::run_native(
             "katana viewer",
             options,
@@ -150,67 +81,31 @@ mod native {
                 let queue = render_state.queue.clone();
                 let target_format = render_state.target_format;
 
-                let mut gpu = renderer_wgpu_port::Renderer::new(device, queue, target_format, 1, 1);
-
-                if let Some(ref tris) = start_triangles {
-                    gpu.upload_mesh(tris);
-                    gpu.upload_bed(
-                        256.0,
-                        256.0,
-                        initial_center[0],
-                        initial_center[1],
-                        initial_mesh_min.z - EPSILON,
-                    );
-                }
-
+                let gpu = renderer_wgpu_port::Renderer::new(device, queue, target_format, 1, 1);
                 let renderer = Arc::new(Mutex::new(gpu));
 
-                Ok(
-                    Box::new(ViewerApp {
-                        phase: initial_phase,
-                        renderer,
-                        mesh_triangles: start_triangles,
-                        mesh_min: initial_mesh_min,
-                        mesh_max: initial_mesh_max,
-                        source_file: initial_source,
-                        gcode_offset: initial_gcode_offset,
-                        planned_result: None,
-                        layers: Vec::new(),
-                        num_layers: 0,
-                        max_layer: 0,
-                        prev_max_layer: 0,
-                        min_layer: 0,
-                        slice_view: SliceView::Toolpaths,
-                        center: initial_center,
-                        extent: initial_extent,
-                        azimuth: std::f32::consts::FRAC_PI_4 + std::f32::consts::PI,
-                        elevation: std::f32::consts::FRAC_PI_6,
-                        zoom: 1.3,
-                        pan: egui::Vec2::ZERO,
-                        bg_mode: BgMode::Mesh,
-                        stats: initial_stats,
-                        show_travel_moves: false,
-                        show_filaments: true,
-                        scrub: 1.0,
-                        fps: 0.0,
-                        frame_time: 0.0,
-                        last_update: Instant::now(),
-                        frame_count: 0,
-                        nozzle_width: args.nozzle_width,
-                        layer_height: args.layer_height,
-                        perimeters: args.perimeters,
-                        infill_density: args.infill_density,
-                        bottom_layers: args.bottom_layers,
-                        top_layers: args.top_layers,
-                        travel_speed: args.travel_speed,
-                        perimeter_speed: args.perimeter_speed,
-                        infill_speed: args.infill_speed,
-                        surface_speed: args.surface_speed,
-                        slicing_progress: 0.0,
-                        slicing_status: String::new(),
-                        slicing_cancelled: false,
-                    })
-                )
+                let mut app = ViewerApp::new(renderer);
+                app.zoom = 1.3;
+                app.nozzle_width = args.nozzle_width;
+                app.layer_height = args.layer_height;
+                app.perimeters = args.perimeters;
+                app.infill_density = args.infill_density;
+                app.bottom_layers = args.bottom_layers;
+                app.top_layers = args.top_layers;
+                app.travel_speed = args.travel_speed;
+                app.perimeter_speed = args.perimeter_speed;
+                app.infill_speed = args.infill_speed;
+                app.surface_speed = args.surface_speed;
+
+                if let Some(ref file) = args.file {
+                    app.import_stl(file);
+                    if app.phase == Phase::Import {
+                        // import_stl already printed the error
+                        std::process::exit(1);
+                    }
+                }
+
+                Ok(Box::new(app))
             })
         )
     }

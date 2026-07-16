@@ -23,6 +23,26 @@ pub struct Triangle {
     pub normal: Vector3<f32>,
 }
 
+/// Returns (min_corner, max_corner) of the axis-aligned bounding box of a
+/// triangle slice.
+pub fn bounding_box_of(triangles: &[Triangle]) -> (Point3<f32>, Point3<f32>) {
+    let mut min = Point3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = Point3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+
+    for tri in triangles {
+        for v in &tri.vertices {
+            min.x = min.x.min(v.x);
+            min.y = min.y.min(v.y);
+            min.z = min.z.min(v.z);
+            max.x = max.x.max(v.x);
+            max.y = max.y.max(v.y);
+            max.z = max.z.max(v.z);
+        }
+    }
+
+    (min, max)
+}
+
 // TODO: implement function to check if mesh is watertight
 #[derive(Debug, Clone)]
 pub struct Mesh {
@@ -37,21 +57,7 @@ impl Mesh {
 
     /// Returns (min_corner, max_corner) of the axis-aligned bounding box.
     pub fn bounding_box(&self) -> (Point3<f32>, Point3<f32>) {
-        let mut min = Point3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
-        let mut max = Point3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-
-        for tri in &self.triangles {
-            for v in &tri.vertices {
-                min.x = min.x.min(v.x);
-                min.y = min.y.min(v.y);
-                min.z = min.z.min(v.z);
-                max.x = max.x.max(v.x);
-                max.y = max.y.max(v.y);
-                max.z = max.z.max(v.z);
-            }
-        }
-
-        (min, max)
+        bounding_box_of(&self.triangles)
     }
 
     /// Compute the volume of a closed (watertight) mesh.

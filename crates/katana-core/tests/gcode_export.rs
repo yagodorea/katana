@@ -198,6 +198,102 @@ fn square_perimeter_plan(s: f32) -> PlannedResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Transformed-model pipeline (mirrors the viewer's Model-phase bake)
+// ---------------------------------------------------------------------------
+
+/// Reproduce the viewer's bake headlessly: normalize the cube onto a fixed
+/// 256×256 bed (XY-centered at the origin), rotate it 45° about X, snap the
+/// lowest point EPSILON above 0, then slice -> plan -> export with the
+/// constant bed-center offset. Asserts the printed coordinates stay on the
+/// physical bed and the first layer starts at the bed, not in the air.
+#[test]
+fn rotated_snapped_model_prints_on_the_bed() {
+    use nalgebra::{ UnitQuaternion, Vector3 };
+
+    const BED: f32 = 256.0;
+    const EPSILON: f32 = 1e-2;
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../stls/cube.stl");
+    let data = std::fs::read(path).expect("read cube.stl");
+    let mesh = stl::load_stl(&data).expect("parse cube.stl");
+
+    // Normalize: bbox XY center at origin, min z at 0.
+    let (min, max) = mesh.bounding_box();
+    let shift = Vector3::new(-(min.x + max.x) / 2.0, -(min.y + max.y) / 2.0, -min.z);
+    let m = nalgebra::Matrix4::new_translation(&shift);
+    let canonical = katana_core::transform::transform_triangles(&mesh.triangles, &m);
+    let (cmin, cmax) = katana_core::mesh::bounding_box_of(&canonical);
+
+    // Rotate 45° about X around the bbox center, then snap onto the bed.
+    let rot = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), PI / 4.0);
+    let m = katana_core::transform::compose(
+        Vector3::zeros(),
+        rot,
+        Vector3::new(1.0, 1.0, 1.0),
+        nalgebra::center(&cmin, &cmax)
+    );
+    let mut tris = katana_core::transform::transform_triangles(&canonical, &m);
+    let (tmin, _) = katana_core::mesh::bounding_box_of(&tris);
+    let dz = EPSILON - tmin.z;
+    for tri in &mut tris {
+        for v in &mut tri.vertices {
+            v.z += dz;
+        }
+    }
+    let (tmin, tmax) = katana_core::mesh::bounding_box_of(&tris);
+    assert!((tmin.z - EPSILON).abs() < 1e-4, "snap failed: min z = {}", tmin.z);
+    // Still on the plate (the cube is small).
+    assert!(tmin.x > -BED / 2.0 && tmax.x < BED / 2.0);
+    assert!(tmin.y > -BED / 2.0 && tmax.y < BED / 2.0);
+
+    let mesh = katana_core::mesh::Mesh::new(tris, katana_core::mesh::MeshSource::StlBinary);
+    let slices = slicer::slice_mesh(&mesh, LAYER_H);
+    assert!(!slices.layers.is_empty(), "rotated mesh produced no layers");
+    let toolpaths = generate_toolpaths(
+        &slices,
+        &(PerimeterConfig {
+            nozzle_width: NOZZLE,
+            perimeter_count: 3,
+            layer_height: LAYER_H,
+        }),
+        &(InfillConfig { density: 0.2, nozzle_width: NOZZLE }),
+        &(SurfaceConfig { bottom_layers: 3, top_layers: 3 })
+    );
+    let plan = plan_toolpaths(&toolpaths, &SpeedConfig::default());
+
+    // Export with the viewer's constant bed-center -> front-left-origin offset.
+    let mut g = Gcode {
+        e: 0.0,
+        config: GcodeConfig {
+            filament_diameter: FILAMENT,
+            nozzle_width: NOZZLE,
+            layer_height: LAYER_H,
+        },
+        offset: nalgebra::Vector2::new(BED / 2.0, BED / 2.0),
+        out: String::new(),
+    };
+    let g = g.export(&plan);
+
+    let mut first_z: Option<f32> = None;
+    for line in g.lines().filter(|l| (l.starts_with("G0") || l.starts_with("G1"))) {
+        if let Some(x) = word(line, 'X') {
+            assert!((0.0..=BED).contains(&x), "X off the bed on `{line}`");
+        }
+        if let Some(y) = word(line, 'Y') {
+            assert!((0.0..=BED).contains(&y), "Y off the bed on `{line}`");
+        }
+        if first_z.is_none() {
+            first_z = word(line, 'Z');
+        }
+    }
+    let first_z = first_z.expect("no Z move emitted");
+    assert!(
+        first_z > 0.0 && first_z < 3.0 * LAYER_H,
+        "first layer should start at the bed, got Z{first_z}"
+    );
+}
+
 #[test]
 fn extrusion_volume_matches_bead_geometry() {
     let side = 10.0f32;

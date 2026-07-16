@@ -2,8 +2,8 @@ use std::sync::{ Arc, Mutex };
 
 use eframe::egui;
 use eframe::egui_wgpu;
-use katana_core::{ gcode::{ self, Gcode, GcodeConfig }, offset, planner, slicer, stl };
-use nalgebra::{ Point2, Vector2 };
+use katana_core::{ gcode::{ Gcode, GcodeConfig }, offset, planner, slicer, stl };
+use nalgebra::Vector2;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -13,6 +13,7 @@ use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 pub use wasm_bindgen_rayon::init_thread_pool;
 
+pub mod gizmo;
 pub mod renderer_wgpu_port;
 
 // ---------------------------------------------------------------------------
@@ -71,11 +72,33 @@ pub struct ViewerApp {
     pub renderer: Arc<Mutex<renderer_wgpu_port::Renderer>>,
 
     // Mesh data (populated on import)
+    // `mesh_triangles`/`mesh_min`/`mesh_max` always hold the BAKED (transformed) mesh
     pub mesh_triangles: Option<Vec<katana_core::mesh::Triangle>>,
     pub mesh_min: nalgebra::Point3<f32>,
     pub mesh_max: nalgebra::Point3<f32>,
     pub source_file: String,
     pub gcode_offset: Vector2<f32>,
+
+    // Canonical (normalized) mesh: XY-centered on the origin, min z at 0.
+    // Never mutated after load; transforms are re-applied from it.
+    pub canonical_triangles: Option<Vec<katana_core::mesh::Triangle>>,
+    pub canonical_min: nalgebra::Point3<f32>,
+    pub canonical_max: nalgebra::Point3<f32>,
+
+    // Model transform (applied to the canonical mesh, baked into mesh_triangles).
+    // Rotation state is the quaternion; Euler degrees in the UI are a view of it.
+    pub model_rotation: nalgebra::UnitQuaternion<f32>,
+    pub model_scale: nalgebra::Vector3<f32>,
+    /// XY placement on the bed; Z is derived by the snap-to-bed rule.
+    pub model_translation: Vector2<f32>,
+    pub scale_uniform_lock: bool,
+    /// True when the baked mesh's XY footprint spills off the build plate.
+    pub model_out_of_bounds: bool,
+
+    // Viewport gizmo state
+    pub gizmo_enabled: bool,
+    pub gizmo_mode: gizmo::GizmoMode,
+    pub gizmo_drag: Option<gizmo::GizmoDrag>,
 
     // Slicing results (populated on slice)
     pub planned_result: Option<planner::PlannedResult>,
@@ -125,8 +148,8 @@ pub struct ViewerApp {
 }
 
 impl ViewerApp {
-    /// Create a ViewerApp for the web target with sensible defaults.
-    pub fn new_web(renderer: Arc<Mutex<renderer_wgpu_port::Renderer>>) -> Self {
+    /// Create a ViewerApp with sensible defaults (Import phase, no mesh).
+    pub fn new(renderer: Arc<Mutex<renderer_wgpu_port::Renderer>>) -> Self {
         Self {
             phase: Phase::Import,
             renderer,
@@ -135,6 +158,17 @@ impl ViewerApp {
             mesh_max: nalgebra::Point3::origin(),
             source_file: String::new(),
             gcode_offset: Vector2::zeros(),
+            canonical_triangles: None,
+            canonical_min: nalgebra::Point3::origin(),
+            canonical_max: nalgebra::Point3::origin(),
+            model_rotation: nalgebra::UnitQuaternion::identity(),
+            model_scale: nalgebra::Vector3::new(1.0, 1.0, 1.0),
+            model_translation: Vector2::zeros(),
+            scale_uniform_lock: true,
+            model_out_of_bounds: false,
+            gizmo_enabled: false,
+            gizmo_mode: gizmo::GizmoMode::Move,
+            gizmo_drag: None,
             planned_result: None,
             layers: Vec::new(),
             num_layers: 0,
@@ -197,31 +231,41 @@ impl ViewerApp {
         };
         let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
 
-        let (mesh_min, mesh_max) = mesh.bounding_box();
+        let (raw_min, raw_max) = mesh.bounding_box();
         let num_triangles = mesh.triangles.len();
 
-        let bed = gcode::BedConfig {
-            width: 256.0,
-            depth: 256.0,
-        };
-        let gcode_offset = gcode::bed_offset(
-            bed,
-            Point2::new(mesh_min.x, mesh_min.y),
-            Point2::new(mesh_max.x, mesh_max.y)
+        // Normalize into canonical space: bbox XY center at the origin, min z
+        // at 0. The bed is fixed (centered at the origin, top at z = 0) and
+        // the model moves relative to it via the user transform.
+        let shift = nalgebra::Vector3::new(
+            -(raw_min.x + raw_max.x) / 2.0,
+            -(raw_min.y + raw_max.y) / 2.0,
+            -raw_min.z
         );
+        let mut canonical = mesh.triangles;
+        for tri in &mut canonical {
+            for v in &mut tri.vertices {
+                *v += shift;
+            }
+        }
+        self.canonical_min = raw_min + shift;
+        self.canonical_max = raw_max + shift;
+        self.canonical_triangles = Some(canonical);
 
-        let center_x = (mesh_min.x + mesh_max.x) / 2.0;
-        let center_y = (mesh_min.y + mesh_max.y) / 2.0;
-        let center_z = (mesh_min.z + mesh_max.z) / 2.0;
-        let extent = (mesh_max.x - mesh_min.x)
-            .max(mesh_max.y - mesh_min.y)
-            .max(mesh_max.z - mesh_min.z);
+        // Fresh model starts untransformed.
+        self.model_rotation = nalgebra::UnitQuaternion::identity();
+        self.model_scale = nalgebra::Vector3::new(1.0, 1.0, 1.0);
+        self.model_translation = Vector2::zeros();
+        self.scale_uniform_lock = true;
+        self.gizmo_drag = None;
 
-        // Upload mesh to GPU
+        let extent = (self.canonical_max.x - self.canonical_min.x)
+            .max(self.canonical_max.y - self.canonical_min.y)
+            .max(self.canonical_max.z - self.canonical_min.z);
+
         {
             let mut r = self.renderer.lock().unwrap();
-            r.upload_mesh(&mesh.triangles);
-            r.upload_bed(bed.width, bed.depth, center_x, center_y, mesh_min.z - EPSILON);
+            r.upload_bed(BED_SIZE_MM, BED_SIZE_MM, 0.0, 0.0, 0.0, None);
             r.slices_buffer = None;
             r.current_slice_buffer = None;
             r.toolpath_lines_buffer = None;
@@ -229,14 +273,17 @@ impl ViewerApp {
             r.toolpath_rhombuses = None;
         }
 
+        // Bake the (identity) transform: snaps the model EPSILON above the
+        // bed, uploads the mesh, and refreshes bounds/out-of-bounds state.
+        self.rebake_model();
+
         println!("Loaded {source_name} ({num_triangles} triangles) in {load_ms:.1}ms");
 
-        self.mesh_triangles = Some(mesh.triangles);
-        self.mesh_min = mesh_min;
-        self.mesh_max = mesh_max;
         self.source_file = source_name.to_string();
-        self.gcode_offset = gcode_offset;
-        self.center = [center_x, center_y, center_z];
+        // The model's placement is baked into mesh coordinates relative to the
+        // bed center, so export only shifts bed-center → front-left origin.
+        self.gcode_offset = Vector2::new(BED_SIZE_MM / 2.0, BED_SIZE_MM / 2.0);
+        self.center = [0.0, 0.0, (self.canonical_max.z - self.canonical_min.z) / 2.0];
         self.pan = egui::Vec2::ZERO;
         self.extent = extent;
         self.stats = Stats {
@@ -250,6 +297,62 @@ impl ViewerApp {
         self.slicing_status.clear();
         self.slicing_cancelled = false;
         self.phase = Phase::Model;
+    }
+
+    /// Re-apply the current transform to the canonical mesh, snap it onto the
+    /// bed, refresh bounds/out-of-bounds state, and re-upload to the GPU.
+    pub fn rebake_model(&mut self) {
+        self.rebake_model_with_lift(0.0);
+    }
+
+    /// Like [`Self::rebake_model`], but keeps the model `extra_z` mm above its
+    /// snapped resting height — used for the live lift while dragging the
+    /// Move-Z gizmo arrow (a release rebakes with 0 and it settles back down).
+    pub fn rebake_model_with_lift(&mut self, extra_z: f32) {
+        let Some(ref canonical) = self.canonical_triangles else {
+            return;
+        };
+
+        let pivot = nalgebra::center(&self.canonical_min, &self.canonical_max);
+        let m = katana_core::transform::compose(
+            nalgebra::Vector3::new(self.model_translation.x, self.model_translation.y, 0.0),
+            self.model_rotation,
+            self.model_scale,
+            pivot
+        );
+        let mut tris = katana_core::transform::transform_triangles(canonical, &m);
+
+        // Snap to bed: lowest point exactly EPSILON above z = 0 (+ lift).
+        let (mut min, mut max) = katana_core::mesh::bounding_box_of(&tris);
+        let dz = EPSILON - min.z + extra_z.max(0.0);
+        if dz.abs() > 1e-9 {
+            for tri in &mut tris {
+                for v in &mut tri.vertices {
+                    v.z += dz;
+                }
+            }
+            min.z += dz;
+            max.z += dz;
+        }
+
+        let half = BED_SIZE_MM / 2.0;
+        let out_of_bounds = min.x < -half || max.x > half || min.y < -half || max.y > half;
+        let bounds_changed = out_of_bounds != self.model_out_of_bounds;
+        self.model_out_of_bounds = out_of_bounds;
+
+        {
+            let mut r = self.renderer.lock().unwrap();
+            r.upload_mesh(&tris);
+            if bounds_changed {
+                // Red border warns that the model spills off the plate.
+                let border = if out_of_bounds { Some([0.9, 0.2, 0.2, 1.0]) } else { None };
+                r.upload_bed(BED_SIZE_MM, BED_SIZE_MM, 0.0, 0.0, 0.0, border);
+            }
+        }
+
+        self.mesh_triangles = Some(tris);
+        self.mesh_min = min;
+        self.mesh_max = max;
     }
 
     /// Generate the G-code string from the planned result.
@@ -272,6 +375,12 @@ impl ViewerApp {
     pub fn reset_to_import(&mut self) {
         self.phase = Phase::Import;
         self.mesh_triangles = None;
+        self.canonical_triangles = None;
+        self.model_rotation = nalgebra::UnitQuaternion::identity();
+        self.model_scale = nalgebra::Vector3::new(1.0, 1.0, 1.0);
+        self.model_translation = Vector2::zeros();
+        self.model_out_of_bounds = false;
+        self.gizmo_drag = None;
         self.layers.clear();
         self.planned_result = None;
         self.slicing_progress = 0.0;
@@ -326,7 +435,11 @@ impl ViewerApp {
         let Some(ref triangles) = self.mesh_triangles else {
             return;
         };
-        
+        if self.model_out_of_bounds {
+            eprintln!("Refusing to slice: model extends beyond the build plate");
+            return;
+        }
+
         // Enter processing phase
         self.phase = Phase::Processing;
         self.slicing_progress = 0.0;
@@ -626,38 +739,188 @@ impl ViewerApp {
     fn update_model(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("model_info").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("← Back").clicked() {
+                if ui.button("Back").clicked() {
                     self.reset_to_import();
                 }
                 ui.separator();
                 ui.label(format!("{} triangles", self.stats.triangles));
                 ui.label(format!("Load: {:.0}ms", self.stats.load_ms));
                 ui.separator();
+                let prev_mode = self.gizmo_mode;
+                let move_btn = ui.selectable_label(
+                    self.gizmo_enabled && self.gizmo_mode == gizmo::GizmoMode::Move,
+                    "Move",
+                );
+                let rotate_btn = ui.selectable_label(
+                    self.gizmo_enabled && self.gizmo_mode == gizmo::GizmoMode::Rotate,
+                    "Rotate",
+                );
+                let scale_btn = ui.selectable_label(
+                    self.gizmo_enabled && self.gizmo_mode == gizmo::GizmoMode::Scale,
+                    "Scale",
+                );
+                if move_btn.clicked() {
+                    self.gizmo_mode = gizmo::GizmoMode::Move;
+                }
+                if rotate_btn.clicked() {
+                    self.gizmo_mode = gizmo::GizmoMode::Rotate;
+                }
+                if scale_btn.clicked() {
+                    self.gizmo_mode = gizmo::GizmoMode::Scale;
+                }
+                if move_btn.clicked() || rotate_btn.clicked() || scale_btn.clicked() {
+                    if self.gizmo_enabled && self.gizmo_mode == prev_mode {
+                        self.gizmo_enabled = false;
+                    } else {
+                        self.gizmo_enabled = true;
+                    }
+                }
+                ui.separator();
                 ui.label(&self.source_file);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if
-                        ui
-                            .add_sized(
-                                [120.0, 28.0],
-                                egui::Button
-                                    ::new(egui::RichText::new("🔪 Slice").size(16.0))
-                                    .fill(egui::Color32::from_rgb(80, 50, 50))
-                            )
-                            .clicked()
-                    {
+                    let slice_btn = ui
+                        .add_enabled(
+                            !self.model_out_of_bounds,
+                            egui::Button
+                                ::new(egui::RichText::new("🔪 Slice").size(16.0))
+                                .fill(egui::Color32::from_rgb(80, 50, 50))
+                                .min_size(egui::vec2(120.0, 28.0))
+                        )
+                        .on_disabled_hover_text("Model extends beyond the build plate");
+                    if slice_btn.clicked() {
                         self.run_slice();
+                    }
+                    if self.model_out_of_bounds {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(230, 80, 80),
+                            "⚠ Model outside build plate"
+                        );
                     }
                 });
             });
         });
 
+        self.transform_window(ctx);
         self.update_viewport(ctx);
+    }
+
+    /// Numeric companion to the viewport gizmo: exact transform values.
+    fn transform_window(&mut self, ctx: &egui::Context) {
+        if self.canonical_triangles.is_none() {
+            return;
+        }
+        let mut changed = false;
+        egui::Window
+            ::new("🔧 Transform")
+            .id(egui::Id::new("transform_window"))
+            .collapsible(true)
+            .default_open(true)
+            .anchor(egui::Align2::LEFT_TOP, [8.0, 40.0])
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_rgba_premultiplied(20, 20, 30, 200))
+                    .corner_radius(6.0)
+                    .inner_margin(8.0)
+            )
+            .show(ctx, |ui| {
+                ui.label("Position (mm)");
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.model_translation.x).speed(1.0).prefix("X "))
+                        .changed();
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.model_translation.y).speed(1.0).prefix("Y "))
+                        .changed();
+                });
+                ui.separator();
+
+                ui.label("Rotation (°)");
+                // Euler degrees are a *view* of the quaternion — a gizmo drag
+                // may re-express the same orientation with different angles.
+                let (rx, ry, rz) = self.model_rotation.euler_angles();
+                let mut deg = [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()];
+                let mut rot_changed = false;
+                ui.horizontal(|ui| {
+                    rot_changed |= ui
+                        .add(egui::DragValue::new(&mut deg[0]).speed(1.0).prefix("X "))
+                        .changed();
+                    rot_changed |= ui
+                        .add(egui::DragValue::new(&mut deg[1]).speed(1.0).prefix("Y "))
+                        .changed();
+                    rot_changed |= ui
+                        .add(egui::DragValue::new(&mut deg[2]).speed(1.0).prefix("Z "))
+                        .changed();
+                });
+                if rot_changed {
+                    self.model_rotation = nalgebra::UnitQuaternion::from_euler_angles(
+                        deg[0].to_radians(),
+                        deg[1].to_radians(),
+                        deg[2].to_radians()
+                    );
+                    changed = true;
+                }
+                ui.separator();
+
+                ui.label("Scale");
+                ui.checkbox(&mut self.scale_uniform_lock, "uniform");
+                let mut s = self.model_scale;
+                let (mut sx, mut sy, mut sz) = (false, false, false);
+                ui.horizontal(|ui| {
+                    sx = ui
+                        .add(
+                            egui::DragValue
+                                ::new(&mut s.x)
+                                .speed(0.01)
+                                .range(0.01..=100.0)
+                                .prefix("X ")
+                        )
+                        .changed();
+                    sy = ui
+                        .add(
+                            egui::DragValue
+                                ::new(&mut s.y)
+                                .speed(0.01)
+                                .range(0.01..=100.0)
+                                .prefix("Y ")
+                        )
+                        .changed();
+                    sz = ui
+                        .add(
+                            egui::DragValue
+                                ::new(&mut s.z)
+                                .speed(0.01)
+                                .range(0.01..=100.0)
+                                .prefix("Z ")
+                        )
+                        .changed();
+                });
+                if sx || sy || sz {
+                    if self.scale_uniform_lock {
+                        let v = if sx { s.x } else if sy { s.y } else { s.z };
+                        s = nalgebra::Vector3::new(v, v, v);
+                    }
+                    self.model_scale = s;
+                    changed = true;
+                }
+                ui.separator();
+
+                if ui.button("Reset").clicked() {
+                    self.model_rotation = nalgebra::UnitQuaternion::identity();
+                    self.model_scale = nalgebra::Vector3::new(1.0, 1.0, 1.0);
+                    self.model_translation = Vector2::zeros();
+                    changed = true;
+                }
+            });
+        if changed {
+            self.rebake_model();
+        }
     }
 
     fn update_sliced(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("info").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("← Back").clicked() {
+                if ui.button("Back").clicked() {
                     self.clear_slice();
                 }
                 ui.separator();
@@ -872,7 +1135,140 @@ impl ViewerApp {
                     egui::Sense::click_and_drag()
                 );
 
-                if response.dragged_by(egui::PointerButton::Primary) {
+                // The MVP is needed up front: the gizmo hit-tests against
+                // what's on screen (camera state from the previous frame).
+                let rect = response.rect;
+                let aspect = rect.width() / rect.height();
+                let mvp = renderer_wgpu_port::build_mvp(
+                    self.center,
+                    self.azimuth,
+                    self.elevation,
+                    self.zoom,
+                    BED_SIZE_MM,
+                    aspect,
+                    (self.pan.x, self.pan.y)
+                );
+
+                // ---------------------------------------------------------
+                // Transform gizmo (Model phase only). Runs before the camera
+                // controls so a drag that starts on a handle is consumed.
+                // ---------------------------------------------------------
+                let mut gizmo_hot: Option<gizmo::GizmoAxis> = None;
+                let gizmo_active = self.phase == Phase::Model && self.mesh_triangles.is_some() && self.gizmo_enabled;
+
+                // Gizmo mode shortcuts: available in Model phase even when
+                // gizmo is disabled, so pressing a key can enable it.
+                if self.phase == Phase::Model && self.mesh_triangles.is_some() && !ctx.wants_keyboard_input() {
+                    ui.input(|i| {
+                        if i.key_pressed(egui::Key::M) {
+                            if self.gizmo_enabled && self.gizmo_mode == gizmo::GizmoMode::Move {
+                                self.gizmo_enabled = false;
+                            } else {
+                                self.gizmo_enabled = true;
+                                self.gizmo_mode = gizmo::GizmoMode::Move;
+                            }
+                        }
+                        if i.key_pressed(egui::Key::R) {
+                            if self.gizmo_enabled && self.gizmo_mode == gizmo::GizmoMode::Rotate {
+                                self.gizmo_enabled = false;
+                            } else {
+                                self.gizmo_enabled = true;
+                                self.gizmo_mode = gizmo::GizmoMode::Rotate;
+                            }
+                        }
+                        if i.key_pressed(egui::Key::S) {
+                            if self.gizmo_enabled && self.gizmo_mode == gizmo::GizmoMode::Scale {
+                                self.gizmo_enabled = false;
+                            } else {
+                                self.gizmo_enabled = true;
+                                self.gizmo_mode = gizmo::GizmoMode::Scale;
+                            }
+                        }
+                    });
+                }
+
+                if gizmo_active {
+
+                    let anchor_p = nalgebra::center(&self.mesh_min, &self.mesh_max);
+                    let handle_len = ((self.mesh_max - self.mesh_min).norm() * 0.55).clamp(
+                        15.0,
+                        200.0
+                    );
+                    let gctx = gizmo::GizmoCtx {
+                        mvp: &mvp,
+                        rect,
+                        anchor: [anchor_p.x, anchor_p.y, anchor_p.z],
+                        handle_len,
+                    };
+
+                    let hover = if self.gizmo_drag.is_none() {
+                        response
+                            .hover_pos()
+                            .and_then(|p| gizmo::hit_test(&gctx, self.gizmo_mode, p))
+                    } else {
+                        None
+                    };
+
+                    if response.drag_started_by(egui::PointerButton::Primary) {
+                        if let (Some(axis), Some(cursor)) = (hover, response.interact_pointer_pos()) {
+                            // While the uniform lock is on, any scale handle
+                            // scales all three axes together.
+                            let axis = if
+                                self.gizmo_mode == gizmo::GizmoMode::Scale &&
+                                self.scale_uniform_lock
+                            {
+                                gizmo::GizmoAxis::Uniform
+                            } else {
+                                axis
+                            };
+                            self.gizmo_drag = gizmo::begin_drag(
+                                &gctx,
+                                self.gizmo_mode,
+                                axis,
+                                cursor,
+                                self.model_translation,
+                                self.model_rotation,
+                                self.model_scale
+                            );
+                        }
+                    }
+
+                    if self.gizmo_drag.is_some() {
+                        if response.dragged_by(egui::PointerButton::Primary) {
+                            if let Some(cursor) = response.interact_pointer_pos() {
+                                let shift = ui.input(|i| i.modifiers.shift);
+                                let update = self.gizmo_drag
+                                    .as_ref()
+                                    .map(|drag| gizmo::apply_drag(drag, cursor, shift));
+                                match update {
+                                    Some(gizmo::GizmoUpdate::Translate(t, lift)) => {
+                                        self.model_translation = t;
+                                        self.rebake_model_with_lift(lift);
+                                    }
+                                    Some(gizmo::GizmoUpdate::Rotate(r)) => {
+                                        self.model_rotation = r;
+                                        self.rebake_model();
+                                    }
+                                    Some(gizmo::GizmoUpdate::Scale(s)) => {
+                                        self.model_scale = s;
+                                        self.rebake_model();
+                                    }
+                                    None => {}
+                                }
+                            }
+                        }
+                        if response.drag_stopped() {
+                            self.gizmo_drag = None;
+                            // Settles the Move-Z lift back onto the bed.
+                            self.rebake_model();
+                        }
+                    }
+
+                    gizmo_hot = self.gizmo_drag.as_ref().map(|d| d.axis).or(hover);
+                }
+
+                let gizmo_dragging = self.gizmo_drag.is_some();
+                if !gizmo_dragging && response.dragged_by(egui::PointerButton::Primary) {
                     let delta = response.drag_delta();
                     let command_pressed = ui.input(|i| (i.modifiers.command || i.modifiers.ctrl));
                     if command_pressed {
@@ -940,18 +1336,6 @@ impl ViewerApp {
                     r.scrub_top_z = self.layers[self.max_layer].z - 0.0001;
                 }
 
-                let rect = response.rect;
-                let aspect = rect.width() / rect.height();
-                let mvp = renderer_wgpu_port::build_mvp(
-                    self.center,
-                    self.azimuth,
-                    self.elevation,
-                    self.zoom,
-                    BED_SIZE_MM,
-                    aspect,
-                    (self.pan.x, self.pan.y)
-                );
-
                 let bg_mode = if self.phase == Phase::Model { BgMode::Mesh } else { self.bg_mode };
                 let light_dir = renderer_wgpu_port::headlight_dir(self.azimuth, self.elevation);
                 let renderer = self.renderer.clone();
@@ -968,6 +1352,36 @@ impl ViewerApp {
                     height: vh,
                 });
                 painter.add(callback);
+
+                // Gizmo overlay: painted after the 3D callback so it draws on top.
+                if gizmo_active {
+                    let anchor_p = nalgebra::center(&self.mesh_min, &self.mesh_max);
+                    let handle_len = ((self.mesh_max - self.mesh_min).norm() * 0.55).clamp(
+                        15.0,
+                        200.0
+                    );
+                    let gctx = gizmo::GizmoCtx {
+                        mvp: &mvp,
+                        rect,
+                        anchor: [anchor_p.x, anchor_p.y, anchor_p.z],
+                        handle_len,
+                    };
+                    gizmo::draw(&painter, &gctx, self.gizmo_mode, gizmo_hot);
+
+                    // Floating value readout while dragging.
+                    if let (Some(drag), Some(cursor)) = (
+                        self.gizmo_drag.as_ref(),
+                        response.interact_pointer_pos(),
+                    ) {
+                        painter.text(
+                            cursor + egui::vec2(16.0, -16.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            gizmo::drag_readout(drag, cursor),
+                            egui::FontId::proportional(14.0),
+                            egui::Color32::WHITE
+                        );
+                    }
+                }
             });
     }
 
@@ -1052,7 +1466,7 @@ pub fn start_web() {
                     let gpu = renderer_wgpu_port::Renderer::new(device, queue, target_format, 1, 1);
                     let renderer = Arc::new(Mutex::new(gpu));
 
-                    Ok(Box::new(ViewerApp::new_web(renderer)))
+                    Ok(Box::new(ViewerApp::new(renderer)))
                 })
             ).await
             .unwrap();

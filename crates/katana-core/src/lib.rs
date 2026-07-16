@@ -6,4 +6,5 @@ pub mod simplify;
 pub mod slicer;
 pub mod stl;
 pub mod svg;
+pub mod transform;
 pub mod gcode;
