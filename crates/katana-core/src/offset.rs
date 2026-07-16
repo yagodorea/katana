@@ -1,3 +1,5 @@
+use std::panic;
+
 use nalgebra::Point2;
 
 use crate::simplify;
@@ -405,7 +407,18 @@ fn build_layer_perimeters(
             let mut level_perimeters = Vec::new();
 
             // Pass all current shapes as a batch to .outline()
-            let offset_result: Vec<OverlayShape> = current_shapes.outline(&style);
+            // i_overlay can panic on degenerate geometry (thin shapes that
+            // collapse after offset, leaving orphaned holes).  Catch the
+            // panic and treat the shape as collapsed.
+            let offset_result: Vec<OverlayShape> = match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                current_shapes.outline(&style)
+            })) {
+                Ok(result) => result,
+                Err(_) => {
+                    // Shape too thin to survive the offset — stop perimeters here
+                    break;
+                }
+            };
 
             for offset_shape in &offset_result {
                 for ring in offset_shape {
@@ -436,7 +449,12 @@ fn build_layer_perimeters(
         let infill_offset_style = OutlineStyle::new(-perim_config.nozzle_width / 2.0).line_join(
             LineJoin::Miter(2.0)
         );
-        let infill_shapes: Vec<OverlayShape> = current_shapes.outline(&infill_offset_style);
+        let infill_shapes: Vec<OverlayShape> = match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            current_shapes.outline(&infill_offset_style)
+        })) {
+            Ok(result) => result,
+            Err(_) => Vec::new(), // Shape collapsed — no infill boundary
+        };
 
         let infill_boundary = infill_shapes
             .iter()
